@@ -459,6 +459,8 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
           <option value="render_preset_k">K (transformer)</option>
           <option value="render_preset_l">L (DLSS 4.5)</option>
           <option value="render_preset_m">M (DLSS 4.5)</option>
+          <option value="render_preset_n">N</option>
+          <option value="render_preset_o">O</option>
           <option value="render_preset_latest">Latest / recommended</option>
         </select>
       </div>
@@ -486,6 +488,8 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
           <option value="render_preset_k">Force on · preset K</option>
           <option value="render_preset_l">Force on · preset L</option>
           <option value="render_preset_m">Force on · preset M</option>
+          <option value="render_preset_n">Force on · preset N</option>
+          <option value="render_preset_o">Force on · preset O</option>
           <option value="render_preset_latest">Force on · latest</option>
         </select>
       </div>
@@ -617,7 +621,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
 
 <script>
 "use strict";
-const FRONTEND_VERSION="1.16.1";
+const FRONTEND_VERSION="1.16.2";
 const $=s=>document.querySelector(s);
 const api=async(p,opts)=>{const r=await fetch(p,opts);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j};
 const post=(p,body)=>api(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
@@ -803,7 +807,7 @@ function buildString(){
   if(srPreset)env.push("DXVK_NVAPI_DRS_NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION="+srPreset);
   if(fg!==""){
     env.push("DXVK_NVAPI_DRS_NGX_DLSS_FG_OVERRIDE=on");
-    if(fg!=="0")env.push("DXVK_NVAPI_DRS_NGX_DLSS_FG_OVERRIDE_MULTI_FRAME_COUNT="+fg);
+    if(fg!=="0")env.push("DXVK_NVAPI_DRS_NGX_DLSSG_MULTI_FRAME_COUNT="+fg);
   }
   if(rr){
     env.push("DXVK_NVAPI_DRS_NGX_DLSS_RR_OVERRIDE=on");
@@ -857,7 +861,7 @@ function loadStringIntoUI(str){
   $("#srRatio").style.display=$("#srMode").value==="custom"?"":"none";
   const ra=str.match(/SR_OVERRIDE_SCALING_RATIO=(\d+)/);
   $("#srRatio").value=ra?ra[1]:"";
-  const mf=str.match(/FG_OVERRIDE_MULTI_FRAME_COUNT=(\d)/);
+  const mf=str.match(/DLSSG_MULTI_FRAME_COUNT=(\d)/);
   $("#fgMode").value=mf?mf[1]:(/DLSS_FG_OVERRIDE=on/.test(str)?"0":"");
   const rp=str.match(/RR_OVERRIDE_RENDER_PRESET_SELECTION=(\S+)/);
   $("#rrPreset").value=rp?rp[1]:(/DLSS_RR_OVERRIDE=on/.test(str)?"on":"");
