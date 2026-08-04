@@ -77,7 +77,7 @@ body.gp-active .card.gp-focus .playbtn{opacity:1}
 /* In-page confirm. Native confirm() blocks the event loop, which freezes the
    gamepad polling loop — meaning a pad literally cannot answer it. This is a
    real element, so it's navigable like anything else. */
-#confirmWrap{position:fixed;inset:0;z-index:80;display:none;align-items:center;
+#confirmWrap{position:fixed;inset:0;z-index:90;display:none;align-items:center;
   justify-content:center;background:#000b;backdrop-filter:blur(2px)}
 #confirmWrap.show{display:flex}
 #confirmBox{background:var(--panel2);border:1px solid var(--line);
@@ -85,6 +85,51 @@ body.gp-active .card.gp-focus .playbtn{opacity:1}
   box-shadow:0 24px 60px #000c}
 #confirmMsg{white-space:pre-wrap;margin-bottom:18px;line-height:1.55}
 #confirmWrap .row{justify-content:flex-end;gap:10px}
+
+/* Add own game + its folder browser - same centered-modal shape as confirm,
+   just bigger since a form / a directory listing needs more room. */
+#addGameWrap,#browseWrap{position:fixed;inset:0;z-index:80;display:none;align-items:center;
+  justify-content:center;background:#000b;backdrop-filter:blur(2px)}
+#addGameWrap.show,#browseWrap.show{display:flex}
+#browseWrap{z-index:85}                 /* opens from within addGame - must sit above it */
+#addGameBox{background:var(--panel2);border:1px solid var(--line);
+  border-radius:var(--radius);padding:24px;width:min(480px,calc(100% - 40px));
+  box-shadow:0 24px 60px #000c;max-height:calc(100vh - 60px);overflow-y:auto}
+#addGameBox h2{font-size:16px;margin-bottom:16px}
+#addGameBox label{display:block;font-size:12.5px;color:var(--muted);margin:14px 0 6px}
+#addGameBox label:first-of-type{margin-top:0}
+#addGameBox input[type=text]{width:100%;background:var(--panel);border:1px solid var(--line);
+  border-radius:8px;padding:9px 12px;color:var(--ink);font-size:13.5px}
+#addGameBox select{width:100%;background:var(--panel);border:1px solid var(--line);
+  border-radius:8px;padding:9px 12px;color:var(--ink);font-size:13.5px}
+#addGameBox .row{margin-top:8px}
+#addGameBox .toggle-row{display:flex;align-items:center;gap:9px;cursor:pointer;margin-top:14px}
+#addGameBox .foot{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
+#addGameErr{color:var(--danger);font-size:12.5px;margin-top:8px;display:none}
+#addGameErr.show{display:block}
+
+#browseBox{background:var(--panel2);border:1px solid var(--line);
+  border-radius:var(--radius);padding:20px;width:min(640px,calc(100% - 40px));
+  height:min(560px,calc(100vh - 60px));display:flex;flex-direction:column;
+  box-shadow:0 24px 60px #000c}
+#browsePath{font-family:"JetBrains Mono",monospace;font-size:12.5px;color:var(--muted);
+  margin-bottom:10px;word-break:break-all}
+#browseQuick{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+#browseQuick button{background:var(--panel);border:1px solid var(--line);color:var(--ink);
+  border-radius:999px;padding:6px 14px;font-size:12px}
+#browseQuick button:hover{border-color:var(--launch)}
+#browseList{flex:1;overflow-y:auto;border:1px solid var(--line);border-radius:8px}
+#browseList .entry{display:flex;align-items:center;gap:10px;padding:9px 14px;font-size:13.5px;
+  border-bottom:1px solid var(--line)}
+#browseList .entry:last-child{border-bottom:none}
+#browseList .entry:hover,#browseList .entry.gp-focus{background:var(--panel)}
+#browseList .entry .ic{width:18px;text-align:center;flex:none}
+#browseList .entry .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#browseList .entry.file .nm{color:var(--ink)}
+#browseList .entry.file:not(.exe) .nm{color:var(--muted)}
+#browseErr{color:var(--danger);font-size:12.5px;margin-top:8px}
+.custombadge{position:absolute;top:8px;left:8px;background:rgba(0,0,0,.7);color:var(--dlss);
+  border:1px solid var(--line);border-radius:6px;padding:2px 7px;font-size:11px;font-weight:700;z-index:2}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 
 /* top bar */
@@ -120,6 +165,8 @@ main{padding:22px;max-width:1500px;margin:0 auto}
 @media (hover:none){.playbtn{opacity:1}}
 #dPlay{position:absolute;right:16px;bottom:16px;background:var(--dlss);color:#0c1403;
   border-radius:8px;padding:9px 18px;font-weight:700;font-family:"Chakra Petch",sans-serif}
+#dRemove{position:absolute;right:106px;bottom:16px;border:1px solid var(--danger);
+  border-radius:8px;padding:9px 14px}
 .rail{width:6px;flex:none;display:flex;flex-direction:column}
 .rail i{flex:1;background:var(--line)}
 .rail i.launch.lit{background:var(--launch)}
@@ -246,6 +293,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
   <button class="btn" id="gameModeBtn" title="Switch to Game Mode (Steam Deck UI)" hidden>🎮 Game Mode</button>
   <button class="btn" id="fsBtn" title="Fullscreen (F11)" aria-label="Toggle fullscreen">⛶</button>
   <button class="btn" id="hwBtn" title="System &amp; MangoHud">🖥</button>
+  <button class="btn" id="addGameBtn" title="Add a game that isn't in Steam">＋ Add Game</button>
   <button class="btn" id="settingsBtn" aria-label="Settings" title="Settings">⚙</button>
   <div id="steamState">checking…</div>
 </header>
@@ -314,6 +362,40 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
     </div>
   </div>
 </div>
+<div id="addGameWrap">
+  <div id="addGameBox" role="dialog" aria-modal="true">
+    <h2>Add your own game</h2>
+    <label for="agName">Name</label>
+    <input type="text" id="agName" placeholder="What Steam should call it">
+    <label for="agExe">Executable</label>
+    <div class="row">
+      <input type="text" id="agExe" placeholder="Nothing chosen yet" readonly style="flex:1">
+      <button class="btn" id="agBrowseBtn">Browse…</button>
+    </div>
+    <label for="agStartDir">Start directory</label>
+    <input type="text" id="agStartDir" placeholder="Defaults to the executable's folder">
+    <label class="toggle-row" for="agProton">
+      <input type="checkbox" id="agProton"> Run with Proton
+    </label>
+    <select id="agCompatSel" style="margin-top:8px" hidden></select>
+    <label for="agLaunchOpts">Launch options (optional)</label>
+    <input type="text" id="agLaunchOpts" placeholder="e.g. -windowed">
+    <div id="addGameErr"></div>
+    <div class="foot">
+      <button class="btn" id="agCancel">Cancel</button>
+      <button class="btn primary" id="agSave">Add to Steam</button>
+    </div>
+  </div>
+</div>
+<div id="browseWrap">
+  <div id="browseBox" role="dialog" aria-modal="true">
+    <div id="browsePath"></div>
+    <div id="browseQuick"></div>
+    <div id="browseList"></div>
+    <div id="browseErr"></div>
+    <div class="foot"><button class="btn" id="browseCancel">Cancel</button></div>
+  </div>
+</div>
 <div id="fsHint">Press <kbd>Esc</kbd> to leave fullscreen</div>
 <div id="gpHint">
   <span><b>✛</b> move</span><span><b class="a">A</b> select</span><span><b class="b">B</b> back</span>
@@ -328,6 +410,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
     <small id="dAppid" class="mono"></small>
     <button id="closeBtn" aria-label="Close">✕</button>
     <button id="dPlay">▶ Play</button>
+    <button id="dRemove" class="btn danger" hidden title="Remove this non-Steam shortcut">Remove</button>
   </div>
   <div class="tabs">
     <button class="tab active" data-tab="launch">Launch</button>
@@ -534,7 +617,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
 
 <script>
 "use strict";
-const FRONTEND_VERSION="1.15.1";
+const FRONTEND_VERSION="1.16.0";
 const $=s=>document.querySelector(s);
 const api=async(p,opts)=>{const r=await fetch(p,opts);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j};
 const post=(p,body)=>api(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
@@ -826,6 +909,7 @@ function renderGrid(filter=""){
   $("#empty").hidden=list.length>0;
   $("#grid").innerHTML=list.map(g=>`
     <div class="card ${g._uninstalled?"uninstalled":""} ${(statusById[g.appid]||{}).installing?"installing":""}" role="button" tabindex="0" data-appid="${g.appid}" ${g._uninstalled?'data-uninstalled="1"':""}>
+      ${g.custom?'<span class="custombadge" title="Added via Command Center — not a Steam game">＋ own</span>':""}
       ${railFor(g)}
       <div class="body">
         <img loading="lazy" src="https://cdn.cloudflare.steamstatic.com/steam/apps/${g.appid}/header.jpg"
@@ -999,6 +1083,8 @@ function closeDrawer(){$("#drawer").classList.remove("open");$("#overlay").class
 
   const drawerOpen=()=>$("#drawer").classList.contains("open");
   const popOpen=()=>!$("#settingsPop").hidden;
+  const browseOpen=()=>$("#browseWrap").classList.contains("show");
+  const addGameOpen=()=>$("#addGameWrap").classList.contains("show");
 
   function visible(el){
     if(el.disabled||el.hidden)return false;
@@ -1010,9 +1096,13 @@ function closeDrawer(){$("#drawer").classList.remove("open");$("#overlay").class
     const cs=getComputedStyle(el);
     return cs.visibility!=="hidden"&&cs.opacity!=="0";
   }
-  // Navigate within the topmost open surface: confirm > settings > drawer > page.
+  // Navigate within the topmost open surface: confirm > browse > add-game >
+  // settings > drawer > page. Confirm outranks browse/add-game because the
+  // "Steam will be closed" prompt can itself open on top of either.
   function items(){
     const root=confirmOpen()?$("#confirmBox")
+              :browseOpen()?$("#browseBox")
+              :addGameOpen()?$("#addGameBox")
               :popOpen()?$("#settingsPop")
               :drawerOpen()?$("#drawer"):document.body;
     return [...root.querySelectorAll(SEL)].filter(el=>{
@@ -1086,18 +1176,20 @@ function closeDrawer(){$("#drawer").classList.remove("open");$("#overlay").class
   }
   function back(){
     if(confirmOpen()){$("#confirmNo").click();return}
+    if(browseOpen()){$("#browseCancel").click();return}
+    if(addGameOpen()){$("#agCancel").click();return}
     if(popOpen()){$("#settingsBtn").click();refocus(60);return}
     if(drawerOpen()){closeDrawer();refocus(280)}
   }
   function playFocused(){
-    if(confirmOpen())return;
+    if(confirmOpen()||browseOpen()||addGameOpen())return;
     const el=document.activeElement;
     const card=el&&el.closest&&el.closest(".card");
     if(card){card.querySelector("[data-play],[data-install]")?.click();return}
     if(drawerOpen())$("#dPlay")?.click();
   }
   function cycleTab(d){
-    if(confirmOpen()||!drawerOpen())return;
+    if(confirmOpen()||browseOpen()||addGameOpen()||!drawerOpen())return;
     const tabs=[...document.querySelectorAll(".tab")].filter(visible);
     if(!tabs.length)return;
     const i=tabs.findIndex(t=>t.classList.contains("active"));
@@ -1112,6 +1204,8 @@ function closeDrawer(){$("#drawer").classList.remove("open");$("#overlay").class
   const SCROLL_DEAD=0.15, SCROLL_MAX=22;
   function scrollSurface(){
     if(confirmOpen())return null;
+    if(browseOpen())return $("#browseList");
+    if(addGameOpen())return $("#addGameBox");
     if(popOpen())return $("#settingsPop");
     const hw=$("#hwBody");
     if(hw&&hw.offsetParent!==null&&hw.closest(".open"))return hw;
@@ -1192,12 +1286,18 @@ window.addEventListener("error",e=>{
 });
 $("#overlay").addEventListener("click",closeDrawer);
 $("#closeBtn").addEventListener("click",closeDrawer);
-document.addEventListener("keydown",e=>{if(e.key==="Escape")closeDrawer()});
+document.addEventListener("keydown",e=>{
+  if(e.key!=="Escape")return;
+  if($("#browseWrap").classList.contains("show")){$("#browseCancel").click();return}
+  if($("#addGameWrap").classList.contains("show")){$("#agCancel").click();return}
+  closeDrawer();
+});
 
 async function openGame(appid){
   current=games.find(g=>g.appid===appid);if(!current)return;
   $("#dName").textContent=current.name;
   $("#dAppid").textContent="appid "+appid;
+  $("#dRemove").hidden=!current.custom;
   $("#dHero").dataset.appid=appid;$("#dHero").dataset.fallback="0";$("#dHero").style.opacity="";
   $("#dHero").src=`https://cdn.cloudflare.steamstatic.com/steam/apps/${appid}/header.jpg`;
   switchTab("launch");
@@ -1942,21 +2042,144 @@ $("#copyLaunch").addEventListener("click",()=>{
   navigator.clipboard.writeText($("#launchStr").value).then(()=>toast("Copied"));
 });
 
-/* ---------- boot ---------- */
-(async function(){
-  renderToggles();
-  refreshStatus();
+/* ---------- add own game (non-Steam shortcut) --------------------------
+   Writes a real entry into Steam's shortcuts.vdf (via the backend, which
+   requires Steam closed - same "close cleanly first" rule as every other
+   save here). Once added it shows up in the grid like any other game,
+   with full access to Launch/DLSS/cache/benchmark since it's a real Steam
+   App ID under the hood. */
+async function reloadGames(){
   try{
     const d=await api("/api/games");
     games=d.games.filter(g=>g.installed);
     seedStatus(games);
-    renderGrid();
-    loadOwned();
-    startPolling();   // always watch for installs (Steam-initiated too)
+    renderGrid($("#search").value);
   }catch(e){
     $("#empty").hidden=false;
     $("#empty").textContent="Backend error: "+e.message;
   }
+}
+
+function openAddGame(){
+  $("#agName").value="";$("#agExe").value="";$("#agStartDir").value="";
+  $("#agLaunchOpts").value="";$("#agProton").checked=false;
+  $("#agCompatSel").hidden=true;$("#agCompatSel").removeAttribute("data-loaded");
+  $("#addGameErr").classList.remove("show");
+  $("#addGameWrap").classList.add("show");
+  setTimeout(()=>$("#agName").focus(),30);
+}
+function closeAddGame(){$("#addGameWrap").classList.remove("show")}
+$("#addGameBtn").addEventListener("click",openAddGame);
+$("#agCancel").addEventListener("click",closeAddGame);
+$("#addGameWrap").addEventListener("click",e=>{if(e.target===$("#addGameWrap"))closeAddGame()});
+
+async function loadCompatForAddGame(){
+  if($("#agCompatSel").dataset.loaded)return;
+  try{
+    if(!compatTools)compatTools=(await api("/api/compat_tools")).tools;
+    $("#agCompatSel").innerHTML=compatTools.map(t=>
+      `<option value="${esc(t.name)}">${esc(t.label)}${t.custom?" ★":""}</option>`).join("");
+    $("#agCompatSel").dataset.loaded="1";
+  }catch(e){/* left empty - Steam default still applies */}
+}
+$("#agProton").addEventListener("change",e=>{
+  $("#agCompatSel").hidden=!e.target.checked;
+  if(e.target.checked)loadCompatForAddGame();
+});
+
+async function loadBrowse(path){
+  $("#browseErr").textContent="";
+  try{
+    const d=await api("/api/browse?path="+encodeURIComponent(path||""));
+    $("#browsePath").textContent=d.path;
+    $("#browseQuick").innerHTML=d.quick.map(q=>
+      `<button data-path="${esc(q.path)}">${esc(q.label)}</button>`).join("");
+    const rows=[];
+    if(d.parent)rows.push(`<div class="entry dir" data-nav="${esc(d.parent)}" tabindex="0"><span class="ic">📁</span><span class="nm">..</span></div>`);
+    for(const e of d.entries){
+      const full=d.path.replace(/\/$/,"")+"/"+e.name;
+      if(e.dir)rows.push(`<div class="entry dir" data-nav="${esc(full)}" tabindex="0"><span class="ic">📁</span><span class="nm">${esc(e.name)}</span></div>`);
+      else rows.push(`<div class="entry file ${e.executable?"exe":""}" data-pick="${esc(full)}" tabindex="0"><span class="ic">${e.executable?"⚙":"📄"}</span><span class="nm">${esc(e.name)}</span></div>`);
+    }
+    $("#browseList").innerHTML=rows.join("")||'<div class="entry"><span class="nm">Empty folder</span></div>';
+  }catch(e){$("#browseErr").textContent=e.message}
+}
+function openBrowse(){
+  $("#browseWrap").classList.add("show");
+  const exe=$("#agExe").value;
+  loadBrowse(exe?exe.replace(/\/[^/]*$/,""):"");
+}
+function closeBrowse(){$("#browseWrap").classList.remove("show")}
+$("#agBrowseBtn").addEventListener("click",openBrowse);
+$("#browseCancel").addEventListener("click",closeBrowse);
+$("#browseWrap").addEventListener("click",e=>{if(e.target===$("#browseWrap"))closeBrowse()});
+$("#browseQuick").addEventListener("click",e=>{
+  const b=e.target.closest("button[data-path]");
+  if(b)loadBrowse(b.dataset.path);
+});
+$("#browseList").addEventListener("click",e=>{
+  const nav=e.target.closest("[data-nav]");
+  if(nav){loadBrowse(nav.dataset.nav);return}
+  const pick=e.target.closest("[data-pick]");
+  if(!pick)return;
+  const path=pick.dataset.pick;
+  $("#agExe").value=path;
+  if(!$("#agStartDir").value.trim())$("#agStartDir").value=path.replace(/\/[^/]*$/,"")||"/";
+  if(!$("#agName").value.trim()){
+    const base=path.split("/").pop().replace(/\.(exe|sh|appimage|bin)$/i,"");
+    $("#agName").value=base;
+  }
+  if(/\.exe$/i.test(path)&&!$("#agProton").checked){
+    $("#agProton").checked=true;
+    $("#agProton").dispatchEvent(new Event("change"));
+  }
+  closeBrowse();
+});
+$("#browseList").addEventListener("keydown",e=>{
+  if(e.key==="Enter"||e.key===" "){e.preventDefault();e.target.click()}
+});
+
+$("#agSave").addEventListener("click",async()=>{
+  const name=$("#agName").value.trim(), exe=$("#agExe").value.trim();
+  const err=$("#addGameErr");
+  err.classList.remove("show");
+  if(!name||!exe){err.textContent="Name and an executable are both required";err.classList.add("show");return}
+  if(steamIsRunning&&!await pccConfirm("Steam will be closed cleanly to add this shortcut. Continue?",{yes:"Close Steam & add"}))return;
+  try{
+    await post("/api/shortcuts",{
+      name,exe,
+      start_dir:$("#agStartDir").value.trim(),
+      launch_options:$("#agLaunchOpts").value.trim(),
+      compat_tool:$("#agProton").checked?$("#agCompatSel").value:"",
+      close_steam:true,
+    });
+    closeAddGame();
+    toast(`Added "${name}"`);
+    await reloadGames();
+  }catch(e){err.textContent=e.message;err.classList.add("show")}
+});
+
+async function removeCurrentShortcut(){
+  if(!current||!current.custom)return;
+  if(!await pccConfirm(`Remove "${current.name}" from Steam?\n\nThis only removes the shortcut — the game files themselves aren't touched.`,
+      {yes:"Remove",danger:true}))return;
+  if(steamIsRunning&&!await pccConfirm("Steam will be closed cleanly to remove this shortcut. Continue?",{yes:"Close Steam & remove"}))return;
+  try{
+    await post("/api/shortcuts/remove",{appid:current.appid,close_steam:true});
+    closeDrawer();
+    toast(`Removed "${current.name}"`);
+    await reloadGames();
+  }catch(e){toast(e.message,true)}
+}
+$("#dRemove")?.addEventListener("click",removeCurrentShortcut);
+
+/* ---------- boot ---------- */
+(async function(){
+  renderToggles();
+  refreshStatus();
+  await reloadGames();
+  loadOwned();
+  startPolling();   // always watch for installs (Steam-initiated too)
 })();
 </script>
 </body>

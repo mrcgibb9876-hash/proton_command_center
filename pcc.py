@@ -15,6 +15,7 @@ import struct
 import subprocess
 import threading
 import time
+import zlib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,7 +26,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.15.1"
+VERSION = "1.16.0"
 PORT = int(os.environ.get("PCC_PORT", "8686"))
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path.home() / ".local/share/proton-command-center"
@@ -349,7 +350,14 @@ def launch_game(appid: str):
     exe = shutil.which("steam")
     if not exe:
         raise RuntimeError("'steam' command not found in PATH")
-    return _spawn_detached([exe, f"steam://rungameid/{appid}"])
+    aid = int(appid)
+    # Non-Steam shortcuts (always have bit 31 set - real Steam appids never
+    # do, being nowhere near 2**31) need the shifted 64-bit id for rungameid;
+    # everywhere else in this app (localconfig/compat-tool keys, grid art)
+    # uses the plain unsigned appid unchanged.
+    if aid & 0x80000000:
+        aid = (aid << 32) | 0x02000000
+    return _spawn_detached([exe, f"steam://rungameid/{aid}"])
 
 
 def library_folders(root: Path):
@@ -542,6 +550,65 @@ def vdf_dump(obj, indent=0):
         else:
             out.append(f'{pad}"{k}"\t\t"{v}"\n')
     return "".join(out)
+
+
+# --------------------------------------------------------------------------
+# Binary VDF (shortcuts.vdf) - a completely different wire format from the
+# text VDF above. Verified byte-for-byte against a real shortcuts.vdf on this
+# box: parse-then-redump reproduces the original file exactly. That includes
+# the trailing run of BIN_END bytes - every object closes with one 0x08,
+# *including the implicit top-level object*, so a document with N shortcuts
+# ends in a run of BIN_END bytes rather than just closing "shortcuts" once.
+# --------------------------------------------------------------------------
+BIN_NONE, BIN_STRING, BIN_INT32, BIN_END = 0x00, 0x01, 0x02, 0x08
+
+
+def binvdf_parse(data: bytes) -> dict:
+    """Parse a binary VDF document (shortcuts.vdf) into a dict. Ints round-trip
+    as signed 32-bit (shortcuts.vdf's `appid` field is stored signed even
+    though it's conceptually an unsigned bitmask - callers mask with
+    0xFFFFFFFF when they need the unsigned value Steam uses elsewhere)."""
+    def parse_obj(pos):
+        d = {}
+        while True:
+            t = data[pos]; pos += 1
+            if t == BIN_END:
+                return d, pos
+            end = data.index(b"\x00", pos)
+            key = data[pos:end].decode("utf-8", "replace")
+            pos = end + 1
+            if t == BIN_NONE:
+                d[key], pos = parse_obj(pos)
+            elif t == BIN_STRING:
+                end = data.index(b"\x00", pos)
+                d[key] = data[pos:end].decode("utf-8", "replace")
+                pos = end + 1
+            elif t == BIN_INT32:
+                d[key] = struct.unpack_from("<i", data, pos)[0]
+                pos += 4
+            else:
+                raise ValueError(f"binvdf: unknown type byte {t:#x} at offset {pos - 1}")
+        return d, pos
+    root, _ = parse_obj(0)
+    return root
+
+
+def binvdf_dump(d: dict) -> bytes:
+    """Inverse of binvdf_parse. Dict insertion order is preserved (Python 3.7+),
+    so re-dumping a parsed file without modification reproduces it exactly -
+    this is what the round-trip test in tests/test_pcc.py checks."""
+    out = bytearray()
+    for k, v in d.items():
+        if isinstance(v, dict):
+            out += bytes([BIN_NONE]) + k.encode("utf-8") + b"\x00" + binvdf_dump(v)
+        elif isinstance(v, str):
+            out += bytes([BIN_STRING]) + k.encode("utf-8") + b"\x00" + v.encode("utf-8") + b"\x00"
+        elif isinstance(v, int):
+            out += bytes([BIN_INT32]) + k.encode("utf-8") + b"\x00" + struct.pack("<i", v)
+        else:
+            raise TypeError(f"binvdf: unsupported value type {type(v)} for key {k!r}")
+    out += bytes([BIN_END])
+    return bytes(out)
 
 
 def ci_get(d, key):
@@ -1665,6 +1732,256 @@ def set_compat_tool(root: Path, appid: str, tool_name, close_steam=False) -> dic
     return {"saved": True, "tool": tool_name, "backup": str(bak)}
 
 
+# --------------------------------------------------------------------------
+# Non-Steam game shortcuts (shortcuts.vdf) - "add your own game"
+# --------------------------------------------------------------------------
+def shortcuts_path(root: Path) -> Path | None:
+    """shortcuts.vdf lives next to localconfig.vdf, per user. Reuses the same
+    userdata/<id>/config discovery as everything else here instead of
+    computing the SteamID3 folder name ourselves."""
+    cfgs = find_localconfigs(root)
+    return cfgs[0].parent / "shortcuts.vdf" if cfgs else None
+
+
+def compute_shortcut_id(exe: str, appname: str):
+    """Steam's own convention for a non-Steam shortcut's App ID: crc32 of the
+    (already-quoted) exe path concatenated with the app name, OR'd with the
+    high bit. Verified against a real shortcut Steam itself created on this
+    box - its grid art is filed under exactly this unsigned value. Returns
+    (unsigned_top32, signed_int32_for_storage)."""
+    top32 = zlib.crc32((exe + appname).encode("utf-8")) | 0x80000000
+    signed = struct.unpack("<i", struct.pack("<I", top32))[0]
+    return top32, signed
+
+
+def list_shortcuts(root: Path) -> list:
+    """Every non-Steam shortcut Steam knows about, already in Command
+    Center's game shape (appid/name/install_path/library/...) so it merges
+    straight into the normal library list via all_games(). `library` points
+    at the same steamapps Steam itself uses for a shortcut's Proton compat
+    data and shader cache, so has_cache/cache_info work unmodified."""
+    path = shortcuts_path(root)
+    if not path or not path.is_file():
+        return []
+    try:
+        data = binvdf_parse(path.read_bytes())
+    except Exception:
+        return []
+    out = []
+    for entry in (data.get("shortcuts") or {}).values():
+        if not isinstance(entry, dict) or entry.get("appid") is None:
+            continue
+        top32 = entry["appid"] & 0xFFFFFFFF
+        exe = entry.get("Exe", "")
+        exe_unquoted = exe.strip('"')
+        start_dir = entry.get("StartDir", "").strip('"') or str(Path(exe_unquoted).parent)
+        out.append({
+            "appid": str(top32),
+            "name": entry.get("AppName") or exe_unquoted or str(top32),
+            "install_path": start_dir,
+            "installed": True,
+            "fully_installed": True,
+            "download_pct": None,
+            "size_bytes": 0,
+            "library": str(root / "steamapps"),
+            "custom": True,
+            "exe": exe_unquoted,
+            "launch_options_shortcut": entry.get("LaunchOptions", ""),
+        })
+    return out
+
+
+def all_games(root: Path) -> list:
+    """Installed Steam games plus non-Steam shortcuts, merged - the single
+    list every per-game route (dlss/cache/launch options/...) should look up
+    against so a custom game gets the same treatment as a real one."""
+    return list_games(root) + list_shortcuts(root)
+
+
+def _new_shortcut_entry(name, quoted_exe, start_dir, launch_options, signed_appid):
+    # Field set/order matches a real Steam-written entry exactly (including
+    # the empty "tags" object) - captured from this box's own shortcuts.vdf.
+    return {
+        "appid": signed_appid,
+        "AppName": name,
+        "Exe": quoted_exe,
+        "StartDir": start_dir,
+        "icon": "",
+        "ShortcutPath": "",
+        "LaunchOptions": launch_options or "",
+        "IsHidden": 0,
+        "AllowDesktopConfig": 1,
+        "AllowOverlay": 1,
+        "OpenVR": 0,
+        "Devkit": 0,
+        "DevkitGameID": "",
+        "DevkitOverrideAppID": 0,
+        "LastPlayTime": 0,
+        "FlatpakAppID": "",
+        "sortas": "",
+        "tags": {},
+    }
+
+
+def add_shortcut(root: Path, name: str, exe: str, start_dir: str = "",
+                 launch_options: str = "", close_steam=False) -> dict:
+    """Add a non-Steam game shortcut. Steam must be closed - like every other
+    write here, it rewrites shortcuts.vdf on exit and would clobber this."""
+    if steam_running():
+        if close_steam:
+            shutdown_steam()
+        else:
+            raise RuntimeError("Steam is running. Close Steam first — it "
+                               "overwrites shortcuts.vdf on exit.")
+    name = name.strip()
+    exe = exe.strip()
+    if not name:
+        raise RuntimeError("Name is required")
+    if not exe:
+        raise RuntimeError("Choose an executable first")
+    quoted_exe = exe if exe.startswith('"') else f'"{exe}"'
+    start_dir = start_dir.strip() or str(Path(exe).parent)
+    path = shortcuts_path(root)
+    if not path:
+        raise RuntimeError("No localconfig.vdf found under userdata/ — log "
+                           "into Steam at least once first")
+    data = {"shortcuts": {}}
+    if path.is_file():
+        try:
+            data = binvdf_parse(path.read_bytes())
+        except Exception as e:
+            raise RuntimeError(f"Couldn't parse existing shortcuts.vdf: {e}")
+    shortcuts = data.setdefault("shortcuts", {})
+    top32, signed = compute_shortcut_id(quoted_exe, name)
+    # A crc32 collision is astronomically unlikely, but a duplicate key would
+    # silently overwrite an existing shortcut on write - refuse instead.
+    for entry in shortcuts.values():
+        if isinstance(entry, dict) and entry.get("appid") == signed:
+            raise RuntimeError("A shortcut with this exe + name already exists")
+    next_idx = str(max((int(k) for k in shortcuts if k.isdigit()), default=-1) + 1)
+    shortcuts[next_idx] = _new_shortcut_entry(name, quoted_exe, start_dir,
+                                              launch_options, signed)
+    bak = None
+    if path.is_file():
+        bak = path.with_suffix(f".vdf.pcc-{int(time.time())}.bak")
+        shutil.copy2(path, bak)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".vdf.pcc-tmp")
+    tmp.write_bytes(binvdf_dump(data))
+    tmp.replace(path)
+    return {"saved": True, "appid": str(top32), "backup": str(bak) if bak else None}
+
+
+def remove_shortcut(root: Path, appid: str, close_steam=False) -> dict:
+    if steam_running():
+        if close_steam:
+            shutdown_steam()
+        else:
+            raise RuntimeError("Steam is running. Close Steam first — it "
+                               "overwrites shortcuts.vdf on exit.")
+    path = shortcuts_path(root)
+    if not path or not path.is_file():
+        raise RuntimeError("No shortcuts.vdf found")
+    data = binvdf_parse(path.read_bytes())
+    shortcuts = data.get("shortcuts") or {}
+    target = int(appid) & 0xFFFFFFFF
+    key = next((k for k, e in shortcuts.items()
+               if isinstance(e, dict) and (e.get("appid", 0) & 0xFFFFFFFF) == target), None)
+    if key is None:
+        raise RuntimeError("Shortcut not found")
+    del shortcuts[key]
+    bak = path.with_suffix(f".vdf.pcc-{int(time.time())}.bak")
+    shutil.copy2(path, bak)
+    tmp = path.with_suffix(".vdf.pcc-tmp")
+    tmp.write_bytes(binvdf_dump(data))
+    tmp.replace(path)
+    return {"removed": True, "backup": str(bak)}
+
+
+EXE_EXTENSIONS = {".exe", ".sh", ".appimage", ".bin", ".py"}
+
+
+def quick_locations() -> list:
+    """Shortcuts shown above the folder browser's listing: home, common game
+    spots, and anything mounted under /run/media or /media (external drives -
+    udisks2's default automount layout is <mountpoint>/<user>/<label>)."""
+    home = Path.home()
+    out = [{"label": "Home", "path": str(home)}]
+    for name in ("Desktop", "Downloads", "Games"):
+        p = home / name
+        if p.is_dir():
+            out.append({"label": name, "path": str(p)})
+    root = steam_root()
+    if root:
+        common = root / "steamapps" / "common"
+        if common.is_dir():
+            out.append({"label": "Steam common", "path": str(common)})
+    seen = set()
+    for mountbase in (Path("/run/media"), Path("/media")):
+        if not mountbase.is_dir():
+            continue
+        try:
+            userdirs = list(mountbase.iterdir())
+        except OSError:
+            continue
+        for userdir in userdirs:
+            try:
+                if not userdir.is_dir():
+                    continue
+                children = list(userdir.iterdir())
+            except OSError:
+                continue   # e.g. /run/media/root, unreadable by this user
+            for d in sorted(children):
+                try:
+                    if d.is_dir() and d.resolve() not in seen:
+                        seen.add(d.resolve())
+                        out.append({"label": d.name, "path": str(d)})
+                except OSError:
+                    continue
+    return out
+
+
+def browse_dir(path_str: str) -> dict:
+    """List a directory for the in-browser folder picker behind 'Add own
+    game'. Browsers can't expose real filesystem paths through a native file
+    input, so this (server-side, 127.0.0.1-only - no more exposed than a
+    native file manager running as the same user) is how the frontend gets
+    one to actually launch later."""
+    base = Path(path_str).expanduser() if path_str else Path.home()
+    try:
+        base = base.resolve()
+    except OSError:
+        base = Path.home()
+    if not base.is_dir():
+        base = base.parent if base.parent.is_dir() else Path.home()
+    entries = []
+    try:
+        listing = sorted(base.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except PermissionError:
+        listing = []
+    for p in listing:
+        try:
+            is_dir = p.is_dir()
+            executable = (not is_dir) and (
+                os.access(p, os.X_OK) or p.suffix.lower() in EXE_EXTENSIONS)
+            if p.name.startswith(".") :
+                continue   # dotfiles/dirs add noise; games don't live there
+            entries.append({"name": p.name, "dir": is_dir, "executable": executable})
+        except OSError:
+            continue
+    parent = base.parent
+    try:
+        quick = quick_locations()
+    except OSError:
+        quick = []
+    return {
+        "path": str(base),
+        "parent": str(parent) if parent != base else None,
+        "entries": entries,
+        "quick": quick,
+    }
+
 
 # --------------------------------------------------------------------------
 # Full library (owned games) via Steam Web API
@@ -2727,7 +3044,7 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/games":
                 if not root:
                     self._json({"error": "Steam not found"}, 500); return
-                games = list_games(root)
+                games = all_games(root)
                 state = load_state()
                 drv = driver_version()
                 # launch options: one parse of the newest localconfig
@@ -2753,7 +3070,7 @@ class Handler(BaseHTTPRequestHandler):
             elif m := re.match(r"^/api/game/(\d+)/launch_options$", self.path):
                 self._json(get_launch_options(root, m.group(1)))
             elif m := re.match(r"^/api/game/(\d+)/dlss$", self.path):
-                games = {g["appid"]: g for g in list_games(root)}
+                games = {g["appid"]: g for g in all_games(root)}
                 g = games.get(m.group(1))
                 dlls = scan_game_dlss(g["install_path"]) if g else []
                 state = load_state()
@@ -2793,6 +3110,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(proton_capabilities(root))
             elif self.path == "/api/compat_tools":
                 self._json({"tools": list_compat_tools(root)})
+            elif m := re.match(r"^/api/browse(?:\?(.*))?$", self.path):
+                qs = urllib.parse.parse_qs(m.group(1) or "")
+                self._json(browse_dir((qs.get("path") or [""])[0]))
             elif m := re.match(r"^/api/game/(\d+)/compat_tool$", self.path):
                 self._json(get_compat_tool(root, m.group(1)))
             elif m := re.match(r"^/api/game/(\d+)/cache$", self.path):
@@ -2893,6 +3213,19 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"launched": launch_game(m.group(1))})
             elif m := re.match(r"^/api/game/(\d+)/compat_tool$", self.path):
                 self._json(set_compat_tool(root, m.group(1), body.get("name", ""),
+                                           close_steam=bool(body.get("close_steam"))))
+            elif self.path == "/api/shortcuts":
+                r = add_shortcut(root, body.get("name", ""), body.get("exe", ""),
+                                 start_dir=body.get("start_dir", ""),
+                                 launch_options=body.get("launch_options", ""),
+                                 close_steam=bool(body.get("close_steam")))
+                # Steam's already closed by add_shortcut above if it was
+                # running, so this second write needs no close_steam of its own.
+                if body.get("compat_tool"):
+                    set_compat_tool(root, r["appid"], body["compat_tool"], close_steam=False)
+                self._json(r)
+            elif self.path == "/api/shortcuts/remove":
+                self._json(remove_shortcut(root, body["appid"],
                                            close_steam=bool(body.get("close_steam"))))
             elif self.path == "/api/art/reset":
                 n = 0
