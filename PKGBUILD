@@ -1,6 +1,6 @@
 # Maintainer: Marc Gibb
 pkgname=proton-command-center
-pkgver=1.16.1
+pkgver=1.16.2
 pkgrel=1
 pkgdesc="Per-game launch options, Proton selection, DLSS DLL management, MangoHud benchmarks, and controller navigation for Steam on Linux"
 arch=('any')
@@ -15,7 +15,7 @@ optdepends=(
     'nvidia-utils: DLSS DLL management and driver-aware compile tracking'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('b29ef586527874f0375592743183eacacdf834243a4df51edbb7c9083d0ffc75')
+sha256sums=('3a53e418717dd310c80c536a74f33d42bfeda93dfcbd4646b4373a0cd5ccae8d')
 
 package() {
     cd "$srcdir/$_repo-$pkgver"
