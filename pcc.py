@@ -640,6 +640,10 @@ def find_localconfigs(root: Path):
 
 
 def get_launch_options(root: Path, appid: str) -> dict:
+    data, path, key = _find_shortcut(root, appid)
+    if data is not None:
+        entry = data["shortcuts"][key]
+        return {"value": entry.get("LaunchOptions", ""), "config": str(path)}
     for cfg in find_localconfigs(root):
         try:
             data = vdf_parse(cfg.read_text(errors="replace"))
@@ -822,7 +826,20 @@ def set_launch_options(root: Path, appid: str, value, close_steam=False) -> dict
         if close_steam:
             shutdown_steam()
         else:
-            raise RuntimeError("Steam is running. Close Steam first — it overwrites localconfig.vdf on exit.")
+            raise RuntimeError("Steam is running. Close Steam first — it overwrites its config files on exit.")
+    # Non-Steam shortcuts store LaunchOptions on the shortcut entry itself in
+    # shortcuts.vdf - Steam never looks at localconfig.vdf's apps.<appid> node
+    # for these, so writing there (as below) silently has no effect in-game.
+    data, path, key = _find_shortcut(root, appid)
+    if data is not None:
+        entry = data["shortcuts"][key]
+        entry["LaunchOptions"] = value.strip()
+        bak = path.with_suffix(f".vdf.pcc-{int(time.time())}.bak")
+        shutil.copy2(path, bak)
+        tmp = path.with_suffix(".vdf.pcc-tmp")
+        tmp.write_bytes(binvdf_dump(data))
+        tmp.replace(path)
+        return {"saved": True, "backup": str(bak), "config": str(path)}
     configs = find_localconfigs(root)
     if not configs:
         raise RuntimeError("No localconfig.vdf found under userdata/")
@@ -898,9 +915,8 @@ def pe_version(path):
     return f"{best[0]}.{best[1]}.{best[2]}.{best[3]}"
 
 
-def scan_game_dlss(install_path):
+def _scan_dlss_tree(base: Path):
     found = []
-    base = Path(install_path)
     if not base.is_dir():
         return found
     # Some games ship a debug copy of the DLSS DLLs in a Development/ or Debug/
@@ -926,6 +942,29 @@ def scan_game_dlss(install_path):
                     "backed_up": _backup_path(p).exists(),
                 })
     return found
+
+
+def scan_game_dlss(install_path):
+    base = Path(install_path)
+    found = _scan_dlss_tree(base)
+    if found:
+        return found
+    # Non-Steam shortcuts point install_path at the launch exe's own folder.
+    # Steam library games get their real install root, but engine-plugin-based
+    # DLSS integrations (Unreal Engine ships DLSS/Streamline under
+    # Engine/Plugins/.../ThirdParty/Win64, a sibling of the project's own
+    # Binaries/Win64 folder the exe sits in) can live several levels above
+    # that. Climb looking for them, stopping at the first hit so this can't
+    # wander into an unrelated sibling game's folder higher up the tree.
+    for _ in range(4):
+        parent = base.parent
+        if parent == base or len(parent.parts) <= 2:
+            break
+        base = parent
+        found = _scan_dlss_tree(base)
+        if found:
+            return found
+    return []
 
 
 def _backup_path(dll_path):
@@ -1741,6 +1780,26 @@ def shortcuts_path(root: Path) -> Path | None:
     computing the SteamID3 folder name ourselves."""
     cfgs = find_localconfigs(root)
     return cfgs[0].parent / "shortcuts.vdf" if cfgs else None
+
+
+def _find_shortcut(root: Path, appid: str):
+    """Locate a shortcut entry by its unsigned Steam app id. Non-Steam games
+    don't have a localconfig.vdf `apps.<appid>` node at all - Steam reads
+    their launch options straight off the shortcut entry itself - so callers
+    that need to read/write launch options must check here first. Returns
+    (parsed_shortcuts_data, shortcuts_path, dict_key) or (None, None, None)."""
+    path = shortcuts_path(root)
+    if not path or not path.is_file():
+        return None, None, None
+    try:
+        data = binvdf_parse(path.read_bytes())
+    except Exception:
+        return None, None, None
+    for key, entry in (data.get("shortcuts") or {}).items():
+        if isinstance(entry, dict) and entry.get("appid") is not None:
+            if str(entry["appid"] & 0xFFFFFFFF) == str(appid):
+                return data, path, key
+    return None, None, None
 
 
 def compute_shortcut_id(exe: str, appname: str):
@@ -3061,7 +3120,12 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                 dlss_seen = state.get("dlss_seen", {})
                 for g in games:
-                    g["has_launch_options"] = g["appid"] in lo_appids
+                    # Shortcuts carry their own LaunchOptions field (surfaced by
+                    # list_shortcuts as launch_options_shortcut) rather than living
+                    # in localconfig.vdf's apps node like real Steam games do.
+                    g["has_launch_options"] = (bool(g.get("launch_options_shortcut"))
+                                               if g.get("custom")
+                                               else g["appid"] in lo_appids)
                     g["has_cache"] = any(
                         (Path(lib) / "shadercache" / g["appid"]).is_dir()
                         for lib in [g["library"]])
