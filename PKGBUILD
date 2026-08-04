@@ -15,11 +15,7 @@ optdepends=(
     'nvidia-utils: DLSS DLL management and driver-aware compile tracking'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# Placeholder — regenerate with `updpkgsums` before every release.
-# Deliberately a WRONG hash rather than 'SKIP': if it's forgotten, makepkg
-# fails loudly with a validity check error instead of silently shipping a
-# package with integrity checking disabled for every user who installs it.
-sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+sha256sums=('b29ef586527874f0375592743183eacacdf834243a4df51edbb7c9083d0ffc75')
 
 package() {
     cd "$srcdir/$_repo-$pkgver"
