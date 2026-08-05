@@ -255,6 +255,18 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
 .toast.show{opacity:1}
 .toast.err{border-color:var(--danger);color:var(--danger)}
 
+/* DLSS preset info pop-up: appears next to the select on change, closes on
+   outside click / Escape / picking again. Not a modal — no focus trap, so it
+   never interferes with gamepad nav. */
+.preset-pop{position:fixed;max-width:320px;background:var(--panel2);border:1px solid var(--line);
+  border-left:3px solid var(--dlss);border-radius:var(--radius);padding:12px 14px;z-index:50;
+  box-shadow:0 10px 28px rgba(0,0,0,.45);font-size:13px;line-height:1.5;animation:presetPopIn .12s ease-out}
+@keyframes presetPopIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+.preset-pop-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:6px}
+.preset-pop-head b{color:var(--dlss);font-family:"Chakra Petch","Inter",sans-serif;font-size:13px;letter-spacing:.02em}
+.preset-pop-head button{width:20px;height:20px;flex:none;border-radius:50%;background:var(--panel);color:var(--muted);font-size:11px}
+.preset-pop p{color:var(--ink);margin:0}
+
 /* toggles */
 .toggle{display:flex;align-items:center;justify-content:space-between;gap:12px;
   padding:11px 0;border-bottom:1px solid var(--line)}
@@ -617,11 +629,15 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
   </div>
   <div style="flex:1;overflow-y:auto;padding:20px" id="hwBody"><p class="note">Detecting hardware…</p></div>
 </aside>
+<div class="preset-pop" id="presetPop" hidden>
+  <div class="preset-pop-head"><b id="presetPopTitle"></b><button id="presetPopClose" aria-label="Close">✕</button></div>
+  <p id="presetPopBody"></p>
+</div>
 <div class="toast" id="toast"></div>
 
 <script>
 "use strict";
-const FRONTEND_VERSION="1.16.2";
+const FRONTEND_VERSION="1.17.0";
 const $=s=>document.querySelector(s);
 const api=async(p,opts)=>{const r=await fetch(p,opts);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j};
 const post=(p,body)=>api(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
@@ -641,6 +657,7 @@ const TOGGLES=[
  {id:"hdr",needs:"PROTON_ENABLE_HDR",label:"HDR",hint:"PROTON_ENABLE_HDR=1 DXVK_HDR=1 — disable the in-game HDR toggle if it conflicts",env:"PROTON_ENABLE_HDR=1 DXVK_HDR=1"},
  {id:"mangohud",label:"MangoHud overlay",hint:"Adds the mangohud wrapper — first enable writes PCC's custom horizontal overlay (orange labels, frametime graph, dGPU-pinned)",wrap:"mangohud"},
  {id:"gameperf",label:"game-performance",hint:"CachyOS wrapper: performance power profile + screensaver inhibit for the game",wrap:"game-performance"},
+ {id:"vram8g",label:"Optimise for 8GB VRAM",hint:"DXVK_CONFIG=\"dxgi.maxDeviceMemory=7168\" — caps the VRAM DXVK reports to the game at 7GB instead of the card's full 8GB. Leaving that headroom stops texture streaming from filling every last MB and thrashing against the desktop/compositor, which is what causes stutter on 8GB cards (3050/3060/4060/5060-class) in VRAM-heavy titles. Leave this off on cards with more than 8GB — it would just throttle memory you actually have.",env:"DXVK_CONFIG=dxgi.maxDeviceMemory=7168"},
  {id:"steamdeckon",label:"Steam Deck spoof (=1)",hint:"SteamDeck=1 — spoofs Deck mode; helps some anti-cheat (ACE) accept Linux",env:"SteamDeck=1"},
  {id:"steamdeckoff",label:"Force Steam Deck off (=0)",hint:"SteamDeck=0 — explicitly disables Deck mode when something else enabled it",env:"SteamDeck=0"},
  {id:"nvapireflex",label:"Reflex low-latency",hint:"DXVK_NVAPI_VKREFLEX=1 — exposes dxvk-nvapi's Vulkan Reflex layer. Only kicks in on games implementing VK_NV_low_latency2; helps latency/frame pacing there, harmless elsewhere. (PROTON_ENABLE_NVAPI was dropped: NVAPI has been on by default since Proton 9 and the variable exists in no current build.)",env:"DXVK_NVAPI_VKREFLEX=1",needs:"DXVK_NVAPI_VKREFLEX"},
@@ -816,19 +833,20 @@ function buildString(){
   if(cap)env.push("DXVK_FRAME_RATE="+cap);
   const extraEnv=$("#extraEnv").value.trim();
   if(extraEnv)env.push(extraEnv);
-  // Merge duplicate KEY= entries into one. VKD3D_CONFIG (and DXVK_CONFIG) take
-  // comma-separated lists, so dxr + upload_hvv must become VKD3D_CONFIG=dxr,upload_hvv
-  // rather than two clashing assignments where the last wins.
-  const LIST_KEYS=new Set(["VKD3D_CONFIG","DXVK_CONFIG"]);
+  // Merge duplicate KEY= entries into one. VKD3D_CONFIG takes a comma-separated
+  // flag list (dxr,upload_hvv); DXVK_CONFIG takes semicolon-separated
+  // key=value pairs (dxvk's own env-var syntax) — so each needs its own
+  // separator rather than two clashing assignments where the last wins.
+  const LIST_SEP={"VKD3D_CONFIG":",","DXVK_CONFIG":"; "};
   const merged=[],seen={};
   for(const e of env){
     const eq=e.indexOf("=");
     if(eq<0){merged.push(e);continue;}
     const k=e.slice(0,eq),v=e.slice(eq+1);
     if(k in seen){
-      if(LIST_KEYS.has(k)){
+      if(LIST_SEP[k]){
         // append to the existing list value
-        merged[seen[k]]=k+"="+merged[seen[k]].slice(k.length+1)+","+v;
+        merged[seen[k]]=k+"="+merged[seen[k]].slice(k.length+1)+LIST_SEP[k]+v;
       }else{
         merged[seen[k]]=e;   // non-list: last value wins (overwrite in place)
       }
@@ -847,6 +865,52 @@ $("#srMode").addEventListener("change",()=>{
   manualEdit=false;buildString();
 });
 ["#dlssPreset","#srRatio","#fgMode","#rrPreset","#fpsCap","#extraEnv","#extraArgs"].forEach(s=>$(s).addEventListener("input",()=>{manualEdit=false;buildString()}));
+
+/* ---------- DLSS preset info pop-up ----------
+   Sourced from NVIDIA's DLSS 4.5 preset guidance and the dxvk-nvapi preset
+   enum as of Aug 2026. J/K are the 1st-gen (DLSS 4.0) transformer model, L/M
+   the 2nd-gen (DLSS 4.5) one; N/O are reserved slots dxvk-nvapi already
+   exposes but NVIDIA hasn't attached behaviour to yet, expected to matter
+   once DLSS 5 actually ships (Fall 2026). */
+const SR_PRESET_INFO={
+  render_preset_j:{title:"J — early 1st-gen Transformer",desc:"An early build of the DLSS 4.0 transformer Super Resolution model, shipped just ahead of K. K superseded it almost immediately — J is mainly a fallback for the handful of early DLSS 4 titles pinned to it. Pick K instead unless a specific game recommends J."},
+  render_preset_k:{title:"K — 1st-gen Transformer, recommended baseline",desc:"The DLSS 4.0 transformer Super Resolution model. NVIDIA's recommended default for RTX 20/30-series cards, where the 2nd-gen model's extra compute cost isn't worth it — good all-round balance of quality and performance, and a safe universal pick if you're unsure."},
+  render_preset_l:{title:"L — 2nd-gen Transformer, Ultra Performance",desc:"The DLSS 4.5 2nd-gen transformer model, tuned for the heaviest upscale ratios (Ultra Performance, especially at 4K). Recovers detail the 1st-gen model loses at aggressive scaling. Best on 40/50-series cards pushing a high output resolution from a low render resolution."},
+  render_preset_m:{title:"M — 2nd-gen Transformer, general purpose",desc:"The DLSS 4.5 2nd-gen transformer model, NVIDIA's general-purpose pick — tuned around Performance mode but also recommended for Balanced/Quality on 40/50-series cards. The best default if your card supports it."},
+  render_preset_n:{title:"N — reserved",desc:"Defined in the driver/dxvk-nvapi preset enum but with no published NVIDIA behaviour yet (Aug 2026) — selecting it likely just falls back to the driver default under the hood. Expected to gain meaning alongside DLSS 5."},
+  render_preset_o:{title:"O — reserved",desc:"Reserved alongside N, not yet assigned a model. Recent GeForce driver strings reference DLSS 5 neural-rendering presets ('DLSS-NR Presets') that aren't live in any game yet — O may end up mapped to one once DLSS 5 actually ships (NVIDIA has said Fall 2026). Safe to try; expect no visible change today."},
+  render_preset_latest:{title:"Latest / recommended",desc:"Always resolves to whichever preset NVIDIA currently recommends for the game/GPU combination, without hardcoding a letter — set it and forget it; it stays current as new presets ship."},
+};
+const RR_PRESET_INFO={
+  on:{title:"Default preset",desc:"Turns Ray Reconstruction on without pinning a specific model — the game/driver default preset applies."},
+  render_preset_k:{title:"K — 1st-gen Transformer RR",desc:"The DLSS 4.0 transformer Ray Reconstruction model — current recommended default. A big step over the old CNN RR presets for denoising ray-traced lighting and reflections."},
+  render_preset_l:{title:"L — 2nd-gen Transformer RR, heavy ray tracing",desc:"The DLSS 4.5 2nd-gen transformer RR model, tuned for the heaviest ray-traced scenes / lowest RR input resolutions. Pairs naturally with Super Resolution preset L."},
+  render_preset_m:{title:"M — 2nd-gen Transformer RR, general purpose",desc:"The DLSS 4.5 2nd-gen transformer RR model, general-purpose pick — pairs naturally with Super Resolution preset M for a consistent 2nd-gen look."},
+  render_preset_n:{title:"N — reserved",desc:"Defined in the driver/dxvk-nvapi preset enum but with no published NVIDIA behaviour yet (Aug 2026). Expected to gain meaning alongside DLSS 5."},
+  render_preset_o:{title:"O — reserved",desc:"Reserved alongside N, not yet assigned a model — likely tied to DLSS 5's neural-rendering pipeline once it ships (NVIDIA has said Fall 2026). Safe to try; expect no visible change today."},
+  render_preset_latest:{title:"Latest / recommended",desc:"Always resolves to whichever RR preset NVIDIA currently recommends for the game/GPU combination — set it and forget it."},
+};
+function showPresetPop(selectEl,info){
+  if(!info){hidePresetPop();return}
+  const pop=$("#presetPop");
+  $("#presetPopTitle").textContent=info.title;
+  $("#presetPopBody").textContent=info.desc;
+  pop.hidden=false;
+  const r=selectEl.getBoundingClientRect(),pr=pop.getBoundingClientRect();
+  let top=r.bottom+8,left=r.left;
+  if(left+pr.width>window.innerWidth-12)left=window.innerWidth-pr.width-12;
+  if(top+pr.height>window.innerHeight-12)top=r.top-pr.height-8;
+  pop.style.top=Math.max(8,top)+"px";
+  pop.style.left=Math.max(8,left)+"px";
+}
+function hidePresetPop(){$("#presetPop").hidden=true}
+$("#dlssPreset").addEventListener("change",()=>showPresetPop($("#dlssPreset"),SR_PRESET_INFO[$("#dlssPreset").value]));
+$("#rrPreset").addEventListener("change",()=>showPresetPop($("#rrPreset"),RR_PRESET_INFO[$("#rrPreset").value]));
+$("#presetPopClose").addEventListener("click",hidePresetPop);
+document.addEventListener("click",e=>{
+  if(!e.target.closest("#presetPop")&&e.target.id!=="dlssPreset"&&e.target.id!=="rrPreset")hidePresetPop();
+});
+window.addEventListener("keydown",e=>{if(e.key==="Escape"&&!$("#presetPop").hidden)hidePresetPop()});
 $("#launchStr").addEventListener("input",()=>{manualEdit=true});
 /* naive reverse-parse: light the toggles a saved string matches */
 function loadStringIntoUI(str){
@@ -1837,16 +1901,20 @@ async function loadHardware(){
         <h3>Overlay preset</h3>
         <div class="row">
           <select id="hwPreset">
-            <option value="reference" selected>Recommended — GPU &amp; CPU name, load, temp, VRAM, FPS, frametime graph</option>
+            <option value="reference" selected>Recommended — GPU &amp; CPU name, load, temp, power, VRAM, FPS, frametime graph</option>
             <option value="minimal">Minimal — FPS, GPU load, CPU load</option>
-            <option value="standard">Standard — adds RAM</option>
-            <option value="benchmark">Benchmark — adds power, I/O, percentiles</option>
+            <option value="standard">Standard — adds RAM, power</option>
+            <option value="benchmark">Benchmark — adds I/O, percentiles</option>
             <option value="stutter">Stutter analysis — adds histogram, throttling, present mode</option>
           </select>
           <label class="note"><input type="checkbox" id="hwLog"> log to PCC benchmarks</label>
         </div>
         <p class="note">Font: ${hw.font?esc(hw.font.split("/").pop()):"system default (install ttf-jetbrains-mono for the best look)"}
           · toggle overlay with Shift_R+F12</p>
+        <p class="note">CPU wattage needs read access to the RAPL power counter — if it shows 0W, run
+          <code class="mono">sudo chmod o+r /sys/class/powercap/intel-rapl:0/energy_uj</code> (Intel) or check your
+          board's <code class="mono">amd_energy</code>/<code class="mono">hwmon</code> permissions on AMD. GPU wattage
+          reads via nvidia-smi and needs no setup.</p>
       </div>
       <div class="section">
         <h3>Config preview</h3>

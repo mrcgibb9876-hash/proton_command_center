@@ -26,7 +26,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.16.2"
+VERSION = "1.17.0"
 PORT = int(os.environ.get("PCC_PORT", "8686"))
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path.home() / ".local/share/proton-command-center"
@@ -2713,33 +2713,37 @@ def detect_hardware() -> dict:
 
 
 # MangoHud 0.8.2 with legacy_layout=false draws a column per listed param.
-# The look in the reference screenshot: horizontal single line, orange section
-# headings, white values, grey unit labels, separators between GPU|CPU|FPS,
-# dark rounded background, frametime graph beneath.
+# Horizontal single line, each stat block colour-coded (blue CPU, NVIDIA-green
+# GPU, violet VRAM, amber RAM) instead of one flat orange for everything, on a
+# slightly blue-tinted charcoal background matching PCC's own panel colour
+# (--panel2 #1e252e) rather than plain black/grey. round_corners matches
+# PCC's own --radius so the overlay reads as part of the same UI.
 MANGOHUD_STYLE = {
     "horizontal": True,             # single-line layout like the reference
     "legacy_layout": False,
     "table_columns": 14,
     "background_alpha": 0.6,
-    "round_corners": 8,
+    "round_corners": 10,
     "font_size": 22,
     "font_size_text": 22,
     "cellpadding_y": -0.03,
-    # colours (hex, no #): orange headings, white values, grey dividers
-    "gpu_color": "F09000",          # orange - matches the RTX label
-    "cpu_color": "F09000",
-    "vram_color": "F09000",
-    "ram_color": "F09000",
-    "engine_color": "F09000",
-    "io_color": "FFFFFF",
+    # colours (hex, no #): one accent per stat category, echoing PCC's own
+    # brand palette (--launch/--dlss/--compiled/--cache) instead of a single
+    # orange for everything and grey for the rest.
+    "gpu_color": "76B900",          # NVIDIA green - matches --dlss
+    "cpu_color": "4DA3FF",          # PCC blue - matches --launch
+    "vram_color": "B07AFF",         # PCC violet - matches --compiled
+    "ram_color": "E8A33D",          # PCC amber - matches --cache
+    "engine_color": "FF5D5D",       # PCC red - matches --danger
+    "io_color": "A491D3",
     "frametime_color": "FFFFFF",
-    "background_color": "0B0E11",
+    "background_color": "12181F",
     "text_color": "FFFFFF",
     "media_player_color": "FFFFFF",
     "network_color": "FFFFFF",
-    "separator_color": "3A444E",
+    "separator_color": "2A333E",    # matches PCC's own --line
     "battery_color": "FFFFFF",
-    "wine_color": "F09000",
+    "wine_color": "FF5D5D",
 }
 
 MANGOHUD_PRESETS = {
@@ -2747,12 +2751,13 @@ MANGOHUD_PRESETS = {
     # gpu_name/cpu_name are intentionally omitted so the overlay doesn't print
     # the long device-name prefix (e.g. "NVIDIA GeForce RTX 5070 Laptop").
     "reference": ["cpu_name", "cpu_stats", "cpu_load_change", "cpu_temp",
-                  "gpu_name", "gpu_stats", "gpu_load_change", "gpu_temp",
-                  "vram", "fps", "frame_timing=1"],
+                  "cpu_power", "gpu_name", "gpu_stats", "gpu_load_change",
+                  "gpu_temp", "gpu_power", "vram", "fps", "frame_timing=1"],
     "minimal": ["fps", "frame_timing=1", "cpu_stats", "gpu_stats"],
     "standard": ["fps", "fps_color_change", "frame_timing=1", "cpu_name",
-                 "cpu_stats", "cpu_temp", "cpu_load_change", "ram", "gpu_name",
-                 "gpu_stats", "gpu_temp", "gpu_load_change", "vram"],
+                 "cpu_stats", "cpu_temp", "cpu_load_change", "cpu_power",
+                 "ram", "gpu_name", "gpu_stats", "gpu_temp", "gpu_load_change",
+                 "gpu_power", "vram"],
     "benchmark": ["fps", "fps_color_change", "frame_timing=1", "histogram",
                   "cpu_stats", "cpu_temp", "cpu_power", "cpu_load_change",
                   "ram", "swap", "gpu_stats", "gpu_temp", "gpu_power",
