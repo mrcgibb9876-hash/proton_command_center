@@ -128,8 +128,16 @@ body.gp-active .card.gp-focus .playbtn{opacity:1}
 #browseList .entry.file .nm{color:var(--ink)}
 #browseList .entry.file:not(.exe) .nm{color:var(--muted)}
 #browseErr{color:var(--danger);font-size:12.5px;margin-top:8px}
-.custombadge{position:absolute;top:8px;left:8px;background:rgba(0,0,0,.7);color:var(--dlss);
-  border:1px solid var(--line);border-radius:6px;padding:2px 7px;font-size:11px;font-weight:700;z-index:2}
+.custombadge{position:absolute;top:8px;left:8px;z-index:3;background:rgba(0,0,0,.7);color:var(--dlss);
+  border:1px solid var(--line);border-radius:6px;padding:2px 7px;font-size:11px;font-weight:700}
+.nameRow{display:flex;align-items:center;gap:6px;min-width:0}
+.nameRow b{flex:1;min-width:0}
+.ultraplusbadge{flex:none;display:inline-flex;align-items:center;gap:4px;
+  background:rgba(139,110,255,.15);border:1px solid var(--compiled);border-radius:999px;
+  padding:1px 7px 1px 3px;font-size:10px;font-weight:700;letter-spacing:.02em;color:var(--compiled);
+  transition:filter .12s}
+.ultraplusbadge img{width:13px;height:13px;display:block}
+.ultraplusbadge:hover{filter:brightness(1.35)}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 
 /* top bar */
@@ -347,6 +355,24 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
       <input type="checkbox" id="fsPref"> Open fullscreen
     </label>
   </div>
+
+  <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:16px 0 10px">
+    <img src="" id="umHeadingLogo" alt="" style="height:16px;vertical-align:-3px;margin-right:6px">Ultra+ Manager</h3>
+  <p class="note" style="margin:0 0 10px">Installs and configures <a href="https://theultraplace.com/" target="_blank" rel="noopener noreferrer" style="color:var(--compiled)">Ultra+</a>
+    mods (UE4SS-based performance/visual mods). Command Center only detects what Ultra+ Manager leaves in a game's
+    folder and launches the app — mod install/config itself happens inside Ultra+ Manager.</p>
+  <div class="row">
+    <button class="btn" id="umGetBtn">Get Ultra+ Manager (Nexus Mods)</button>
+    <button class="btn primary" id="umLaunchBtn" disabled>Open Ultra+ Manager</button>
+  </div>
+  <p class="note" id="umStatus" style="margin-top:8px">Checking…</p>
+  <div class="row" style="margin-top:10px">
+    <input type="text" id="umZipPath" placeholder="/path/to/UltraPlus Manager Linux-….zip" style="flex:1">
+    <button class="btn" id="umBrowseBtn">Browse…</button>
+    <button class="btn" id="umInstallBtn">Install</button>
+  </div>
+  <p class="note" style="margin-top:6px">Nexus Mods doesn't allow automated downloads for free accounts — "Get" opens
+    the mod page so you can save the zip yourself (usually to Downloads), then Install unpacks it here.</p>
 
   <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:16px 0 10px">Proton versions (GE-Proton)</h3>
   <div id="protonList"><p class="note">Loading…</p></div>
@@ -637,10 +663,13 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
 
 <script>
 "use strict";
-const FRONTEND_VERSION="1.17.0";
+const FRONTEND_VERSION="1.18.0";
 const $=s=>document.querySelector(s);
 const api=async(p,opts)=>{const r=await fetch(p,opts);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j};
 const post=(p,body)=>api(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
+// Ultra+ Manager's own logo (theultraplace.com), bundled as a data URI so the
+// stdlib-only backend doesn't need a static-file route to serve it.
+const ULTRAPLUS_LOGO="data:image/png;base64,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";
 const vTup=v=>String(v||"0").split(".").map(n=>parseInt(n)||0);
 const vNewer=(a,b)=>{const x=vTup(a),y=vTup(b);for(let i=0;i<Math.max(x.length,y.length);i++){if((x[i]||0)>(y[i]||0))return true;if((x[i]||0)<(y[i]||0))return false}return false};
 const fShort=v=>{const p=String(v||"?").split(".");while(p.length>2&&p[p.length-1]==="0")p.pop();return p.join(".")};
@@ -666,6 +695,7 @@ const TOGGLES=[
  {id:"dlssupgrade",needs:"PROTON_DLSS_UPGRADE",label:"DLSS auto-upgrade",hint:"PROTON_DLSS_UPGRADE=1 — swaps the game's bundled DLSS DLL for the newest one Proton ships, without touching game files. Overlaps with the DLSS tab's manual swaps; pick one approach.",env:"PROTON_DLSS_UPGRADE=1"},
  {id:"fsr4upgrade",needs:"PROTON_FSR4_UPGRADE",label:"FSR4 upgrade",hint:"PROTON_FSR4_UPGRADE=1 — upgrades FSR 3.1 DLLs to FSR 4. RDNA4 only in practice; on your NVIDIA GPU this won't do anything useful.",env:"PROTON_FSR4_UPGRADE=1"},
  {id:"noesync",needs:"PROTON_NO_ESYNC",label:"Disable esync",hint:"PROTON_NO_ESYNC=1 — turns off eventfd synchronisation. A troubleshooting switch: try it only if a game hangs or crashes on launch, since esync is normally a performance win.",env:"PROTON_NO_ESYNC=1"},
+ {id:"ultraplus",label:"Ultra+ mod loader",hint:"WINEDLLOVERRIDES=dwmapi=n,b — forces Proton to load the mod's dwmapi.dll (UE4SS + ASI loader) from disk instead of its own builtin stub, so Ultra+'s UltraPlusExtensions and any companion .asi fixes (e.g. NaniteRayTracingFix.asi) can inject. The status note below only appears once a game is open, and only means something if the files are already in the game folder — installed separately via Ultra+ Manager.",env:"WINEDLLOVERRIDES=dwmapi=n,b"},
  {id:"gamescope",label:"Gamescope (NVIDIA)",hint:"Wraps the game in gamescope at your display's native resolution/refresh with adaptive-sync + --mangoapp overlay. Forces NVAPI on so DLSS works inside gamescope. Can improve frame pacing by isolating the game from the desktop compositor. NOTE: overrides all other options above except the Proton version.",gamescope:true},
  {id:"gshdr",needs:"DXVK_HDR",label:"↳ Gamescope HDR",hint:"Adds --hdr-enabled + DXVK_HDR=1 to the gamescope command. EXPERIMENTAL on NVIDIA: works on many DX11 titles but can black-screen or hang some DX12 games. Only has an effect when Gamescope is on. Turn off if a game shows no image.",gshdr:true},
 ];
@@ -837,7 +867,7 @@ function buildString(){
   // flag list (dxr,upload_hvv); DXVK_CONFIG takes semicolon-separated
   // key=value pairs (dxvk's own env-var syntax) — so each needs its own
   // separator rather than two clashing assignments where the last wins.
-  const LIST_SEP={"VKD3D_CONFIG":",","DXVK_CONFIG":"; "};
+  const LIST_SEP={"VKD3D_CONFIG":",","DXVK_CONFIG":"; ","WINEDLLOVERRIDES":";"};
   const merged=[],seen={};
   for(const e of env){
     const eq=e.indexOf("=");
@@ -936,6 +966,42 @@ function loadStringIntoUI(str){
   if(!str){manualEdit=false;buildString()}
 }
 
+async function loadUltraPlus(appid){
+  const input=document.querySelector('#toggles input[data-id="ultraplus"]');
+  if(!input)return;
+  const row=input.closest(".toggle").querySelector("div");
+  const old=row.querySelector(".ultraplus-note");
+  if(old)old.remove();
+  const s=document.createElement("small");
+  s.className="ultraplus-note";
+  try{
+    const st=await api(`/api/game/${appid}/ultraplus`);
+    if(!st.installed){
+      s.style.color="var(--danger)";
+      s.textContent="No ue4ss folder found in this game — install Ultra+ with Ultra+ Manager first.";
+    }else if(!st.loader_present){
+      s.style.color="var(--danger)";
+      s.textContent=`ue4ss found but dwmapi.dll (the loader) is missing from ${st.exe_dir}`;
+    }else{
+      const asi=st.asi_files.length?` + ${st.asi_files.join(", ")}`:"";
+      s.style.color="var(--dlss)";
+      s.textContent=`Found dwmapi.dll${asi} in ${st.exe_dir}`
+        +(st.mod_enabled?"":" — UltraPlusExtensions is disabled in mods.txt");
+    }
+    // Reflect straight onto the card's badge - otherwise it only shows up
+    // after the next full page load, since /api/games isn't re-fetched here.
+    const g=games.find(x=>x.appid===appid);
+    if(g&&g.has_ultraplus!==!!st.installed){
+      g.has_ultraplus=!!st.installed;
+      renderGrid($("#search").value);
+    }
+  }catch(e){
+    s.style.color="var(--danger)";
+    s.textContent="Couldn't check for Ultra+ files.";
+  }
+  row.appendChild(s);
+}
+
 /* ---------- app state ---------- */
 let games=[],current=null,statusById={};
 
@@ -982,7 +1048,7 @@ function renderGrid(filter=""){
       <div class="body">
         <img loading="lazy" src="https://cdn.cloudflare.steamstatic.com/steam/apps/${g.appid}/header.jpg"
              data-appid="${g.appid}" data-fallback="0" alt="">
-        <div class="meta"><b>${esc(g.name)}</b><small>${(statusById[g.appid]||{}).installing?("installing"+((statusById[g.appid]||{}).pct!=null?" · "+(statusById[g.appid]||{}).pct+"%":"…")):(g._uninstalled?"not installed":(g.size_bytes?fmtMB(g.size_bytes):"—"))}</small></div>
+        <div class="meta"><div class="nameRow"><b>${esc(g.name)}</b>${g.has_ultraplus?`<button class="ultraplusbadge" data-ultraplus="${g.appid}" title="Ultra+ mods are set up in this game — click to open Ultra+ Manager"><img src="${ULTRAPLUS_LOGO}" alt="">ULTRA+</button>`:""}</div><small>${(statusById[g.appid]||{}).installing?("installing"+((statusById[g.appid]||{}).pct!=null?" · "+(statusById[g.appid]||{}).pct+"%":"…")):(g._uninstalled?"not installed":(g.size_bytes?fmtMB(g.size_bytes):"—"))}</small></div>
         ${g._uninstalled?`<button class="installbtn" data-install="${g.appid}">Install</button>`:`<button class="playbtn" data-play="${g.appid}" title="Play">▶</button>`}
       </div>
       <div class="cardbar"><i></i></div>
@@ -1019,6 +1085,8 @@ $("#grid").addEventListener("click",e=>{
   if(p){e.stopPropagation();playGame(p.dataset.play);return}
   const ib=e.target.closest(".installbtn");
   if(ib){e.stopPropagation();installGame(ib.dataset.install);return}
+  const ub=e.target.closest(".ultraplusbadge");
+  if(ub){e.stopPropagation();openUltraPlusManager();return}
   const c=e.target.closest(".card");
   if(!c)return;
   if(c.dataset.uninstalled){
@@ -1378,6 +1446,7 @@ async function openGame(appid){
     loadStringIntoUI(lo.value||"");
     statusById[appid]={...statusById[appid],launch:!!lo.value};
   }catch(e){loadStringIntoUI("")}
+  loadUltraPlus(appid);
   refreshCapabilities();
   loadLibrary().then(()=>loadDLSS(appid));loadCache(appid);loadBench(appid);loadCompat(appid);loadSteamShader();loadShaderEnv();loadCachedPdb(appid);
 }
@@ -1937,6 +2006,44 @@ async function loadHardware(){
   }catch(e){$("#hwBody").innerHTML=`<p class="note">${esc(e.message)}</p>`}
 }
 
+/* ---------- Ultra+ Manager ---------- */
+$("#umHeadingLogo").src=ULTRAPLUS_LOGO;
+async function loadUltraplusManager(){
+  try{
+    const st=await api("/api/ultraplus_manager/status");
+    $("#umStatus").textContent=st.installed?`Installed at ${st.path}`:"Not installed yet";
+    $("#umLaunchBtn").disabled=!st.installed;
+  }catch(e){$("#umStatus").textContent="Couldn't check status"}
+}
+$("#umGetBtn").addEventListener("click",()=>{
+  window.open("https://www.nexusmods.com/site/mods/1586","_blank","noopener");
+});
+$("#umBrowseBtn").addEventListener("click",()=>openBrowse("umZipPath"));
+$("#umInstallBtn").addEventListener("click",async()=>{
+  const path=$("#umZipPath").value.trim();
+  if(!path){toast("Enter or browse to the downloaded zip",true);return}
+  const btn=$("#umInstallBtn");btn.disabled=true;btn.textContent="Installing…";
+  try{
+    await post("/api/ultraplus_manager/install",{zip:path});
+    toast("Ultra+ Manager installed");
+    await loadUltraplusManager();
+  }catch(e){toast(e.message,true)}
+  btn.disabled=false;btn.textContent="Install";
+});
+async function openUltraPlusManager(){
+  // No CLI hook into UM for a specific game (it's GUI-only) - this opens the
+  // app itself; the game is picked inside it, same as launching it by hand.
+  try{
+    await post("/api/ultraplus_manager/launch",{});
+    toast("Opening Ultra+ Manager — pick the game there");
+  }catch(e){
+    toast("Ultra+ Manager isn't installed yet — install it from Settings",true);
+    $("#settingsPop").hidden=false;
+    loadUltraplusManager();
+  }
+}
+$("#umLaunchBtn").addEventListener("click",openUltraPlusManager);
+
 /* ---------- settings ---------- */
 $("#settingsBtn").addEventListener("click",async()=>{
   const pop=$("#settingsPop");pop.hidden=!pop.hidden;
@@ -1945,6 +2052,7 @@ $("#settingsBtn").addEventListener("click",async()=>{
       $("#keyStatus").textContent=s.sgdb_api_key_set?`Key saved (${s.sgdb_api_key_hint})`:"No key set — Steam CDN art only";
     }catch(e){}
     loadProtonList();
+    loadUltraplusManager();
   }
 });
 
@@ -2176,13 +2284,15 @@ async function loadBrowse(path){
     $("#browseList").innerHTML=rows.join("")||'<div class="entry"><span class="nm">Empty folder</span></div>';
   }catch(e){$("#browseErr").textContent=e.message}
 }
-function openBrowse(){
+let browseTarget="agExe";
+function openBrowse(target="agExe"){
+  browseTarget=target;
   $("#browseWrap").classList.add("show");
-  const exe=$("#agExe").value;
-  loadBrowse(exe?exe.replace(/\/[^/]*$/,""):"");
+  const cur=$("#"+target).value;
+  loadBrowse(cur?cur.replace(/\/[^/]*$/,""):"");
 }
 function closeBrowse(){$("#browseWrap").classList.remove("show")}
-$("#agBrowseBtn").addEventListener("click",openBrowse);
+$("#agBrowseBtn").addEventListener("click",()=>openBrowse("agExe"));
 $("#browseCancel").addEventListener("click",closeBrowse);
 $("#browseWrap").addEventListener("click",e=>{if(e.target===$("#browseWrap"))closeBrowse()});
 $("#browseQuick").addEventListener("click",e=>{
@@ -2195,15 +2305,17 @@ $("#browseList").addEventListener("click",e=>{
   const pick=e.target.closest("[data-pick]");
   if(!pick)return;
   const path=pick.dataset.pick;
-  $("#agExe").value=path;
-  if(!$("#agStartDir").value.trim())$("#agStartDir").value=path.replace(/\/[^/]*$/,"")||"/";
-  if(!$("#agName").value.trim()){
-    const base=path.split("/").pop().replace(/\.(exe|sh|appimage|bin)$/i,"");
-    $("#agName").value=base;
-  }
-  if(/\.exe$/i.test(path)&&!$("#agProton").checked){
-    $("#agProton").checked=true;
-    $("#agProton").dispatchEvent(new Event("change"));
+  $("#"+browseTarget).value=path;
+  if(browseTarget==="agExe"){
+    if(!$("#agStartDir").value.trim())$("#agStartDir").value=path.replace(/\/[^/]*$/,"")||"/";
+    if(!$("#agName").value.trim()){
+      const base=path.split("/").pop().replace(/\.(exe|sh|appimage|bin)$/i,"");
+      $("#agName").value=base;
+    }
+    if(/\.exe$/i.test(path)&&!$("#agProton").checked){
+      $("#agProton").checked=true;
+      $("#agProton").dispatchEvent(new Event("change"));
+    }
   }
   closeBrowse();
 });

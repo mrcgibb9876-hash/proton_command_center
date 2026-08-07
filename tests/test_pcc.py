@@ -244,6 +244,33 @@ class PCCTests(unittest.TestCase):
         r = pcc.restore_dll(dlls[0]["path"])
         self.assertTrue(r["restored"])
 
+    def test_scan_ultraplus_detects_loader_and_asi(self):
+        exe_dir = self.root / "steamapps/common/TestGame/Binaries/Win64"
+        mods_dir = exe_dir / "ue4ss" / "Mods"
+        mods_dir.mkdir(parents=True)
+        (exe_dir / "dwmapi.dll").write_bytes(b"x")
+        (exe_dir / "NaniteRayTracingFix.asi").write_bytes(b"x")
+        (mods_dir / "mods.txt").write_text(
+            "﻿BPML_GenericFunctions : 1\nUltraPlusExtensions : 1\n")
+        st = pcc.scan_ultraplus(self.root / "steamapps/common/TestGame")
+        self.assertTrue(st["installed"])
+        self.assertTrue(st["loader_present"])
+        self.assertTrue(st["mod_enabled"])
+        self.assertEqual(st["asi_files"], ["NaniteRayTracingFix.asi"])
+        self.assertEqual(st["exe_dir"], str(exe_dir))
+
+    def test_scan_ultraplus_missing_loader(self):
+        exe_dir = self.root / "steamapps/common/TestGame/Binaries/Win64"
+        (exe_dir / "ue4ss" / "Mods").mkdir(parents=True)
+        st = pcc.scan_ultraplus(self.root / "steamapps/common/TestGame")
+        self.assertTrue(st["installed"])
+        self.assertFalse(st["loader_present"])
+        self.assertEqual(st["asi_files"], [])
+
+    def test_scan_ultraplus_not_installed(self):
+        st = pcc.scan_ultraplus(self.root / "steamapps/common/TestGame")
+        self.assertFalse(st["installed"])
+
     def test_swap_refuses_type_mismatch(self):
         game_dll = self.root / "steamapps/common/TestGame/Engine/nvngx_dlss.dll"
         wrong = pcc.DLL_LIBRARY / "nvngx_dlssg.dll"

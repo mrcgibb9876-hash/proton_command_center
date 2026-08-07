@@ -26,7 +26,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.17.0"
+VERSION = "1.18.0"
 PORT = int(os.environ.get("PCC_PORT", "8686"))
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path.home() / ".local/share/proton-command-center"
@@ -972,6 +972,105 @@ def _backup_path(dll_path):
     h = re.sub(r"[^A-Za-z0-9]", "_", str(p))
     return BACKUP_DIR / f"{h}.pccbak"
 
+
+# --------------------------------------------------------------------------
+# Ultra+ (UE4SS-based mod) detection
+# --------------------------------------------------------------------------
+
+def scan_ultraplus(install_path):
+    """Ultra+ mods (theultraplace.com) inject via a UE4SS build that hijacks
+    dwmapi.dll, sitting next to the game's own ue4ss/ folder. Companion
+    fixes some games require (e.g. NaniteRayTracingFix.asi) are separate .asi
+    files loaded from the same directory. None of this fires under Proton
+    unless WINEDLLOVERRIDES forces the native dwmapi.dll over Proton's own
+    stub, so this only reports what's on disk - the launch-option toggle is
+    a separate, explicit step."""
+    base = Path(install_path)
+    if not base.is_dir():
+        return {"installed": False}
+    SKIP_DIRS = {"development", "debug", "profile", "profiling"}
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames
+                       if not d.startswith(".") and d.lower() not in SKIP_DIRS]
+        if "ue4ss" not in (d.lower() for d in dirnames):
+            continue
+        exe_dir = Path(dirpath)
+        mods_txt = exe_dir / "ue4ss" / "Mods" / "mods.txt"
+        enabled = False
+        if mods_txt.is_file():
+            for line in mods_txt.read_text(errors="replace").splitlines():
+                name, _, flag = line.strip().lstrip("﻿").partition(":")
+                if name.strip().lower() == "ultraplusextensions":
+                    enabled = flag.strip() == "1"
+                    break
+        return {
+            "installed": True,
+            "exe_dir": str(exe_dir),
+            "loader_present": (exe_dir / "dwmapi.dll").is_file(),
+            "asi_files": sorted(p.name for p in exe_dir.glob("*.asi")),
+            "mod_enabled": enabled,
+        }
+    return {"installed": False}
+
+
+ULTRAPLUS_DIR = DATA_DIR / "tools" / "ultraplus-manager"
+ULTRAPLUS_NEXUS_URL = "https://www.nexusmods.com/site/mods/1586"
+
+
+def ultraplus_manager_binary():
+    exe = ULTRAPLUS_DIR / "UltraPlusManager.Linux"
+    return exe if exe.is_file() else None
+
+
+def ultraplus_manager_status() -> dict:
+    exe = ultraplus_manager_binary()
+    return {"installed": exe is not None, "path": str(exe) if exe else None}
+
+
+def install_ultraplus_manager(zip_path_str) -> dict:
+    """Unpack a manually-downloaded 'UltraPlus Manager Linux' zip into
+    DATA_DIR/tools. Nexus Mods has no anonymous/API download for non-premium
+    accounts, so this is a two-step flow: the Settings button opens the mod
+    page in a browser, and this call points PCC at whatever the user saved
+    from there (typically ~/Downloads)."""
+    import zipfile
+    src = Path(zip_path_str).expanduser()
+    if not src.is_file():
+        raise RuntimeError(f"File not found: {src}")
+    if src.suffix.lower() != ".zip":
+        raise RuntimeError("Expected the Ultra+ Manager Linux .zip from Nexus Mods")
+    with zipfile.ZipFile(src) as zf:
+        names = [n for n in zf.namelist() if n and not n.endswith("/")]
+        for n in names:
+            if n.startswith("/") or ".." in n.split("/"):
+                raise RuntimeError(f"unsafe path in archive: {n}")
+        roots = {n.split("/", 1)[0] for n in names if "/" in n}
+        with tempfile.TemporaryDirectory() as tmp:
+            zf.extractall(tmp)
+            tmp_path = Path(tmp)
+            payload = tmp_path / next(iter(roots)) if len(roots) == 1 else tmp_path
+            if not (payload / "UltraPlusManager.Linux").is_file():
+                raise RuntimeError("Archive doesn't look like UltraPlus Manager Linux "
+                                   "(no UltraPlusManager.Linux binary inside)")
+            ULTRAPLUS_DIR.parent.mkdir(parents=True, exist_ok=True)
+            if ULTRAPLUS_DIR.exists():
+                shutil.rmtree(ULTRAPLUS_DIR)
+            shutil.move(str(payload), str(ULTRAPLUS_DIR))
+    exe = ULTRAPLUS_DIR / "UltraPlusManager.Linux"
+    exe.chmod(exe.stat().st_mode | 0o111)
+    return ultraplus_manager_status()
+
+
+def launch_ultraplus_manager() -> dict:
+    """UltraPlus Manager has no CLI flag to jump to a specific game (checked
+    the shipped binary/DLL for --game/--appid style args - it's GUI-only, you
+    pick the game inside it), so this opens the app itself rather than any
+    one game's settings."""
+    exe = ultraplus_manager_binary()
+    if not exe:
+        raise RuntimeError("Ultra+ Manager isn't installed yet - get it from Settings")
+    _spawn_detached([str(exe)])
+    return {"launched": True}
 
 
 def dedupe_dll_library() -> None:
@@ -3124,6 +3223,7 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
                 dlss_seen = state.get("dlss_seen", {})
+                ultraplus_seen = state.get("ultraplus_seen", {})
                 for g in games:
                     # Shortcuts carry their own LaunchOptions field (surfaced by
                     # list_shortcuts as launch_options_shortcut) rather than living
@@ -3135,6 +3235,7 @@ class Handler(BaseHTTPRequestHandler):
                         (Path(lib) / "shadercache" / g["appid"]).is_dir()
                         for lib in [g["library"]])
                     g["has_dlss"] = bool(dlss_seen.get(g["appid"]))
+                    g["has_ultraplus"] = bool(ultraplus_seen.get(g["appid"]))
                 self._json({"games": games})
             elif m := re.match(r"^/api/game/(\d+)/launch_options$", self.path):
                 self._json(get_launch_options(root, m.group(1)))
@@ -3146,6 +3247,17 @@ class Handler(BaseHTTPRequestHandler):
                 state.setdefault("dlss_seen", {})[m.group(1)] = bool(dlls)
                 save_state(state)
                 self._json({"dlls": dlls})
+            elif m := re.match(r"^/api/game/(\d+)/ultraplus$", self.path):
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(m.group(1))
+                result = scan_ultraplus(g["install_path"]) if g else {"installed": False}
+                if g:
+                    state = load_state()
+                    state.setdefault("ultraplus_seen", {})[m.group(1)] = bool(result.get("installed"))
+                    save_state(state)
+                self._json(result)
+            elif self.path == "/api/ultraplus_manager/status":
+                self._json(ultraplus_manager_status())
             elif self.path == "/api/progress":
                 self._json({"games": install_progress(root)})
             elif self.path == "/api/owned_games":
@@ -3260,6 +3372,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(launch_game_mode())
             elif self.path == "/api/backup/restore":
                 self._json(restore_backup(body["archive"]))
+            elif self.path == "/api/ultraplus_manager/install":
+                self._json(install_ultraplus_manager(body["zip"]))
+            elif self.path == "/api/ultraplus_manager/launch":
+                self._json(launch_ultraplus_manager())
             elif self.path == "/api/proton/install":
                 tid = str(uuid.uuid4())
                 threading.Thread(target=install_ge_proton,

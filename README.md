@@ -100,7 +100,17 @@ server-side. Skip them and everything else still works.
 
 Compatibility tools are read from disk, so only builds you actually have are
 offered, and new releases show up on their own. Toggles cover DXVK, gamescope,
-HDR, native Wayland, Reflex, esync, and GE-only extras like D7VK and OptiScaler.
+HDR, native Wayland, Reflex, esync, GE-only extras like D7VK and OptiScaler,
+and an Ultra+ mod loader toggle (`WINEDLLOVERRIDES=dwmapi=n,b`) for UE4SS-based
+mods from [theultraplace.com](https://theultraplace.com) - it forces Proton to
+load the mod's dwmapi.dll from disk instead of its own stub. Opening a game
+whose folder has a `ue4ss/` directory shows what Ultra+ found there (the
+loader DLL, any companion `.asi` fixes); the files themselves come from
+Ultra+ Manager, not Command Center.
+
+A game with Ultra+ set up gets an **ULTRA+** badge on its library card - click
+the logo to launch Ultra+ Manager. Get the manager itself, or point Command
+Center at an already-downloaded copy, from *Settings → Ultra+ Manager*.
 
 
 Options that the selected build can't act on are greyed out with the reason. The
@@ -242,5 +252,15 @@ Tests build a mock Steam install in a temp dir, so they run anywhere. A second
 instance won't disturb your service: `PCC_PORT=8687 python3 pcc.py`. Games
 launched via Play run in their own systemd scope, so restarting the backend
 never kills a running game.
+
+## Credits
+
+Ultra+, Ultra+ Manager, and the UE4SS-based mods they cover are made by the
+Ultra+ team at [theultraplace.com](https://theultraplace.com) and distributed
+via [Nexus Mods](https://www.nexusmods.com/site/mods/1586). Command Center
+doesn't install or modify any of their files itself - it only detects what
+Ultra+ Manager already put in a game's folder and launches the app; all
+Ultra+ branding and assets (including the logo shown on tagged library cards)
+belong to their respective owners.
 
 MIT. Copyright (c) 2026 Marc Gibb.
