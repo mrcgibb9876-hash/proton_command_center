@@ -62,7 +62,9 @@ class PCCTests(unittest.TestCase):
         pcc.STATE_FILE = pcc.DATA_DIR / "state.json"
         pcc.CONFIG_FILE = pcc.DATA_DIR / "config.json"
         pcc.ART_DIR = pcc.DATA_DIR / "art"
-        for d in (pcc.DLL_LIBRARY, pcc.BACKUP_DIR, pcc.ART_DIR):
+        pcc.RESHADE_DIR = pcc.DATA_DIR / "reshade"
+        pcc.RESHADE_SHADERS_DIR = pcc.RESHADE_DIR / "shaders"
+        for d in (pcc.DLL_LIBRARY, pcc.BACKUP_DIR, pcc.ART_DIR, pcc.RESHADE_DIR):
             d.mkdir(parents=True, exist_ok=True)
         pcc.steam_running = lambda: False
         pcc.ART_MISSES.clear()
@@ -277,6 +279,89 @@ class PCCTests(unittest.TestCase):
         wrong.write_bytes(b"x")
         with self.assertRaises(RuntimeError):
             pcc.swap_dll(str(game_dll), str(wrong))
+
+    # ---- ReShade ----
+    def test_detect_graphics_api_priority_and_dxgi_inference(self):
+        """DX12 > Vulkan > DX11 > DX10 > OpenGL > DX9 > DX8, and a dxgi.dll
+        import with nothing higher-priority present is inferred as DX12 (many
+        modern engines create their device through DXGI alone)."""
+        self.assertEqual(pcc.detect_graphics_api({"d3d11.dll", "d3d9.dll"}), "d3d11")
+        self.assertEqual(pcc.detect_graphics_api({"opengl32.dll"}), "opengl")
+        self.assertEqual(pcc.detect_graphics_api({"dxgi.dll"}), "d3d12")
+        self.assertEqual(pcc.detect_graphics_api({"dxgi.dll", "d3d11.dll"}), "d3d11")
+        self.assertIsNone(pcc.detect_graphics_api(set()))
+
+    def test_find_game_exe_skips_installers_picks_largest(self):
+        d = self.root / "steamapps/common/TestGame"
+        (d / "UnInstall.exe").write_bytes(b"x" * 500)
+        (d / "EasyAntiCheat_Setup.exe").write_bytes(b"x" * 5000)
+        (d / "Binaries/Win64").mkdir(parents=True, exist_ok=True)
+        real = d / "Binaries/Win64/Game-Win64-Shipping.exe"
+        real.write_bytes(b"x" * 2000)
+        found = pcc._find_game_exe(d)
+        self.assertEqual(found, real)
+
+    def _fake_exe(self):
+        d = self.root / "steamapps/common/TestGame"
+        exe = d / "Game.exe"
+        exe.write_bytes(b"MZ" + b"\x00" * 62)   # not a real PE; api_override bypasses detection
+        return d, exe
+
+    def test_install_reshade_refuses_foreign_dll(self):
+        d, exe = self._fake_exe()
+        (d / "dxgi.dll").write_bytes(b"not ours")
+        with self.assertRaises(RuntimeError) as ctx:
+            pcc.install_reshade("12345", str(d), api_override="d3d11")
+        self.assertIn("wasn't installed by Command Center", str(ctx.exception))
+
+    def test_install_reshade_full_flow_and_update_and_remove(self):
+        d, exe = self._fake_exe()
+
+        engine_dir = pcc.RESHADE_DIR / "9.9.9"
+        engine_dir.mkdir(parents=True)
+        (engine_dir / "ReShade64.dll").write_bytes(b"fake reshade64")
+        (engine_dir / "ReShade32.dll").write_bytes(b"fake reshade32")
+        real_latest, real_ensure_engine, real_ensure_shaders = (
+            pcc.reshade_latest, pcc.ensure_reshade_engine, pcc.ensure_default_shaders)
+        pcc.reshade_latest = lambda: {"version": "9.9.9", "url": "http://x"}
+        pcc.ensure_reshade_engine = lambda version, url=None, task_id=None: engine_dir
+        pcc.ensure_default_shaders = lambda task_id=None: pcc.RESHADE_SHADERS_DIR
+        try:
+            r = pcc.install_reshade("12345", str(d), api_override="d3d11")
+        finally:
+            pcc.reshade_latest = real_latest
+            pcc.ensure_reshade_engine = real_ensure_engine
+            pcc.ensure_default_shaders = real_ensure_shaders
+
+        self.assertEqual(r["proxy_dll"], "dxgi.dll")
+        self.assertEqual(r["winedlloverride"], "dxgi=n,b")
+        self.assertTrue(r["wrote_ini"])
+        target = d / "dxgi.dll"
+        self.assertEqual(target.read_bytes(), b"fake reshade64")
+        ini = (d / "ReShade.ini").read_text()
+        self.assertIn("EffectSearchPaths=", ini)
+
+        # updating (same appid, same target, now tracked as ours) must be
+        # allowed even though the target already exists.
+        (engine_dir / "ReShade64.dll").write_bytes(b"fake reshade64 v2")
+        pcc.reshade_latest = lambda: {"version": "9.9.9", "url": "http://x"}
+        pcc.ensure_reshade_engine = lambda version, url=None, task_id=None: engine_dir
+        pcc.ensure_default_shaders = lambda task_id=None: pcc.RESHADE_SHADERS_DIR
+        try:
+            r2 = pcc.install_reshade("12345", str(d), api_override="d3d11")
+        finally:
+            pcc.reshade_latest = real_latest
+            pcc.ensure_reshade_engine = real_ensure_engine
+            pcc.ensure_default_shaders = real_ensure_shaders
+        self.assertTrue(r2["installed"])
+        self.assertEqual(target.read_bytes(), b"fake reshade64 v2")
+        self.assertFalse(r2["wrote_ini"])          # existing ini left alone
+
+        rm = pcc.remove_reshade("12345")
+        self.assertTrue(rm["removed"])
+        self.assertFalse(target.exists())
+        with self.assertRaises(RuntimeError):
+            pcc.remove_reshade("12345")   # nothing tracked any more
 
     # ---- compile state ----
     def test_sgdb_fetch_and_cache(self):
@@ -845,15 +930,6 @@ class PCCTests(unittest.TestCase):
         self.assertEqual(r["newest"], "GE-Proton9-28")
         self.assertFalse(r["up_to_date"])
 
-    def test_display_mode_parse_from_kscreen(self):
-        """kscreen-doctor active mode (marked *) parses to width/height/refresh."""
-        import re
-        sample = "Modes:  1:2560x1600@165.00*!  2:2560x1600@60.00"
-        m = re.search(r"(\d+)x(\d+)@(\d+(?:\.\d+)?)\*", sample)
-        self.assertIsNotNone(m)
-        self.assertEqual((m.group(1), m.group(2), round(float(m.group(3)))),
-                         ("2560", "1600", 165))
-
     def test_ge_proton_selects_x86_not_arm(self):
         """GE-Proton 11+ ships aarch64 + x86_64 tarballs; must pick x86_64 even
         when the ARM build is listed first (regression: was grabbing ARM)."""
@@ -917,47 +993,6 @@ class PCCTests(unittest.TestCase):
         g = next(x for x in pcc.list_games(self.root) if x["appid"] == "555")
         self.assertTrue(g["fully_installed"])
         self.assertIsNone(g["download_pct"])   # NOT 3.0
-
-    def test_display_mode_never_runs_qt_tool_without_display(self):
-        """Regression: kscreen-doctor is a Qt app that qFatal()s and dumps core
-        when it can't reach a display. The backend runs as a systemd user
-        service with no WAYLAND_DISPLAY of its own, so Qt fell back to xcb,
-        found no DISPLAY either, and aborted -> repeated coredumps in the
-        journal. It must not be invoked at all without a reachable session."""
-        calls = []
-
-        class FakeRun:
-            def __init__(self, out=""):
-                self.stdout = out
-
-        def fake_run(cmd, **kw):
-            calls.append((cmd, kw))
-            return FakeRun("1:2560x1600@165.00*!")
-
-        real_run, real_which = pcc.subprocess.run, pcc.shutil.which
-        real_senv = pcc.session_env
-        pcc.shutil.which = lambda n: "/usr/bin/kscreen-doctor"
-        pcc.subprocess.run = fake_run
-        try:
-            # no display anywhere -> must NOT invoke the Qt tool
-            pcc.session_env = lambda: {}
-            pcc.detect_display_mode()
-            self.assertEqual(calls, [], "ran kscreen-doctor with no display")
-
-            # display present -> runs it, with the session env and a pinned
-            # platform plugin so Qt can't fall back to xcb on Wayland
-            pcc.session_env = lambda: {"WAYLAND_DISPLAY": "wayland-0",
-                                       "XDG_RUNTIME_DIR": "/run/user/1000"}
-            mode = pcc.detect_display_mode()
-            self.assertEqual(len(calls), 1)
-            env = calls[0][1]["env"]
-            self.assertEqual(env["WAYLAND_DISPLAY"], "wayland-0")
-            self.assertEqual(env["QT_QPA_PLATFORM"], "wayland")
-            self.assertEqual(mode, {"width": 2560, "height": 1600,
-                                    "refresh": 165})
-        finally:
-            pcc.subprocess.run, pcc.shutil.which = real_run, real_which
-            pcc.session_env = real_senv
 
     def test_pkgbuild_never_ships_skip_checksum(self):
         """Regression: the PKGBUILD template carried sha256sums=('SKIP'), which

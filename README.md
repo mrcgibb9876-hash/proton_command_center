@@ -21,8 +21,8 @@ Python standard library only. No dependencies, no telemetry, no account.
 ## What it does
 
 **Builds launch options with toggles instead of guesswork.** Pick from DXVK,
-gamescope, HDR, Wayland, Reflex and the rest. Each one says what it does and
-what it costs.
+HDR, Wayland, Reflex and the rest. Each one says what it does and what it
+costs.
 
 **Knows what your Proton build actually supports.** GE-Proton 11-1 reads 90
 environment variables. Valve's Proton 11.0 reads 60. Set a GE-only option on a
@@ -31,6 +31,11 @@ build and greys out what won't work, so you can't ship dead options.
 
 **Manages DLSS DLLs.** Every DLL in the game with its version, one-click
 upgrade, backups you can roll back.
+
+**Installs ReShade.** Detects the game's graphics API from its own exe and
+bitness, drops the matching build next to it under the right proxy name, and
+seeds a shared shader library. Refuses to overwrite a proxy DLL it didn't
+install itself.
 
 **Fixes Steam's shader processing.** Steam defaults to a fraction of your cores
 for the "Processing Vulkan shaders" pass. The setting isn't in Steam's UI at
@@ -99,8 +104,8 @@ server-side. Skip them and everything else still works.
 ![Launch options built from toggles, with unsupported ones greyed out](assets/screenshots/launch.png)
 
 Compatibility tools are read from disk, so only builds you actually have are
-offered, and new releases show up on their own. Toggles cover DXVK, gamescope,
-HDR, native Wayland, Reflex, esync, GE-only extras like D7VK and OptiScaler,
+offered, and new releases show up on their own. Toggles cover DXVK, HDR,
+native Wayland, Reflex, esync, GE-only extras like D7VK and OptiScaler,
 and an Ultra+ mod loader toggle (`WINEDLLOVERRIDES=dwmapi=n,b`) for UE4SS-based
 mods from [theultraplace.com](https://theultraplace.com) - it forces Proton to
 load the mod's dwmapi.dll from disk instead of its own stub. Opening a game
@@ -130,6 +135,31 @@ one-click restart.
 Every DLSS DLL in the game with its version. Swap in a newer one from your
 library, back up the original, roll back whenever. Requires an NVIDIA driver.
 
+### ReShade tab
+
+Scans the game's own exe for its graphics API (reading the PE import table -
+same technique as [RankFTW/RHI](https://github.com/RankFTW/RHI)'s detector)
+and bitness, then offers to install ReShade under the matching proxy DLL name:
+`d3d9.dll` for D3D9, `dxgi.dll` for D3D10/11/12, `opengl32.dll` for OpenGL.
+Native Vulkan and D3D8 aren't supported yet. Both the API and the exe it
+scanned can be overridden manually if it guesses wrong.
+
+The engine comes straight from reshade.me's own installer - it's a zip with a
+stub exe prepended, so no extra tooling is needed to pull `ReShade64.dll` /
+`ReShade32.dll` out of it. First install also seeds a shared shader folder
+(`~/.local/share/proton-command-center/reshade/shaders`) with ReShade's own
+default selection (Standard effects + SweetFX), pointed at from every game's
+`ReShade.ini` so effects work immediately.
+
+Installing never overwrites a proxy-named DLL Command Center didn't put there
+itself - a `dxgi.dll` already in the game folder could belong to OptiScaler or
+another mod, and clobbering it silently would break that instead. Move it
+aside first if you're sure it's safe to replace.
+
+ReShade only loads once the game process actually reads its proxy DLL from
+disk instead of Proton's own - add `WINEDLLOVERRIDES=dxgi=n,b` (or whichever
+DLL was installed) to the game's launch options; the ReShade tab has a button
+that adds this for you once it's installed.
 
 ### Shader cache tab
 
@@ -200,10 +230,6 @@ maps the controller to mouse and keyboard system-wide.
 Fullscreen is also on ⛶ or **F11**; **Esc** always leaves. *Settings → Display →
 Open fullscreen* makes it automatic - it fires on your first click or button
 press, since browsers forbid a page going fullscreen on load.
-
-### Game Mode *(CachyOS only)*
-
-Appears when `steamos-session-select` exists. Switches to the Steam Deck UI.
 
 ### Settings
 

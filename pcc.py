@@ -26,16 +26,19 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.18.0"
+VERSION = "1.19.0"
 PORT = int(os.environ.get("PCC_PORT", "8686"))
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path.home() / ".local/share/proton-command-center"
 DLL_LIBRARY = DATA_DIR / "dlls"        # dlls/<kind>/<version>/<name>.dll
 BACKUP_DIR = DATA_DIR / "backups"      # backups/<appid>/<relpath>.pccbak
+RESHADE_DIR = DATA_DIR / "reshade"     # reshade/<version>/ReShade{32,64}.dll
+RESHADE_SHADERS_DIR = RESHADE_DIR / "shaders"  # shared Shaders/ + Textures/
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DLL_LIBRARY.mkdir(parents=True, exist_ok=True)
 _DEDUPE_ON_IMPORT = True  # dedupe runs lazily via dll_library()
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+RESHADE_DIR.mkdir(parents=True, exist_ok=True)
 
 DLSS_KINDS = {
     "nvngx_dlss.dll":  {"kind": "sr",  "label": "DLSS Super Resolution"},
@@ -1453,6 +1456,369 @@ def restore_dll(game_dll_path) -> dict:
         raise RuntimeError("No backup exists for this DLL")
     shutil.copy2(bak, game_dll)
     return {"restored": True, "version": pe_version(game_dll)}
+
+
+# --------------------------------------------------------------------------
+# ReShade
+# --------------------------------------------------------------------------
+
+RESHADE_DOWNLOADS_PAGE = "https://reshade.me/"
+
+# ReShade's own default package selection - crosire/reshade-shaders'
+# EffectPackages.ini lists every installable shader pack; these two
+# (Standard effects + SweetFX) are the ones marked Enabled=1, i.e. what the
+# official Windows installer installs when you accept its defaults.
+DEFAULT_SHADER_PACKAGES = [
+    {"url": "https://github.com/crosire/reshade-shaders/archive/refs/heads/slim.zip",
+     "deny": set()},
+    {"url": "https://github.com/CeeJayDK/SweetFX/archive/refs/heads/master.zip",
+     "deny": {"Template.fx"}},
+]
+
+# Which system DLL name ReShade gets installed as, per detected graphics API.
+# D3D10/11/12 all create their device through DXGI's swap chain, so all three
+# hook via dxgi.dll - that's the standard ReShade convention on both Windows
+# and Linux/Proton. Vulkan (an implicit Vulkan layer, not a proxy DLL) and
+# D3D8 (needs its own D3D9 wrapper first) aren't supported here.
+RESHADE_PROXY_DLL = {
+    "d3d9": "d3d9.dll",
+    "d3d10": "dxgi.dll",
+    "d3d11": "dxgi.dll",
+    "d3d12": "dxgi.dll",
+    "opengl": "opengl32.dll",
+}
+
+# (dll import name, api id, priority) - higher priority wins when a game
+# imports more than one. Mirrors RankFTW/RHI's GraphicsApiDetector.
+_GRAPHICS_DLL_PRIORITY = [
+    ("d3d12.dll", "d3d12", 7),
+    ("vulkan-1.dll", "vulkan", 6),
+    ("d3d11.dll", "d3d11", 5),
+    ("d3d10.dll", "d3d10", 4),
+    ("d3d10_1.dll", "d3d10", 4),
+    ("opengl32.dll", "opengl", 3),
+    ("d3d9.dll", "d3d9", 2),
+    ("d3d8.dll", "d3d8", 1),
+]
+
+
+def pe_imports(path):
+    """Read a PE exe's machine type (32/64-bit) and imported DLL names with no
+    dependency beyond stdlib: parse the DOS/PE/section headers by hand and
+    walk the import directory table. Returns (bitness, {lowercased dll
+    names}), or (None, set()) if it doesn't look like a PE file."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None, set()
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        return None, set()
+    pe_off = struct.unpack_from("<i", data, 0x3C)[0]
+    if pe_off < 0 or pe_off + 24 > len(data) or data[pe_off:pe_off + 4] != b"PE\x00\x00":
+        return None, set()
+    coff = pe_off + 4
+    machine = struct.unpack_from("<H", data, coff)[0]
+    bitness = {0x8664: 64, 0x14c: 32}.get(machine)
+    n_sections = struct.unpack_from("<H", data, coff + 2)[0]
+    size_opt = struct.unpack_from("<H", data, coff + 16)[0]
+    opt_off = coff + 20
+    if size_opt < 2 or opt_off + size_opt > len(data):
+        return bitness, set()
+    magic = struct.unpack_from("<H", data, opt_off)[0]
+    if magic == 0x10B:      # PE32
+        imp_dir_off = opt_off + 104
+    elif magic == 0x20B:    # PE32+
+        imp_dir_off = opt_off + 120
+    else:
+        return bitness, set()
+    if imp_dir_off + 8 > len(data):
+        return bitness, set()
+    import_rva = struct.unpack_from("<I", data, imp_dir_off)[0]
+    if not import_rva:
+        return bitness, set()
+    sections = []
+    for i in range(n_sections):
+        off = opt_off + size_opt + i * 40
+        if off + 40 > len(data):
+            break
+        vsize, va = struct.unpack_from("<II", data, off + 8)
+        raw_ptr = struct.unpack_from("<I", data, off + 20)[0]
+        sections.append((va, vsize, raw_ptr))
+
+    def rva2off(rva):
+        for va, vsize, raw_ptr in sections:
+            if va <= rva < va + vsize:
+                return raw_ptr + (rva - va)
+        return None
+
+    imp_off = rva2off(import_rva)
+    if imp_off is None:
+        return bitness, set()
+    names = set()
+    i = 0
+    while True:
+        entry_off = imp_off + i * 20
+        if entry_off + 20 > len(data):
+            break
+        name_rva = struct.unpack_from("<I", data, entry_off + 12)[0]
+        if not name_rva:
+            break
+        noff = rva2off(name_rva)
+        if noff is not None:
+            end = data.find(b"\x00", noff, noff + 256)
+            if end < 0:
+                end = noff + 256
+            names.add(data[noff:end].decode("ascii", "ignore").lower())
+        i += 1
+    return bitness, names
+
+
+def detect_graphics_api(dll_names) -> str | None:
+    """Highest-priority graphics API among a PE's imported DLLs. A DX12 game
+    that creates its device through dxgi.dll alone (no d3d12.dll import,
+    common in modern engines) is inferred as DX12 when nothing higher-
+    priority was found - same rule RankFTW/RHI's detector uses."""
+    best, best_pri = None, 0
+    for dll, api, pri in _GRAPHICS_DLL_PRIORITY:
+        if dll in dll_names and pri > best_pri:
+            best, best_pri = api, pri
+    if "dxgi.dll" in dll_names and best_pri < 5:
+        return "d3d12"
+    return best
+
+
+def _find_game_exe(install_path):
+    """Best-effort: the largest .exe in the install tree, skipping obvious
+    installers/redistributables/anti-cheat launchers by name. Nothing on disk
+    says which file is the real game binary, so this is a heuristic - the
+    API-override dropdown in the UI exists for when it guesses wrong."""
+    base = Path(install_path)
+    if not base.is_dir():
+        return None
+    SKIP_DIRS = {"_commonredist", "redist", "directx", "vcredist"}
+    SKIP_NAME_HINTS = ("unins", "redist", "vcredist", "directx", "dxsetup",
+                       "crashreporter", "crashpad", "easyanticheat",
+                       "battleye", "vc_redist")
+    best, best_size = None, -1
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if d.lower() not in SKIP_DIRS]
+        for fn in filenames:
+            low = fn.lower()
+            if not low.endswith(".exe") or any(h in low for h in SKIP_NAME_HINTS):
+                continue
+            p = Path(dirpath) / fn
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            if size > best_size:
+                best, best_size = p, size
+    return best
+
+
+def reshade_latest() -> dict:
+    """Scrapes reshade.me for the current version and Full Add-on Support
+    build (needed for third-party addons like OptiScaler to load alongside
+    it). ReShade ships no GitHub releases to query, so the download page is
+    the only source. Cached 6h, same pattern as the GE-Proton release list."""
+    state = load_state()
+    cache = state.get("reshade_latest")
+    now = time.time()
+    if cache and now - cache.get("ts", 0) < 21600:
+        return cache["data"]
+    req = urllib.request.Request(RESHADE_DOWNLOADS_PAGE,
+                                 headers={"User-Agent": "Mozilla/5.0 pcc"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        html = r.read().decode("utf-8", "replace")
+    m = re.search(r"downloads/ReShade_Setup_([\d.]+)_Addon\.exe", html)
+    if not m:
+        raise RuntimeError("Couldn't find a current ReShade build on reshade.me")
+    version = m.group(1)
+    data = {"version": version,
+            "url": f"https://reshade.me/downloads/ReShade_Setup_{version}_Addon.exe"}
+    state["reshade_latest"] = {"ts": now, "data": data}
+    save_state(state)
+    return data
+
+
+def ensure_reshade_engine(version, url=None, task_id=None) -> Path:
+    """Downloads the ReShade setup .exe and pulls ReShade32.dll/ReShade64.dll
+    straight out of it. The installer is a plain zip with a .NET stub exe
+    prepended - stdlib zipfile finds the end-of-central-directory record by
+    scanning back from EOF and reads it with no extra tooling needed (checked
+    against the real 6.8.0 Addon build). Cached per version so repeat
+    installs across games don't re-download."""
+    import zipfile, io
+    engine_dir = RESHADE_DIR / version
+    if (engine_dir / "ReShade64.dll").is_file() and (engine_dir / "ReShade32.dll").is_file():
+        return engine_dir
+    if not url:
+        url = reshade_latest()["url"]
+    if task_id:
+        TASKS[task_id] = {"status": "running", "progress": 10,
+                          "detail": f"Downloading ReShade {version}"}
+    data = _gh_bytes(url, task_id)
+    if task_id:
+        TASKS[task_id]["detail"] = "Extracting"
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        names = set(zf.namelist())
+        for dll in ("ReShade32.dll", "ReShade64.dll"):
+            if dll not in names:
+                raise RuntimeError(f"ReShade installer didn't contain {dll} "
+                                   "(its format may have changed)")
+        engine_dir.mkdir(parents=True, exist_ok=True)
+        for dll in ("ReShade32.dll", "ReShade64.dll"):
+            (engine_dir / dll).write_bytes(zf.read(dll))
+    return engine_dir
+
+
+def ensure_default_shaders(task_id=None) -> Path:
+    """One-time fetch of ReShade's own default shader selection (Standard
+    effects + SweetFX) into a folder every game's ReShade.ini points at, so
+    installing ReShade gives you working effects immediately instead of an
+    empty effects list."""
+    import zipfile, io
+    shaders_dir = RESHADE_SHADERS_DIR / "Shaders"
+    textures_dir = RESHADE_SHADERS_DIR / "Textures"
+    if shaders_dir.is_dir() and any(shaders_dir.glob("*.fx")):
+        return RESHADE_SHADERS_DIR
+    shaders_dir.mkdir(parents=True, exist_ok=True)
+    textures_dir.mkdir(parents=True, exist_ok=True)
+    for pkg in DEFAULT_SHADER_PACKAGES:
+        if task_id:
+            TASKS[task_id]["detail"] = "Fetching default shaders"
+        data = _gh_bytes(pkg["url"], None)
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            roots = {n.split("/", 1)[0] for n in zf.namelist() if "/" in n}
+            if len(roots) != 1:
+                continue
+            root = next(iter(roots))
+            for n in zf.namelist():
+                if n.endswith("/"):
+                    continue
+                if n.startswith(f"{root}/Shaders/"):
+                    fn = n.rsplit("/", 1)[-1]
+                    if fn not in pkg["deny"]:
+                        (shaders_dir / fn).write_bytes(zf.read(n))
+                elif n.startswith(f"{root}/Textures/"):
+                    fn = n.rsplit("/", 1)[-1]
+                    (textures_dir / fn).write_bytes(zf.read(n))
+    return RESHADE_SHADERS_DIR
+
+
+def scan_game_reshade(appid, install_path) -> dict:
+    """Report ReShade status for a game: whatever PCC has on record for it,
+    plus best-effort auto-detection of the exe/graphics API/bitness so the
+    install call can usually proceed without asking the user anything."""
+    state = load_state()
+    rec = state.get("reshade_installs", {}).get(appid)
+    exe = _find_game_exe(install_path)
+    bitness, dll_names = pe_imports(exe) if exe else (None, set())
+    api = detect_graphics_api(dll_names) if dll_names else None
+    result = {"exe": str(exe) if exe else None, "detected_api": api,
+             "detected_bitness": bitness, "installed": False}
+    if rec:
+        p = Path(rec["path"])
+        result.update({"installed": p.is_file(), "path": rec["path"],
+                       "api": rec.get("api"), "version": rec.get("version"),
+                       "bitness": rec.get("bitness"),
+                       "proxy_name": p.name})
+    return result
+
+
+def install_reshade(appid, install_path, exe_override=None, api_override=None,
+                    task_id=None) -> dict:
+    """Installs ReShade for one game: picks (or takes) the exe, detects (or
+    takes) the graphics API and bitness, drops the matching ReShade DLL in
+    next to the exe under the name that API hooks through, and points a
+    fresh ReShade.ini at the shared shader library. Refuses to overwrite any
+    proxy-named DLL it didn't put there itself - the foreign-DLL protection
+    RankFTW/RHI's own installer has, since a game folder's dxgi.dll could
+    just as easily belong to OptiScaler or a bundled DXVK build."""
+    exe = Path(exe_override).expanduser() if exe_override else _find_game_exe(install_path)
+    if not exe or not exe.is_file():
+        raise RuntimeError("Couldn't find the game's .exe under its install folder — "
+                           "point Command Center at it manually.")
+    bitness, dll_names = pe_imports(exe)
+    api = api_override or detect_graphics_api(dll_names)
+    if not api:
+        raise RuntimeError("Couldn't tell which graphics API this game uses — pick one manually.")
+    if api not in RESHADE_PROXY_DLL:
+        raise RuntimeError(f"{api.upper()} isn't supported yet (native Vulkan needs a "
+                           "Wine-prefix layer registration Command Center doesn't do; "
+                           "D3D8 needs a D3D9 wrapper first).")
+    bitness = bitness or 64   # nearly every modern Steam game is 64-bit
+    proxy_name = RESHADE_PROXY_DLL[api]
+    target = exe.parent / proxy_name
+
+    # Foreign-DLL check happens before any download, so a refusal is instant
+    # and never wastes a fetch on a call that was always going to fail.
+    state = load_state()
+    installs = state.setdefault("reshade_installs", {})
+    rec = installs.get(appid)
+    ours = bool(rec and rec.get("path") == str(target))
+    if target.exists() and not ours:
+        raise RuntimeError(f"{proxy_name} already exists in {exe.parent} and wasn't "
+                           "installed by Command Center — refusing to overwrite it "
+                           "(could be DXVK, OptiScaler, or another mod's file). Move "
+                           "it aside first if you're sure it's safe to replace.")
+
+    info = reshade_latest()
+    engine_dir = ensure_reshade_engine(info["version"], info["url"], task_id=task_id)
+    src_dll = engine_dir / ("ReShade64.dll" if bitness == 64 else "ReShade32.dll")
+
+    # No backup step: the refusal above already guarantees target is either
+    # absent or a DLL Command Center itself put there, so there's never a
+    # foreign original to preserve here.
+    shutil.copy2(src_dll, target)
+
+    ensure_default_shaders(task_id=task_id)
+    ini_path = exe.parent / "ReShade.ini"
+    wrote_ini = not ini_path.exists()
+    if wrote_ini:
+        shaders_win = "Z:" + str(RESHADE_SHADERS_DIR / "Shaders").replace("/", "\\")
+        textures_win = "Z:" + str(RESHADE_SHADERS_DIR / "Textures").replace("/", "\\")
+        ini_path.write_text(
+            "[GENERAL]\n"
+            f"EffectSearchPaths={shaders_win}\n"
+            f"TextureSearchPaths={textures_win}\n"
+            "PresetPath=.\\ReShadePreset.ini\n")
+
+    installs[appid] = {"path": str(target), "api": api, "bitness": bitness,
+                       "version": info["version"]}
+    save_state(state)
+    return {"installed": True, "path": str(target), "proxy_dll": proxy_name,
+            "api": api, "bitness": bitness, "version": info["version"],
+            "wrote_ini": wrote_ini,
+            "winedlloverride": f"{proxy_name[:-4]}=n,b"}
+
+
+def remove_reshade(appid) -> dict:
+    """Removes ReShade from a game: deletes the proxy DLL Command Center
+    installed. Install refuses to ever touch a pre-existing foreign DLL (see
+    install_reshade), so there's never an original to restore here. The
+    ReShade.ini and shared shader library are left alone - the ini may hold
+    tuned settings, and the shaders are shared across every other game using
+    it."""
+    state = load_state()
+    installs = state.get("reshade_installs", {})
+    rec = installs.pop(appid, None)
+    if not rec:
+        raise RuntimeError("No ReShade install tracked for this game.")
+    Path(rec["path"]).unlink(missing_ok=True)
+    save_state(state)
+    return {"removed": True}
+
+
+def _reshade_install_task(task_id, appid, install_path, exe, api) -> None:
+    try:
+        result = install_reshade(appid, install_path, exe_override=exe,
+                                 api_override=api, task_id=task_id)
+        TASKS[task_id] = {"status": "done", "progress": 100,
+                          "detail": f"Installed as {result['proxy_dll']}",
+                          "result": result}
+    except Exception as e:
+        TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
 
 
 # --------------------------------------------------------------------------
@@ -2938,85 +3304,6 @@ def apply_mangohud_config(preset="reference", pin_gpu=None, log_dir=None) -> dic
 
 
 
-# --------------------------------------------------------------------------
-# Game Mode (CachyOS Handheld / gamescope session)
-# --------------------------------------------------------------------------
-def detect_display_mode() -> dict | None:
-    """Best-effort current resolution + refresh rate for auto-filling the
-    gamescope command. On KDE Wayland, kscreen-doctor reports the active mode
-    (marked with '*'). Falls back to /sys/class/drm modes for resolution and a
-    sane 60 Hz default. Returns {'width','height','refresh'} or None."""
-    # 1) kscreen-doctor (KDE Wayland) - has both res AND refresh.
-    # It's a Qt GUI app: with no reachable display it does NOT fail politely,
-    # it qFatal()s and dumps core. The backend runs as a systemd user service
-    # and so may have no WAYLAND_DISPLAY of its own, in which case Qt falls
-    # back to the xcb plugin, finds no DISPLAY either, and aborts. So: harvest
-    # the real session env, skip the call entirely if there's still no display,
-    # and pin the platform plugin so Qt can't wander off to xcb on Wayland.
-    kd = shutil.which("kscreen-doctor")
-    env = session_env()
-    if kd and (env.get("WAYLAND_DISPLAY") or env.get("DISPLAY")):
-        env = dict(env)
-        if env.get("WAYLAND_DISPLAY") and not env.get("QT_QPA_PLATFORM"):
-            env["QT_QPA_PLATFORM"] = "wayland"
-        try:
-            out = subprocess.run([kd, "-o"], capture_output=True, text=True,
-                                 timeout=5, env=env).stdout
-            # active mode looks like:  1:2560x1600@165.00*!  (star = current).
-            # Refresh may carry decimals, so match them and round to int.
-            m = re.search(r"(\d+)x(\d+)@(\d+(?:\.\d+)?)\*", out)
-            if m:
-                return {"width": int(m.group(1)), "height": int(m.group(2)),
-                        "refresh": round(float(m.group(3)))}
-        except Exception:
-            pass
-    # 2) /sys/class/drm current-mode fallback (resolution only, assume 60)
-    try:
-        for status in Path("/sys/class/drm").glob("*/status"):
-            if status.read_text().strip() == "connected":
-                modes = status.parent / "modes"
-                if modes.is_file():
-                    first = modes.read_text().splitlines()
-                    if first:
-                        w, h = first[0].split("x")
-                        return {"width": int(w), "height": int(h),
-                                "refresh": 60}
-    except Exception:
-        pass
-    return None
-
-
-def game_mode_available() -> dict:
-    """Detect whether a gamescope Game Mode session can be launched. CachyOS
-    Handheld ships steamos-session-select plus a gamescope session file."""
-    switcher = shutil.which("steamos-session-select")
-    session = any(Path(d).is_file() for d in (
-        "/usr/share/wayland-sessions/gamescope-session.desktop",
-        "/usr/share/wayland-sessions/gamescope.desktop",
-    ))
-    return {"available": bool(switcher) and session,
-            "switcher": switcher,
-            "has_session": session}
-
-
-def launch_game_mode() -> dict:
-    """Switch to the gamescope Game Mode session. NOTE: this ends the desktop
-    session, so it also terminates this backend and the browser tab - it's a
-    one-way switch. Return before the session actually tears down so the API
-    call can respond."""
-    info = game_mode_available()
-    if not info["available"]:
-        raise RuntimeError("Game Mode not available — steamos-session-select "
-                           "or the gamescope session file is missing "
-                           "(install cachyos-handheld / gamescope-session-cachyos).")
-    # steamos-session-select runs as the user and triggers the switch. Fire it
-    # detached so the HTTP response can flush before the desktop goes down.
-    subprocess.Popen(["steamos-session-select", "gamescope"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
-    return {"switching": True}
-
-
 
 # --------------------------------------------------------------------------
 # Backup / restore - export and re-import PCC's own data (survives reinstalls)
@@ -3224,6 +3511,7 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                 dlss_seen = state.get("dlss_seen", {})
                 ultraplus_seen = state.get("ultraplus_seen", {})
+                reshade_installs = state.get("reshade_installs", {})
                 for g in games:
                     # Shortcuts carry their own LaunchOptions field (surfaced by
                     # list_shortcuts as launch_options_shortcut) rather than living
@@ -3236,6 +3524,7 @@ class Handler(BaseHTTPRequestHandler):
                         for lib in [g["library"]])
                     g["has_dlss"] = bool(dlss_seen.get(g["appid"]))
                     g["has_ultraplus"] = bool(ultraplus_seen.get(g["appid"]))
+                    g["has_reshade"] = g["appid"] in reshade_installs
                 self._json({"games": games})
             elif m := re.match(r"^/api/game/(\d+)/launch_options$", self.path):
                 self._json(get_launch_options(root, m.group(1)))
@@ -3268,10 +3557,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(shader_threads_status(root))
             elif self.path == "/api/hardware":
                 self._json(detect_hardware())
-            elif self.path == "/api/game_mode":
-                self._json(game_mode_available())
-            elif self.path == "/api/display_mode":
-                self._json(detect_display_mode() or {})
             elif self.path == "/api/backup/export":
                 self._json(export_backup())
             elif self.path == "/api/proton/list":
@@ -3313,6 +3598,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(fetch_owned_games(root, force=force))
             elif self.path == "/api/dlss/library":
                 self._json({"dlls": dll_library()})
+            elif self.path == "/api/reshade/latest":
+                self._json(reshade_latest())
+            elif m := re.match(r"^/api/game/(\d+)/reshade$", self.path):
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(m.group(1))
+                self._json(scan_game_reshade(m.group(1), g["install_path"]) if g
+                          else {"installed": False})
             elif m := re.match(r"^/api/art_debug/(\d+)(?:\?(.*))?$", self.path):
                 qs = urllib.parse.parse_qs(m.group(2) or "")
                 gname = (qs.get("name") or [None])[0]
@@ -3368,8 +3660,6 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/env/shaders":
                 self._json(set_environment_shaders(
                     bool(body.get("enable")), body.get("size_bytes")))
-            elif self.path == "/api/game_mode/launch":
-                self._json(launch_game_mode())
             elif self.path == "/api/backup/restore":
                 self._json(restore_backup(body["archive"]))
             elif self.path == "/api/ultraplus_manager/install":
@@ -3453,6 +3743,21 @@ class Handler(BaseHTTPRequestHandler):
                 tid = str(uuid.uuid4())
                 threading.Thread(target=download_latest_sr, args=(tid,), daemon=True).start()
                 self._json({"task": tid})
+            elif self.path == "/api/reshade/install":
+                appid = body["appid"]
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(appid)
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                tid = str(uuid.uuid4())
+                TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
+                threading.Thread(target=_reshade_install_task,
+                                 args=(tid, appid, g["install_path"],
+                                       body.get("exe"), body.get("api")),
+                                 daemon=True).start()
+                self._json({"task": tid})
+            elif self.path == "/api/reshade/remove":
+                self._json(remove_reshade(body["appid"]))
             elif m := re.match(r"^/api/game/(\d+)/cache/clear$", self.path):
                 self._json(clear_cache(root, m.group(1),
                                        keep_recordings=body.get("keep_recordings", True)))

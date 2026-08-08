@@ -18,6 +18,7 @@
   --bg:#101418; --panel:#171d24; --panel2:#1e252e; --line:#2a333e;
   --ink:#e8edf2; --muted:#8a97a6;
   --launch:#4da3ff; --dlss:#76b900; --cache:#e8a33d; --compiled:#b07aff; --danger:#ff5d5d;
+  --reshade:#2dd4bf;
   --radius:10px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -180,6 +181,7 @@ main{padding:22px;max-width:1500px;margin:0 auto}
 .rail i.launch.lit{background:var(--launch)}
 .rail i.dlss.lit{background:var(--dlss)}
 .rail i.cache.lit{background:var(--cache)}
+.rail i.reshade.lit{background:var(--reshade)}
 .btn.violet{background:var(--compiled);border-color:var(--compiled);color:#160a24}
 .chip.v{color:var(--compiled);border-color:var(--compiled)}
 #globalBar{height:4px;background:transparent;position:fixed;top:0;left:0;right:0;z-index:40}
@@ -222,6 +224,7 @@ body.locked{overflow:hidden}
   border-bottom:2px solid transparent}
 .tab.active[data-tab=launch]{color:var(--launch);border-color:var(--launch)}
 .tab.active[data-tab=dlss]{color:var(--dlss);border-color:var(--dlss)}
+.tab.active[data-tab=reshade]{color:var(--reshade);border-color:var(--reshade)}
 .tab.active[data-tab=cache]{color:var(--cache);border-color:var(--cache)}
 .tab.active[data-tab=bench]{color:var(--compiled);border-color:var(--compiled)}
 .statgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
@@ -310,7 +313,6 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
 <header>
   <h1>Proton <span>//</span> Command Center</h1>
   <input id="search" type="text" placeholder="Search your library…" autocomplete="off">
-  <button class="btn" id="gameModeBtn" title="Switch to Game Mode (Steam Deck UI)" hidden>🎮 Game Mode</button>
   <button class="btn" id="fsBtn" title="Fullscreen (F11)" aria-label="Toggle fullscreen">⛶</button>
   <button class="btn" id="hwBtn" title="System &amp; MangoHud">🖥</button>
   <button class="btn" id="addGameBtn" title="Add a game that isn't in Steam">＋ Add Game</button>
@@ -453,6 +455,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
   <div class="tabs">
     <button class="tab active" data-tab="launch">Launch</button>
     <button class="tab" data-tab="dlss">DLSS</button>
+    <button class="tab" data-tab="reshade">ReShade</button>
     <button class="tab" data-tab="cache">Shader cache</button>
     <button class="tab" data-tab="bench">Benchmark</button>
   </div>
@@ -583,6 +586,37 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
     </div>
   </div>
 
+  <!-- RESHADE -->
+  <div class="pane" id="pane-reshade">
+    <div class="section">
+      <h3>ReShade</h3>
+      <div id="reshadeStatus"><p class="note">Checking…</p></div>
+      <div class="row" style="margin-top:10px;align-items:center;gap:10px" id="reshadeApiRow">
+        <label class="note" for="reshadeApi" style="margin:0">Graphics API</label>
+        <select id="reshadeApi" style="flex:0 0 auto">
+          <option value="">Auto-detect</option>
+          <option value="d3d9">Direct3D 9 (d3d9.dll)</option>
+          <option value="d3d10">Direct3D 10 (dxgi.dll)</option>
+          <option value="d3d11">Direct3D 11 (dxgi.dll)</option>
+          <option value="d3d12">Direct3D 12 (dxgi.dll)</option>
+          <option value="opengl">OpenGL (opengl32.dll)</option>
+        </select>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <input type="text" id="reshadeExePath" placeholder="Auto-detected .exe — override only if it picked the wrong one" style="flex:1">
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn green" id="reshadeInstallBtn">Install ReShade</button>
+        <button class="btn danger" id="reshadeRemoveBtn" hidden>Remove</button>
+      </div>
+      <div class="bar" id="reshadeBar"><i></i></div>
+      <p class="note" id="reshadeDetail"></p>
+      <p class="note">Full Add-on Support build, straight from reshade.me. Default
+        shaders are ReShade's own Standard effects + SweetFX — drop more .fx files
+        into the shared shader folder to add them for every game.</p>
+    </div>
+  </div>
+
   <!-- CACHE -->
   <div class="pane" id="pane-cache">
     <div class="section">
@@ -663,7 +697,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
 
 <script>
 "use strict";
-const FRONTEND_VERSION="1.18.0";
+const FRONTEND_VERSION="1.19.0";
 const $=s=>document.querySelector(s);
 const api=async(p,opts)=>{const r=await fetch(p,opts);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j};
 const post=(p,body)=>api(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
@@ -696,8 +730,6 @@ const TOGGLES=[
  {id:"fsr4upgrade",needs:"PROTON_FSR4_UPGRADE",label:"FSR4 upgrade",hint:"PROTON_FSR4_UPGRADE=1 — upgrades FSR 3.1 DLLs to FSR 4. RDNA4 only in practice; on your NVIDIA GPU this won't do anything useful.",env:"PROTON_FSR4_UPGRADE=1"},
  {id:"noesync",needs:"PROTON_NO_ESYNC",label:"Disable esync",hint:"PROTON_NO_ESYNC=1 — turns off eventfd synchronisation. A troubleshooting switch: try it only if a game hangs or crashes on launch, since esync is normally a performance win.",env:"PROTON_NO_ESYNC=1"},
  {id:"ultraplus",label:"Ultra+ mod loader",hint:"WINEDLLOVERRIDES=dwmapi=n,b — forces Proton to load the mod's dwmapi.dll (UE4SS + ASI loader) from disk instead of its own builtin stub, so Ultra+'s UltraPlusExtensions and any companion .asi fixes (e.g. NaniteRayTracingFix.asi) can inject. The status note below only appears once a game is open, and only means something if the files are already in the game folder — installed separately via Ultra+ Manager.",env:"WINEDLLOVERRIDES=dwmapi=n,b"},
- {id:"gamescope",label:"Gamescope (NVIDIA)",hint:"Wraps the game in gamescope at your display's native resolution/refresh with adaptive-sync + --mangoapp overlay. Forces NVAPI on so DLSS works inside gamescope. Can improve frame pacing by isolating the game from the desktop compositor. NOTE: overrides all other options above except the Proton version.",gamescope:true},
- {id:"gshdr",needs:"DXVK_HDR",label:"↳ Gamescope HDR",hint:"Adds --hdr-enabled + DXVK_HDR=1 to the gamescope command. EXPERIMENTAL on NVIDIA: works on many DX11 titles but can black-screen or hang some DX12 games. Only has an effect when Gamescope is on. Turn off if a game shows no image.",gshdr:true},
 ];
 let manualEdit=false;
 
@@ -774,36 +806,12 @@ function renderToggles(){
       <div><b>${t.label}</b><small>${t.hint}</small></div>
       <label class="switch"><input type="checkbox" data-id="${t.id}"><em></em></label>
     </div>`).join("");
-  // HDR sub-toggle is inert until Gamescope is enabled
-  const hdrIn=document.querySelector('#toggles input[data-id="gshdr"]');
-  if(hdrIn){hdrIn.disabled=true;hdrIn.closest(".toggle").style.opacity=".4";}
   $("#toggles").addEventListener("change",async(e)=>{
     // SteamDeck=1 and =0 are opposites — turning one on clears the other
     if(e.target&&e.target.checked){
       const pair={steamdeckon:"steamdeckoff",steamdeckoff:"steamdeckon"};
       const other=pair[e.target.dataset.id];
       if(other){const o=document.querySelector(`#toggles input[data-id="${other}"]`);if(o)o.checked=false;}
-    }
-    // Gamescope is exclusive: turning it on clears + disables every other toggle
-    // EXCEPT its own HDR sub-toggle; turning it off re-enables everything.
-    if(e.target&&e.target.dataset.id==="gamescope"){
-      const gsOn=e.target.checked;
-      document.querySelectorAll("#toggles input").forEach(i=>{
-        if(i.dataset.id==="gamescope")return;
-        if(i.dataset.id==="gshdr"){
-          // HDR sub-toggle: usable only while gamescope is on
-          if(gsOn){i.disabled=false;i.closest(".toggle").style.opacity="";}
-          else{i.checked=false;i.disabled=true;i.closest(".toggle").style.opacity=".4";}
-          return;
-        }
-        if(gsOn){i.checked=false;i.disabled=true;i.closest(".toggle").style.opacity=".4";}
-        else{i.disabled=false;i.closest(".toggle").style.opacity="";}
-      });
-      const dlssBox=$("#dlssControls");
-      if(dlssBox)dlssBox.style.opacity=gsOn?".4":"";
-      if(gsOn && !window.__displayMode){
-        try{window.__displayMode=await api("/api/display_mode");}catch(_){}
-      }
     }
     manualEdit=false;buildString();
     // when the MangoHud toggle is switched ON, ensure our custom config exists
@@ -821,23 +829,6 @@ function renderToggles(){
 function buildString(){
   if(manualEdit)return;
   const on=new Set([...document.querySelectorAll("#toggles input:checked")].map(i=>i.dataset.id));
-  // Gamescope wraps the entire game, so it's mutually exclusive with the other
-  // launch options — when it's on we build ONLY the gamescope command (plus the
-  // Proton compat tool, which is handled separately via the compat selector).
-  if(on.has("gamescope")){
-    const m=window.__displayMode||{width:1920,height:1080,refresh:60};
-    const hdr=on.has("gshdr");
-    // NVAPI must be forced on for DLSS to appear inside gamescope. Both vars:
-    // DXVK_ENABLE_NVAPI actually initialises the NVAPI layer (the documented
-    // fix for "DLSS missing"), PROTON_ENABLE_NVAPI keeps Proton's side on too.
-    let inner="DXVK_ENABLE_NVAPI=1 PROTON_ENABLE_NVAPI=1";
-    if(hdr)inner="DXVK_HDR=1 "+inner;   // game side needs DXVK_HDR for HDR output
-    let flags="-f --adaptive-sync --prefer-vk --mangoapp";
-    if(hdr)flags+=" --hdr-enabled";     // gamescope side enables the HDR pipeline
-    const gs=`gamescope -W ${m.width} -H ${m.height} -r ${m.refresh} ${flags} -- env ${inner} %command%`;
-    $("#launchStr").value=gs;
-    return;
-  }
   const env=[],wraps=[],gameArgs=[];
   for(const t of TOGGLES){
     if(!on.has(t.id))continue;
@@ -1008,6 +999,7 @@ let games=[],current=null,statusById={};
 function seedStatus(list){
   list.forEach(g=>statusById[g.appid]={...statusById[g.appid],
     launch:!!g.has_launch_options,dlss:!!g.has_dlss,cache:!!g.has_cache,
+    reshade:!!g.has_reshade,
     installing:g.fully_installed===false,pct:g.download_pct});
 }
 let steamIsRunning=false;
@@ -1032,6 +1024,7 @@ function railFor(g){
   return `<div class="rail">
     <i class="launch ${st.launch?"lit":""}"></i>
     <i class="dlss ${st.dlss?"lit":""}"></i>
+    <i class="reshade ${st.reshade?"lit":""}"></i>
     <i class="cache ${st.cache?"lit":""}"></i></div>`;
 }
 let ownedOnly=[];   // owned but not installed
@@ -1448,7 +1441,7 @@ async function openGame(appid){
   }catch(e){loadStringIntoUI("")}
   loadUltraPlus(appid);
   refreshCapabilities();
-  loadLibrary().then(()=>loadDLSS(appid));loadCache(appid);loadBench(appid);loadCompat(appid);loadSteamShader();loadShaderEnv();loadCachedPdb(appid);
+  loadLibrary().then(()=>loadDLSS(appid));loadCache(appid);loadBench(appid);loadCompat(appid);loadSteamShader();loadShaderEnv();loadCachedPdb(appid);loadReshade(appid);
 }
 
 async function loadDLSS(appid){
@@ -1500,6 +1493,82 @@ async function loadDLSS(appid){
     };
   }catch(e){$("#dlssList").innerHTML=`<p class="note">Scan failed: ${esc(e.message)}</p>`}
 }
+
+/* ---------- ReShade ---------- */
+function applyWineDllOverride(pair){
+  const box=$("#launchStr");
+  const cur=box.value||"";
+  const m=cur.match(/WINEDLLOVERRIDES=(\S+)/);
+  const [dll]=pair.split("=");
+  let entries=m?m[1].split(",").filter(e=>!e.startsWith(dll+"=")):[];
+  entries.push(pair);
+  const token="WINEDLLOVERRIDES="+entries.join(",");
+  box.value=m?cur.replace(/WINEDLLOVERRIDES=\S+/,token):(cur?cur+" "+token:token);
+  manualEdit=true;
+  switchTab("launch");
+  toast("Added to launch options — click Save to Steam to apply");
+}
+
+async function loadReshade(appid){
+  const box=$("#reshadeStatus");
+  box.innerHTML='<p class="note">Scanning game folder…</p>';
+  $("#reshadeRemoveBtn").hidden=true;
+  try{
+    const d=await api(`/api/game/${appid}/reshade`);
+    statusById[appid]={...statusById[appid],reshade:!!d.installed};
+    renderGrid($("#search").value);
+    window._reshadeState=d;
+    $("#reshadeExePath").value="";
+    $("#reshadeExePath").placeholder=d.exe?`Auto-detected: ${d.exe}`:"No .exe auto-detected — point PCC at it manually";
+    $("#reshadeApi").value="";
+    if(d.installed){
+      const wine=(d.proxy_name||"").replace(/\.dll$/,"")+"=n,b";
+      box.innerHTML=`
+        <div class="item">
+          <div class="top"><b>${esc(d.proxy_name)}</b>
+            <span class="chip g">v${esc(d.version||"?")}</span>
+            <span class="chip a">${esc((d.api||"").toUpperCase())}</span></div>
+          <div class="path mono">${esc(d.path)}</div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button class="btn" id="reshadeApplyOverride" data-pair="${esc(wine)}">Add WINEDLLOVERRIDES=${esc(wine)} to launch options</button>
+        </div>
+        <p class="note">Toggle the effects overlay in-game with <b>Shift+F2</b> once it's running.</p>`;
+      $("#reshadeApplyOverride").addEventListener("click",e=>applyWineDllOverride(e.target.dataset.pair));
+      $("#reshadeInstallBtn").textContent="Reinstall / update";
+      $("#reshadeRemoveBtn").hidden=false;
+    }else{
+      box.innerHTML=d.exe
+        ? `<p class="note">Detected <b class="mono">${esc(d.exe.split("/").pop())}</b>${d.detected_api?` — looks like <b>${esc(d.detected_api.toUpperCase())}</b>`:" — couldn't tell the graphics API, pick one below"}.</p>`
+        : `<p class="note">No .exe found automatically — point Command Center at it manually below.</p>`;
+      $("#reshadeInstallBtn").textContent="Install ReShade";
+    }
+  }catch(e){box.innerHTML=`<p class="note">${esc(e.message)}</p>`}
+}
+$("#reshadeInstallBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  const btn=$("#reshadeInstallBtn");
+  btn.disabled=true;
+  try{
+    const body={appid:current.appid};
+    if($("#reshadeExePath").value.trim())body.exe=$("#reshadeExePath").value.trim();
+    if($("#reshadeApi").value)body.api=$("#reshadeApi").value;
+    const {task}=await post("/api/reshade/install",body);
+    trackTask(task,"#reshadeBar",(t)=>{
+      btn.disabled=false;
+      if(t.result)toast(`Installed as ${t.result.proxy_dll}`);
+      loadReshade(current.appid);
+    },"#reshadeDetail");
+  }catch(e){toast(e.message,true);btn.disabled=false}
+});
+$("#reshadeRemoveBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  if(!await pccConfirm(`Remove ReShade from ${current.name}?`,{yes:"Remove",danger:true}))return;
+  try{
+    await post("/api/reshade/remove",{appid:current.appid});
+    toast("Removed");loadReshade(current.appid);
+  }catch(e){toast(e.message,true)}
+});
 
 let libDlls=[];
 async function loadLibrary(){
@@ -1637,7 +1706,7 @@ function trackTask(id,barSel,onDone,detailSel){
       const t=await api("/api/tasks/"+id);
       bar.querySelector("i").style.width=(t.progress||0)+"%";
       if(detailSel)$(detailSel).textContent=t.detail||"";
-      if(t.status==="done"){clearInterval(iv);bar.classList.remove("show");onDone&&onDone()}
+      if(t.status==="done"){clearInterval(iv);bar.classList.remove("show");onDone&&onDone(t)}
       if(t.status==="error"){clearInterval(iv);bar.classList.remove("show");toast(t.detail,true)}
     }catch(e){clearInterval(iv)}
   },800);
@@ -1916,25 +1985,6 @@ $("#shaderEnvToggle")?.addEventListener("change",async e=>{
     toast(err.message,true);
   }
 });
-
-/* ---------- game mode (gamescope / Steam Deck UI) ---------- */
-(async function initGameMode(){
-  try{window.__displayMode=await api("/api/display_mode");}catch(_){}
-  try{
-    const d=await api("/api/game_mode");
-    if(d&&d.available){
-      const btn=$("#gameModeBtn");
-      btn.hidden=false;
-      btn.addEventListener("click",async()=>{
-        if(!await pccConfirm("Switch to Game Mode (Steam Deck UI)?\n\nThis closes your desktop session — Proton Command Center and this browser tab will close. Return to desktop from Steam's Power menu → Switch to Desktop.",{yes:"Switch",danger:true}))return;
-        try{
-          await post("/api/game_mode/launch",{});
-          document.body.innerHTML='<div style="display:flex;height:100dvh;align-items:center;justify-content:center;font:600 20px system-ui;color:var(--muted)">Switching to Game Mode…</div>';
-        }catch(e){toast(e.message,true)}
-      });
-    }
-  }catch(e){/* endpoint absent on older backend — leave button hidden */}
-})();
 
 /* ---------- system & mangohud ---------- */
 let hwPreset="reference";
