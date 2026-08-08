@@ -139,6 +139,10 @@ body.gp-active .card.gp-focus .playbtn{opacity:1}
   transition:filter .12s}
 .ultraplusbadge img{width:13px;height:13px;display:block}
 .ultraplusbadge:hover{filter:brightness(1.35)}
+.ultraplusbadge.dim{background:rgba(139,110,255,.05);border-color:var(--line);color:var(--muted)}
+.ultraplusbadge.dim img{opacity:.55}
+.ultraplusbadge.dim:hover{border-color:var(--compiled);color:var(--compiled)}
+.ultraplusbadge.dim:hover img{opacity:1}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 
 /* top bar */
@@ -1041,7 +1045,7 @@ function renderGrid(filter=""){
       <div class="body">
         <img loading="lazy" src="https://cdn.cloudflare.steamstatic.com/steam/apps/${g.appid}/header.jpg"
              data-appid="${g.appid}" data-fallback="0" alt="">
-        <div class="meta"><div class="nameRow"><b>${esc(g.name)}</b>${g.has_ultraplus?`<button class="ultraplusbadge" data-ultraplus="${g.appid}" title="Ultra+ mods are set up in this game — click to open Ultra+ Manager"><img src="${ULTRAPLUS_LOGO}" alt="">ULTRA+</button>`:""}</div><small>${(statusById[g.appid]||{}).installing?("installing"+((statusById[g.appid]||{}).pct!=null?" · "+(statusById[g.appid]||{}).pct+"%":"…")):(g._uninstalled?"not installed":(g.size_bytes?fmtMB(g.size_bytes):"—"))}</small></div>
+        <div class="meta"><div class="nameRow"><b>${esc(g.name)}</b>${g.has_ultraplus?`<button class="ultraplusbadge" data-ultraplus="${g.appid}" title="Ultra+ mods are set up in this game — click to open Ultra+ Manager"><img src="${ULTRAPLUS_LOGO}" alt="">ULTRA+</button>`:g.ultraplus_supported?`<button class="ultraplusbadge dim" data-ultraplus-info="${esc(g.ultraplus_url||"")}" title="Ultra+ mods are available for this game — click for details"><img src="${ULTRAPLUS_LOGO}" alt="">ULTRA+ available</button>`:""}</div><small>${(statusById[g.appid]||{}).installing?("installing"+((statusById[g.appid]||{}).pct!=null?" · "+(statusById[g.appid]||{}).pct+"%":"…")):(g._uninstalled?"not installed":(g.size_bytes?fmtMB(g.size_bytes):"—"))}</small></div>
         ${g._uninstalled?`<button class="installbtn" data-install="${g.appid}">Install</button>`:`<button class="playbtn" data-play="${g.appid}" title="Play">▶</button>`}
       </div>
       <div class="cardbar"><i></i></div>
@@ -1079,7 +1083,14 @@ $("#grid").addEventListener("click",e=>{
   const ib=e.target.closest(".installbtn");
   if(ib){e.stopPropagation();installGame(ib.dataset.install);return}
   const ub=e.target.closest(".ultraplusbadge");
-  if(ub){e.stopPropagation();openUltraPlusManager();return}
+  if(ub){
+    e.stopPropagation();
+    if(ub.hasAttribute("data-ultraplus-info")){
+      const infoUrl=ub.getAttribute("data-ultraplus-info");
+      if(infoUrl)window.open(infoUrl,"_blank","noopener");
+    }else openUltraPlusManager();
+    return;
+  }
   const c=e.target.closest(".card");
   if(!c)return;
   if(c.dataset.uninstalled){

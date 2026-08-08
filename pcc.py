@@ -1016,6 +1016,78 @@ def scan_ultraplus(install_path):
     return {"installed": False}
 
 
+ULTRAPLUS_GAMEDATA_URL = "https://d25cpafae92g0h.cloudfront.net/gamedata.json"
+ULTRAPLUS_MODS_URL = "https://d25cpafae92g0h.cloudfront.net/mods_manifest.json"
+
+
+def _fetch_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "proton-command-center"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.load(r)
+
+
+def ultraplus_catalog() -> dict:
+    """theultraplace.com's live game/mod catalog, reduced to just what PCC
+    needs: which games actually have a released Ultra+ mod (gamedata.json
+    lists every UE game it *could* support, including ones with no mod yet -
+    mods_manifest.json is the ground truth for "released"), and the Steam
+    display-name variants to match each one against. Cached 6h, same pattern
+    as reshade_latest()."""
+    state = load_state()
+    cache = state.get("ultraplus_catalog")
+    now = time.time()
+    if cache and now - cache.get("ts", 0) < 21600:
+        return cache["data"]
+    gamedata = _fetch_json(ULTRAPLUS_GAMEDATA_URL)
+    mods = _fetch_json(ULTRAPLUS_MODS_URL)
+    supported = gamedata.get("SupportedGames", {})
+    search_terms = gamedata.get("GameSearchTerms", {})
+    # Mod filenames look like "<key> Ultra Plus vX.Y.Z.zip" but their casing
+    # doesn't always match the SupportedGames key (e.g. "Runescape" vs.
+    # "RuneScape"), so key everything off the lowercased prefix.
+    mod_keys = set()
+    for f in mods.get("files", []):
+        m = re.match(r"^(.*?)\s+Ultra\s*Plus\s+v", f.get("filename", ""), re.I)
+        if m:
+            mod_keys.add(m.group(1).strip().lower())
+    games = {}
+    for key, info in supported.items():
+        if key.lower() not in mod_keys:
+            continue
+        games[key] = {
+            "full_name": info.get("full_name") or key,
+            "search_terms": [t.lower() for t in search_terms.get(key, [key])],
+            "url": info.get("nexus_url") or info.get("wiki_url") or "",
+        }
+    data = {"games": games}
+    state["ultraplus_catalog"] = {"ts": now, "data": data}
+    save_state(state)
+    return data
+
+
+def _norm_game_name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def match_ultraplus_catalog(name: str, catalog: dict):
+    """Match a Steam game's display name against the Ultra+ catalog. Compares
+    alnum-only normalized forms (so spacing/punctuation differences like
+    "Stellar Blade" vs. catalog key "StellarBlade" still match) against every
+    known name variant for each game - GameSearchTerms, the key itself, and
+    full_name. GameSearchTerms is community-curated and occasionally missing
+    a variant (confirmed for StellarBlade, which only lists "StellarBlade"
+    with no space), so the key/full_name are included as a safety net rather
+    than trusting search_terms alone."""
+    norm = _norm_game_name(name)
+    if not norm:
+        return None
+    for key, info in catalog.get("games", {}).items():
+        candidates = info["search_terms"] + [key, info["full_name"]]
+        if norm in (_norm_game_name(c) for c in candidates):
+            return key, info
+    return None
+
+
 ULTRAPLUS_DIR = DATA_DIR / "tools" / "ultraplus-manager"
 ULTRAPLUS_NEXUS_URL = "https://www.nexusmods.com/site/mods/1586"
 
@@ -3512,6 +3584,10 @@ class Handler(BaseHTTPRequestHandler):
                 dlss_seen = state.get("dlss_seen", {})
                 ultraplus_seen = state.get("ultraplus_seen", {})
                 reshade_installs = state.get("reshade_installs", {})
+                try:
+                    ultraplus_cat = ultraplus_catalog()
+                except Exception:
+                    ultraplus_cat = {"games": {}}  # offline/CDN hiccup - just skip the tag
                 for g in games:
                     # Shortcuts carry their own LaunchOptions field (surfaced by
                     # list_shortcuts as launch_options_shortcut) rather than living
@@ -3525,6 +3601,9 @@ class Handler(BaseHTTPRequestHandler):
                     g["has_dlss"] = bool(dlss_seen.get(g["appid"]))
                     g["has_ultraplus"] = bool(ultraplus_seen.get(g["appid"]))
                     g["has_reshade"] = g["appid"] in reshade_installs
+                    match = match_ultraplus_catalog(g["name"], ultraplus_cat)
+                    g["ultraplus_supported"] = match is not None
+                    g["ultraplus_url"] = match[1]["url"] if match else ""
                 self._json({"games": games})
             elif m := re.match(r"^/api/game/(\d+)/launch_options$", self.path):
                 self._json(get_launch_options(root, m.group(1)))
