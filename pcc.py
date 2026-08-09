@@ -26,7 +26,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.20.0"
+VERSION = "1.21.0"
 PORT = int(os.environ.get("PCC_PORT", "8686"))
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path.home() / ".local/share/proton-command-center"
@@ -1091,6 +1091,15 @@ def match_ultraplus_catalog(name: str, catalog: dict):
 ULTRAPLUS_DIR = DATA_DIR / "tools" / "ultraplus-manager"
 ULTRAPLUS_NEXUS_URL = "https://www.nexusmods.com/site/mods/1586"
 
+# Our own linux-parity fork/build of Ultra+ Manager (theultraplace.com's
+# official app is Windows-only via WinUI 3; this is a from-scratch Avalonia
+# port we build and host ourselves), self-contained linux-x64, published as
+# a GitLab release asset rather than bundled in-repo (43MB compressed).
+ULTRAPLUS_BUNDLED_URL = ("https://gitlab.com/mrcgibb9876/ultraplus-manager/-/releases/"
+                         "ultraplus-manager-v0.1.0/downloads/"
+                         "UltraPlusManager-Linux-linux-parity-3a0c09c.tar.gz")
+ULTRAPLUS_BUNDLED_TAG = "ultraplus-manager-v0.1.0"
+
 
 def ultraplus_manager_binary():
     exe = ULTRAPLUS_DIR / "UltraPlusManager.Linux"
@@ -1099,7 +1108,10 @@ def ultraplus_manager_binary():
 
 def ultraplus_manager_status() -> dict:
     exe = ultraplus_manager_binary()
-    return {"installed": exe is not None, "path": str(exe) if exe else None}
+    state = load_state()
+    return {"installed": exe is not None, "path": str(exe) if exe else None,
+            "bundled_tag": ULTRAPLUS_BUNDLED_TAG,
+            "installed_tag": state.get("ultraplus_manager_tag")}
 
 
 def install_ultraplus_manager(zip_path_str) -> dict:
@@ -1133,7 +1145,47 @@ def install_ultraplus_manager(zip_path_str) -> dict:
             shutil.move(str(payload), str(ULTRAPLUS_DIR))
     exe = ULTRAPLUS_DIR / "UltraPlusManager.Linux"
     exe.chmod(exe.stat().st_mode | 0o111)
+    state = load_state()
+    state.pop("ultraplus_manager_tag", None)
+    save_state(state)
     return ultraplus_manager_status()
+
+
+def install_ultraplus_manager_bundled(task_id) -> None:
+    """Download our own linux-parity build (see ULTRAPLUS_BUNDLED_URL) and
+    unpack it into ULTRAPLUS_DIR, same layout as install_ultraplus_manager's
+    Nexus-zip flow but self-serve — no manual download required."""
+    import tarfile, io
+    TASKS[task_id] = {"status": "running", "progress": 5,
+                      "detail": "Downloading Ultra+ Manager"}
+    try:
+        data = _gh_bytes(ULTRAPLUS_BUNDLED_URL, task_id)
+        TASKS[task_id]["detail"] = "Extracting"
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+            for m in tar.getmembers():
+                if m.name.startswith("/") or ".." in m.name.split("/"):
+                    raise RuntimeError(f"unsafe path in archive: {m.name}")
+            names = [n for n in tar.getnames() if n and not n.endswith("/")]
+            roots = {n.split("/", 1)[0] for n in names if "/" in n}
+            with tempfile.TemporaryDirectory() as tmp:
+                tar.extractall(tmp)
+                tmp_path = Path(tmp)
+                payload = tmp_path / next(iter(roots)) if len(roots) == 1 else tmp_path
+                if not (payload / "UltraPlusManager.Linux").is_file():
+                    raise RuntimeError("bundled archive is missing UltraPlusManager.Linux")
+                ULTRAPLUS_DIR.parent.mkdir(parents=True, exist_ok=True)
+                if ULTRAPLUS_DIR.exists():
+                    shutil.rmtree(ULTRAPLUS_DIR)
+                shutil.move(str(payload), str(ULTRAPLUS_DIR))
+        exe = ULTRAPLUS_DIR / "UltraPlusManager.Linux"
+        exe.chmod(exe.stat().st_mode | 0o111)
+        state = load_state()
+        state["ultraplus_manager_tag"] = ULTRAPLUS_BUNDLED_TAG
+        save_state(state)
+        TASKS[task_id] = {"status": "done", "progress": 100,
+                          "detail": "Ultra+ Manager installed"}
+    except Exception as e:
+        TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
 
 
 def launch_ultraplus_manager() -> dict:
@@ -3743,6 +3795,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(restore_backup(body["archive"]))
             elif self.path == "/api/ultraplus_manager/install":
                 self._json(install_ultraplus_manager(body["zip"]))
+            elif self.path == "/api/ultraplus_manager/install_bundled":
+                tid = str(uuid.uuid4())
+                threading.Thread(target=install_ultraplus_manager_bundled,
+                                 args=(tid,), daemon=True).start()
+                self._json({"task": tid})
             elif self.path == "/api/ultraplus_manager/launch":
                 self._json(launch_ultraplus_manager())
             elif self.path == "/api/proton/install":

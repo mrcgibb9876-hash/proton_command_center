@@ -368,17 +368,20 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
     mods (UE4SS-based performance/visual mods). Command Center only detects what Ultra+ Manager leaves in a game's
     folder and launches the app — mod install/config itself happens inside Ultra+ Manager.</p>
   <div class="row">
-    <button class="btn" id="umGetBtn">Get Ultra+ Manager (Nexus Mods)</button>
+    <button class="btn primary" id="umInstallBundledBtn">Install Ultra+ Manager</button>
     <button class="btn primary" id="umLaunchBtn" disabled>Open Ultra+ Manager</button>
   </div>
   <p class="note" id="umStatus" style="margin-top:8px">Checking…</p>
+  <p class="note" style="margin-top:6px">Installs our own linux-parity build automatically — no manual download
+    needed.</p>
   <div class="row" style="margin-top:10px">
     <input type="text" id="umZipPath" placeholder="/path/to/UltraPlus Manager Linux-….zip" style="flex:1">
     <button class="btn" id="umBrowseBtn">Browse…</button>
-    <button class="btn" id="umInstallBtn">Install</button>
+    <button class="btn" id="umInstallBtn">Install from zip</button>
   </div>
-  <p class="note" style="margin-top:6px">Nexus Mods doesn't allow automated downloads for free accounts — "Get" opens
-    the mod page so you can save the zip yourself (usually to Downloads), then Install unpacks it here.</p>
+  <p class="note" style="margin-top:6px">Alternative: <a href="https://www.nexusmods.com/site/mods/1586"
+    target="_blank" rel="noopener noreferrer" style="color:var(--compiled)">the official Windows-only release on
+    Nexus Mods</a> — save its zip yourself, then Install from zip unpacks it here.</p>
 
   <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:16px 0 10px">Proton versions (GE-Proton)</h3>
   <div id="protonList"><p class="note">Loading…</p></div>
@@ -701,7 +704,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
 
 <script>
 "use strict";
-const FRONTEND_VERSION="1.20.0";
+const FRONTEND_VERSION="1.21.0";
 const $=s=>document.querySelector(s);
 const api=async(p,opts)=>{const r=await fetch(p,opts);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j};
 const post=(p,body)=>api(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
@@ -2073,12 +2076,29 @@ $("#umHeadingLogo").src=ULTRAPLUS_LOGO;
 async function loadUltraplusManager(){
   try{
     const st=await api("/api/ultraplus_manager/status");
-    $("#umStatus").textContent=st.installed?`Installed at ${st.path}`:"Not installed yet";
+    const upToDate=st.installed_tag&&st.installed_tag===st.bundled_tag;
+    $("#umStatus").textContent=st.installed
+      ?`Installed at ${st.path}`+(st.installed_tag?(upToDate?" (up to date)":` (${st.installed_tag}, ${st.bundled_tag} available)`):"")
+      :"Not installed yet";
     $("#umLaunchBtn").disabled=!st.installed;
+    $("#umInstallBundledBtn").textContent=st.installed?(upToDate?"Reinstall":"Update"):"Install Ultra+ Manager";
   }catch(e){$("#umStatus").textContent="Couldn't check status"}
 }
-$("#umGetBtn").addEventListener("click",()=>{
-  window.open("https://www.nexusmods.com/site/mods/1586","_blank","noopener");
+$("#umInstallBundledBtn").addEventListener("click",async()=>{
+  const btn=$("#umInstallBundledBtn");btn.disabled=true;const label=btn.textContent;btn.textContent="Installing…";
+  try{
+    const {task}=await post("/api/ultraplus_manager/install_bundled",{});
+    const iv=setInterval(async()=>{
+      try{
+        const t=await api("/api/tasks/"+task);
+        if(t.detail)btn.textContent=t.detail.length>18?t.detail.slice(0,18)+"…":t.detail;
+        if(t.status==="done"||t.status==="error"){
+          clearInterval(iv);toast(t.detail,t.status==="error");btn.disabled=false;
+          await loadUltraplusManager();
+        }
+      }catch(e){clearInterval(iv);btn.disabled=false;btn.textContent=label}
+    },800);
+  }catch(e){toast(e.message,true);btn.disabled=false;btn.textContent=label}
 });
 $("#umBrowseBtn").addEventListener("click",()=>openBrowse("umZipPath"));
 $("#umInstallBtn").addEventListener("click",async()=>{
@@ -2090,7 +2110,7 @@ $("#umInstallBtn").addEventListener("click",async()=>{
     toast("Ultra+ Manager installed");
     await loadUltraplusManager();
   }catch(e){toast(e.message,true)}
-  btn.disabled=false;btn.textContent="Install";
+  btn.disabled=false;btn.textContent="Install from zip";
 });
 async function openUltraPlusManager(){
   // No CLI hook into UM for a specific game (it's GUI-only) - this opens the
