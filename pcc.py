@@ -1096,9 +1096,9 @@ ULTRAPLUS_NEXUS_URL = "https://www.nexusmods.com/site/mods/1586"
 # port we build and host ourselves), self-contained linux-x64, published as
 # a GitLab release asset rather than bundled in-repo (43MB compressed).
 ULTRAPLUS_BUNDLED_URL = ("https://gitlab.com/mrcgibb9876/ultraplus-manager/-/releases/"
-                         "ultraplus-manager-v0.1.0/downloads/"
-                         "UltraPlusManager-Linux-linux-parity-3a0c09c.tar.gz")
-ULTRAPLUS_BUNDLED_TAG = "ultraplus-manager-v0.1.0"
+                         "ultraplus-manager-v0.1.1/downloads/"
+                         "UltraPlusManager-Linux-linux-parity-bdb7190.tar.gz")
+ULTRAPLUS_BUNDLED_TAG = "ultraplus-manager-v0.1.1"
 
 
 def ultraplus_manager_binary():
