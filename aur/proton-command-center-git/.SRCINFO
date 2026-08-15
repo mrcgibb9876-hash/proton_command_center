@@ -12,6 +12,7 @@ pkgbase = proton-command-center-git
 	optdepends = steam: the storefront this manages (required in practice)
 	optdepends = mangohud: performance overlay toggle and benchmark tab
 	optdepends = gamescope: compositor wrapper toggle in the launch builder
+	optdepends = gamemode: performance wrapper toggle in the launch builder
 	optdepends = nvidia-utils: DLSS DLL management and driver-aware compile tracking
 	provides = proton-command-center
 	conflicts = proton-command-center

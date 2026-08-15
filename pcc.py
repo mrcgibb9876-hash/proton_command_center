@@ -2020,7 +2020,7 @@ def fetch_owned_games(root: Path, force=False) -> dict:
 # --------------------------------------------------------------------------
 NING_RULES = {
     "base_env": {"PROTON_ENABLE_NVAPI": "1", "PROTON_USE_NTSYNC": "1"},
-    "base_wrappers": ["game-performance"],
+    "base_wrappers": ["gamemoderun"],
     "vram_cap_below_mb": 12000,
     "engines": {
         "unreal4": {

@@ -12,6 +12,7 @@ optdepends=(
     'steam: the storefront this manages (required in practice)'
     'mangohud: performance overlay toggle and benchmark tab'
     'gamescope: compositor wrapper toggle in the launch builder'
+    'gamemode: performance wrapper toggle in the launch builder'
     'nvidia-utils: DLSS DLL management and driver-aware compile tracking'
 )
 makedepends=('git')

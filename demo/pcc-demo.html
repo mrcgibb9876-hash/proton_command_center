@@ -253,8 +253,8 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
       <div class="row">
         <select id="preset">
           <option value="">— pick a starting point —</option>
-          <option value="cachyos">CachyOS baseline (Wayland · HDR · NTSync · game-performance)</option>
-          <option value="ue5">UE5 anti-stutter (NVAPI · NTSync · game-performance)</option>
+          <option value="gamemode">Gaming baseline (Wayland · HDR · NTSync · GameMode)</option>
+          <option value="ue5">UE5 anti-stutter (NVAPI · NTSync · GameMode)</option>
           <option value="fgmax">Max smoothness (4x FG · Reflex · NGX updater)</option>
           <option value="ace">Anti-cheat spoof (STEAMDECK=1)</option>
           <option value="clean">Minimal (%command% only)</option>
@@ -554,16 +554,16 @@ const TOGGLES=[
  {id:"nvapi",label:"NVAPI",hint:"PROTON_ENABLE_NVAPI=1 — needed for DLSS / Reflex in some titles",env:"PROTON_ENABLE_NVAPI=1"},
  {id:"steamdeck",label:"Steam Deck spoof",hint:"STEAMDECK=1 — helps some anti-cheat (ACE) accept Linux",env:"STEAMDECK=1"},
  {id:"mangohud",label:"MangoHud overlay",hint:"Adds the mangohud wrapper",wrap:"mangohud"},
- {id:"gameperf",label:"game-performance",hint:"CachyOS power-profile wrapper",wrap:"game-performance"},
+ {id:"gamemode",label:"GameMode",hint:"Feral GameMode: temporary performance profile for the game",wrap:"gamemoderun"},
  {id:"smooth",label:"Smooth Motion",hint:"Driver-level frame generation for games without DLSS FG (RTX 40/50, recent drivers)",env:"NVPRESENT_ENABLE_SMOOTH_MOTION=1"},
  {id:"reflex",label:"NVIDIA Reflex (Vulkan)",hint:"DXVK_NVAPI_VKREFLEX=1 — needs the dxvk-nvapi Reflex layer; pairs well with FG",env:"DXVK_NVAPI_VKREFLEX=1"},
  {id:"ngxupd",label:"NGX auto-updater",hint:"PROTON_ENABLE_NGX_UPDATER=1 — driver keeps DLSS DLLs current (may override manual swaps)",env:"PROTON_ENABLE_NGX_UPDATER=1"},
  {id:"dlsshud",label:"DLSS indicator overlay",hint:"On-screen proof of which DLSS preset/FG mode is active",env:"DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS=DLSSIndicator=1024,DLSSGIndicator=2"},
 ];
 const PRESETS={
- cachyos:{on:["wayland","hdr","ntsync","gameperf"],dlss:"render_preset_m"},
- ue5:{on:["nvapi","ntsync","gameperf"],dlss:""},
- fgmax:{on:["nvapi","reflex","ngxupd","gameperf"],dlss:"render_preset_latest",fg:"3"},
+ gamemode:{on:["wayland","hdr","ntsync","gamemode"],dlss:"render_preset_m"},
+ ue5:{on:["nvapi","ntsync","gamemode"],dlss:""},
+ fgmax:{on:["nvapi","reflex","ngxupd","gamemode"],dlss:"render_preset_latest",fg:"3"},
  ace:{on:["steamdeck"],dlss:""},
  clean:{on:[],dlss:""},
 };

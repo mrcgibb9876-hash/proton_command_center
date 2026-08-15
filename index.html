@@ -726,7 +726,7 @@ const TOGGLES=[
  {id:"wayland",needs:"PROTON_ENABLE_WAYLAND",label:"Native Wayland",hint:"PROTON_ENABLE_WAYLAND=1 — better latency/pacing and HDR without Gamescope, but breaks the Steam Overlay",env:"PROTON_ENABLE_WAYLAND=1"},
  {id:"hdr",needs:"PROTON_ENABLE_HDR",label:"HDR",hint:"PROTON_ENABLE_HDR=1 DXVK_HDR=1 — disable the in-game HDR toggle if it conflicts",env:"PROTON_ENABLE_HDR=1 DXVK_HDR=1"},
  {id:"mangohud",label:"MangoHud overlay",hint:"Adds the mangohud wrapper — first enable writes PCC's custom horizontal overlay (orange labels, frametime graph, dGPU-pinned)",wrap:"mangohud"},
- {id:"gameperf",label:"game-performance",hint:"CachyOS wrapper: performance power profile + screensaver inhibit for the game",wrap:"game-performance"},
+ {id:"gamemode",label:"GameMode",hint:"Feral GameMode: requests a temporary performance profile (CPU governor, I/O priority, GPU perf mode) for the duration of the game",wrap:"gamemoderun"},
  {id:"vram8g",label:"Optimise for 8GB VRAM",hint:"DXVK_CONFIG=\"dxgi.maxDeviceMemory=7168\" — caps the VRAM DXVK reports to the game at 7GB instead of the card's full 8GB. Leaving that headroom stops texture streaming from filling every last MB and thrashing against the desktop/compositor, which is what causes stutter on 8GB cards (3050/3060/4060/5060-class) in VRAM-heavy titles. Leave this off on cards with more than 8GB — it would just throttle memory you actually have.",env:"DXVK_CONFIG=dxgi.maxDeviceMemory=7168"},
  {id:"steamdeckon",label:"Steam Deck spoof (=1)",hint:"SteamDeck=1 — spoofs Deck mode; helps some anti-cheat (ACE) accept Linux",env:"SteamDeck=1"},
  {id:"steamdeckoff",label:"Force Steam Deck off (=0)",hint:"SteamDeck=0 — explicitly disables Deck mode when something else enabled it",env:"SteamDeck=0"},

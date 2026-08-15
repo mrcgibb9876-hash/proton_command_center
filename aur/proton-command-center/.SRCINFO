@@ -10,6 +10,7 @@ pkgbase = proton-command-center
 	depends = curl
 	optdepends = steam: the storefront this manages (required in practice)
 	optdepends = mangohud: performance overlay toggle and benchmark tab
+	optdepends = gamemode: performance wrapper toggle in the launch builder
 	optdepends = nvidia-utils: DLSS DLL management and driver-aware compile tracking
 	source = proton-command-center-1.21.0.tar.gz::https://github.com/mrcgibb9876-hash/proton_command_center/archive/refs/tags/v1.21.0.tar.gz
 	sha256sums = 9b3add7d181dafc3e584cead740579d6b7339de2caccfe29ca9e7f5820f3f345
