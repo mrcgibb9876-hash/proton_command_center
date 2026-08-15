@@ -737,7 +737,7 @@ const TOGGLES=[
  {id:"fsr4upgrade",needs:"PROTON_FSR4_UPGRADE",label:"FSR4 upgrade",hint:"PROTON_FSR4_UPGRADE=1 — upgrades FSR 3.1 DLLs to FSR 4. RDNA4 only in practice; on your NVIDIA GPU this won't do anything useful.",env:"PROTON_FSR4_UPGRADE=1"},
  {id:"noesync",needs:"PROTON_NO_ESYNC",label:"Disable esync",hint:"PROTON_NO_ESYNC=1 — turns off eventfd synchronisation. A troubleshooting switch: try it only if a game hangs or crashes on launch, since esync is normally a performance win.",env:"PROTON_NO_ESYNC=1"},
  {id:"vkd3dheap",label:"VKD3D descriptor heap (experimental)",hint:"VKD3D_CONFIG=descriptor_heap — enables vkd3d-proton's newer Vulkan descriptor-heap path for D3D12 titles, meant to eventually replace the current descriptor-buffer implementation. Still opt-in upstream because of unresolved NVIDIA driver bugs (crashes/visual corruption reported in some titles, e.g. Ready or Not) — worth trying per-game, not as a default. (PROTON_VKD3D_HEAP=1 was the old opt-in for this and is being removed upstream; don't set it alongside this.)",env:"VKD3D_CONFIG=descriptor_heap"},
- {id:"ultraplus",label:"Ultra+ mod loader",hint:"WINEDLLOVERRIDES=dwmapi=n,b — forces Proton to load the mod's dwmapi.dll (UE4SS + ASI loader) from disk instead of its own builtin stub, so Ultra+'s UltraPlusExtensions and any companion .asi fixes (e.g. NaniteRayTracingFix.asi) can inject. The status note below only appears once a game is open, and only means something if the files are already in the game folder — installed separately via Ultra+ Manager.",env:"WINEDLLOVERRIDES=dwmapi=n,b"},
+ {id:"ultraplus",label:"Ultra+ mod loader",hint:"WINEDLLOVERRIDES=dinput8=n,b — forces Proton to load the mod's dinput8.dll (Ultimate ASI Loader) from disk instead of its own builtin stub, so Ultra+'s UltraPlusExtensions and any companion .asi fixes (e.g. NaniteRayTracingFix.asi) can inject. The status note below only appears once a game is open, and only means something if the files are already in the game folder — installed separately via Ultra+ Manager.",env:"WINEDLLOVERRIDES=dinput8=n,b"},
 ];
 let manualEdit=false;
 
@@ -980,11 +980,11 @@ async function loadUltraPlus(appid){
       s.textContent="No ue4ss folder found in this game — install Ultra+ with Ultra+ Manager first.";
     }else if(!st.loader_present){
       s.style.color="var(--danger)";
-      s.textContent=`ue4ss found but dwmapi.dll (the loader) is missing from ${st.exe_dir}`;
+      s.textContent=`ue4ss found but dinput8.dll (the loader) is missing from ${st.exe_dir}`;
     }else{
       const asi=st.asi_files.length?` + ${st.asi_files.join(", ")}`:"";
       s.style.color="var(--dlss)";
-      s.textContent=`Found dwmapi.dll${asi} in ${st.exe_dir}`
+      s.textContent=`Found dinput8.dll${asi} in ${st.exe_dir}`
         +(st.mod_enabled?"":" — UltraPlusExtensions is disabled in mods.txt");
     }
     // Reflect straight onto the card's badge - otherwise it only shows up

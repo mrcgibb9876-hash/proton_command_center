@@ -250,7 +250,7 @@ class PCCTests(unittest.TestCase):
         exe_dir = self.root / "steamapps/common/TestGame/Binaries/Win64"
         mods_dir = exe_dir / "ue4ss" / "Mods"
         mods_dir.mkdir(parents=True)
-        (exe_dir / "dwmapi.dll").write_bytes(b"x")
+        (exe_dir / "dinput8.dll").write_bytes(b"x")
         (exe_dir / "NaniteRayTracingFix.asi").write_bytes(b"x")
         (mods_dir / "mods.txt").write_text(
             "﻿BPML_GenericFunctions : 1\nUltraPlusExtensions : 1\n")

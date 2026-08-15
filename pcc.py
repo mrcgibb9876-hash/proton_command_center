@@ -982,12 +982,12 @@ def _backup_path(dll_path):
 
 def scan_ultraplus(install_path):
     """Ultra+ mods (theultraplace.com) inject via a UE4SS build that hijacks
-    dwmapi.dll, sitting next to the game's own ue4ss/ folder. Companion
-    fixes some games require (e.g. NaniteRayTracingFix.asi) are separate .asi
-    files loaded from the same directory. None of this fires under Proton
-    unless WINEDLLOVERRIDES forces the native dwmapi.dll over Proton's own
-    stub, so this only reports what's on disk - the launch-option toggle is
-    a separate, explicit step."""
+    dinput8.dll (Ultimate ASI Loader), sitting next to the game's own ue4ss/
+    folder. Companion fixes some games require (e.g. NaniteRayTracingFix.asi)
+    are separate .asi files loaded from the same directory. None of this
+    fires under Proton unless WINEDLLOVERRIDES forces the native dinput8.dll
+    over Proton's own stub, so this only reports what's on disk - the
+    launch-option toggle is a separate, explicit step."""
     base = Path(install_path)
     if not base.is_dir():
         return {"installed": False}
@@ -1009,7 +1009,7 @@ def scan_ultraplus(install_path):
         return {
             "installed": True,
             "exe_dir": str(exe_dir),
-            "loader_present": (exe_dir / "dwmapi.dll").is_file(),
+            "loader_present": (exe_dir / "dinput8.dll").is_file(),
             "asi_files": sorted(p.name for p in exe_dir.glob("*.asi")),
             "mod_enabled": enabled,
         }
