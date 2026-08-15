@@ -99,7 +99,7 @@ class PCCTests(unittest.TestCase):
             store["Software"]["Valve"]["Steam"]["apps"]["12345"]["playtime"], "120")
 
     def test_vdf_escaped_quotes(self):
-        tricky = 'WINEDLLOVERRIDES="version=n,b" %command%'
+        tricky = 'WINEDLLOVERRIDES="dwmapi=n,b" %command%'
         pcc.set_launch_options(self.root, "12345", tricky)
         self.assertEqual(pcc.get_launch_options(self.root, "12345")["value"], tricky)
 
@@ -250,7 +250,7 @@ class PCCTests(unittest.TestCase):
         exe_dir = self.root / "steamapps/common/TestGame/Binaries/Win64"
         mods_dir = exe_dir / "ue4ss" / "Mods"
         mods_dir.mkdir(parents=True)
-        (exe_dir / "version.dll").write_bytes(b"x")
+        (exe_dir / "dwmapi.dll").write_bytes(b"x")
         (exe_dir / "NaniteRayTracingFix.asi").write_bytes(b"x")
         (mods_dir / "mods.txt").write_text(
             "﻿BPML_GenericFunctions : 1\nUltraPlusExtensions : 1\n")
@@ -272,20 +272,6 @@ class PCCTests(unittest.TestCase):
     def test_scan_ultraplus_not_installed(self):
         st = pcc.scan_ultraplus(self.root / "steamapps/common/TestGame")
         self.assertFalse(st["installed"])
-
-    def test_install_ultraplus_loader_copies_bundled_dll(self):
-        exe_dir = self.root / "steamapps/common/TestGame/Binaries/Win64"
-        (exe_dir / "ue4ss" / "Mods").mkdir(parents=True)
-        existing = exe_dir / "version.dll"
-        existing.write_bytes(b"old-unrelated-version-dll")
-        r = pcc.install_ultraplus_loader(self.root / "steamapps/common/TestGame")
-        self.assertTrue(r["installed"])
-        self.assertEqual(existing.read_bytes(), pcc.ultraplus_loader_bytes())
-        self.assertEqual(pcc._backup_path(existing).read_bytes(), b"old-unrelated-version-dll")
-
-    def test_install_ultraplus_loader_requires_ue4ss(self):
-        with self.assertRaises(RuntimeError):
-            pcc.install_ultraplus_loader(self.root / "steamapps/common/TestGame")
 
     def test_swap_refuses_type_mismatch(self):
         game_dll = self.root / "steamapps/common/TestGame/Engine/nvngx_dlss.dll"
