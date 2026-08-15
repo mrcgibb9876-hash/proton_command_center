@@ -106,12 +106,14 @@ server-side. Skip them and everything else still works.
 Compatibility tools are read from disk, so only builds you actually have are
 offered, and new releases show up on their own. Toggles cover DXVK, HDR,
 native Wayland, Reflex, esync, GE-only extras like D7VK and OptiScaler,
-and an Ultra+ mod loader toggle (`WINEDLLOVERRIDES=dinput8=n,b`) for UE4SS-based
+and an Ultra+ mod loader toggle (`WINEDLLOVERRIDES="version=n,b"`) for UE4SS-based
 mods from [theultraplace.com](https://theultraplace.com) - it forces Proton to
-load the mod's dinput8.dll from disk instead of its own stub. Opening a game
-whose folder has a `ue4ss/` directory shows what Ultra+ found there (the
-loader DLL, any companion `.asi` fixes); the files themselves come from
-Ultra+ Manager, not Command Center.
+load version.dll from disk instead of its own stub. Switching the toggle on
+copies Command Center's own bundled build of version.dll (Ultimate ASI
+Loader) into the game's exe folder, backing up whatever was already there.
+Opening a game whose folder has a `ue4ss/` directory shows what Ultra+ found
+there (the loader DLL, any companion `.asi` fixes); the `ue4ss/` mod itself
+still comes from Ultra+ Manager, not Command Center.
 
 A game with Ultra+ set up gets an **ULTRA+** badge on its library card - click
 the logo to launch Ultra+ Manager. Get the manager itself, or point Command
