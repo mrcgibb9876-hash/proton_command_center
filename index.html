@@ -362,27 +362,6 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
     </label>
   </div>
 
-  <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:16px 0 10px">
-    <img src="" id="umHeadingLogo" alt="" style="height:16px;vertical-align:-3px;margin-right:6px">Ultra+ Manager</h3>
-  <p class="note" style="margin:0 0 10px">Installs and configures <a href="https://theultraplace.com/" target="_blank" rel="noopener noreferrer" style="color:var(--compiled)">Ultra+</a>
-    mods (UE4SS-based performance/visual mods). Command Center only detects what Ultra+ Manager leaves in a game's
-    folder and launches the app — mod install/config itself happens inside Ultra+ Manager.</p>
-  <div class="row">
-    <button class="btn primary" id="umInstallBundledBtn">Install Ultra+ Manager</button>
-    <button class="btn primary" id="umLaunchBtn" disabled>Open Ultra+ Manager</button>
-  </div>
-  <p class="note" id="umStatus" style="margin-top:8px">Checking…</p>
-  <p class="note" style="margin-top:6px">Installs our own linux-parity build automatically — no manual download
-    needed.</p>
-  <div class="row" style="margin-top:10px">
-    <input type="text" id="umZipPath" placeholder="/path/to/UltraPlus Manager Linux-….zip" style="flex:1">
-    <button class="btn" id="umBrowseBtn">Browse…</button>
-    <button class="btn" id="umInstallBtn">Install from zip</button>
-  </div>
-  <p class="note" style="margin-top:6px">Alternative: <a href="https://www.nexusmods.com/site/mods/1586"
-    target="_blank" rel="noopener noreferrer" style="color:var(--compiled)">the official Windows-only release on
-    Nexus Mods</a> — save its zip yourself, then Install from zip unpacks it here.</p>
-
   <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:16px 0 10px">Proton versions (GE-Proton)</h3>
   <div id="protonList"><p class="note">Loading…</p></div>
 </div>
@@ -463,6 +442,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
     <button class="tab active" data-tab="launch">Launch</button>
     <button class="tab" data-tab="dlss">DLSS</button>
     <button class="tab" data-tab="reshade">ReShade</button>
+    <button class="tab" data-tab="mods">Mods</button>
     <button class="tab" data-tab="cache">Shader cache</button>
     <button class="tab" data-tab="bench">Benchmark</button>
   </div>
@@ -505,10 +485,8 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
           <option value="">Preset: game default</option>
           <option value="render_preset_j">J (transformer)</option>
           <option value="render_preset_k">K (transformer)</option>
-          <option value="render_preset_l">L (DLSS 4.5)</option>
-          <option value="render_preset_m">M (DLSS 4.5)</option>
-          <option value="render_preset_n">N</option>
-          <option value="render_preset_o">O</option>
+          <option value="render_preset_l">L (2nd-gen transformer)</option>
+          <option value="render_preset_m">M (2nd-gen transformer)</option>
           <option value="render_preset_latest">Latest / recommended</option>
         </select>
       </div>
@@ -533,11 +511,8 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
         <select id="rrPreset">
           <option value="">Off (game default)</option>
           <option value="on">Force on (default preset)</option>
-          <option value="render_preset_k">Force on · preset K</option>
-          <option value="render_preset_l">Force on · preset L</option>
-          <option value="render_preset_m">Force on · preset M</option>
-          <option value="render_preset_n">Force on · preset N</option>
-          <option value="render_preset_o">Force on · preset O</option>
+          <option value="render_preset_d">Force on · preset D (default transformer)</option>
+          <option value="render_preset_e">Force on · preset E (latest transformer)</option>
           <option value="render_preset_latest">Force on · latest</option>
         </select>
       </div>
@@ -624,6 +599,60 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
     </div>
   </div>
 
+  <!-- MODS -->
+  <div class="pane" id="pane-mods">
+    <div class="section">
+      <h3><img src="" id="modsHeadingLogo" alt="" style="height:16px;vertical-align:-3px;margin-right:6px">Ultra+ Mods</h3>
+      <div id="modsStatus"><p class="note">Checking…</p></div>
+      <div class="row" style="margin-top:10px;align-items:center;gap:10px" id="modsVersionRow" hidden>
+        <label class="note" for="modsVersion" style="margin:0">Version</label>
+        <select id="modsVersion" style="flex:1"></select>
+      </div>
+      <div class="row" style="margin-top:10px" id="modsSkipUE4SSRow" hidden>
+        <label style="display:flex;align-items:center;gap:9px;cursor:pointer">
+          <input type="checkbox" id="modsSkipUE4SS"> I manage my own UE4SS, only install Ultra+ files
+        </label>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn green" id="modsInstallBtn" hidden>Install</button>
+        <button class="btn danger" id="modsRemoveBtn" hidden>Remove</button>
+      </div>
+      <div class="bar" id="modsBar"><i></i></div>
+      <p class="note" id="modsDetail"></p>
+      <div id="modsPresetRow" class="row" style="margin-top:14px;align-items:center;gap:10px" hidden>
+        <label class="note" for="modsPreset" style="margin:0">Preset</label>
+        <select id="modsPreset" style="flex:1"></select>
+        <button class="btn" id="modsApplyPresetBtn">Apply</button>
+      </div>
+      <p class="note" id="modsPresetHint" style="margin-top:6px" hidden>Only the base preset has
+        generated so far — quality-tier presets (low/medium/high/veryhigh/epic) are written by the
+        mod itself the first time you actually launch the game with it installed.</p>
+      <p class="note" style="margin-top:10px">Fetched from the same public
+        <a href="https://theultraplace.com/" target="_blank" rel="noopener noreferrer" style="color:var(--compiled)">Ultra+</a>
+        catalog the official apps use. Command Center installs the files directly — all Ultra+
+        branding, mod content, and the game-data catalog belong to the Ultra+ team.</p>
+    </div>
+
+    <div class="section" id="modsSettingsSection" hidden>
+      <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:0 0 10px">Settings</h3>
+      <div class="row" style="gap:10px;align-items:center">
+        <input id="modsSettingsSearch" type="text" placeholder="Search settings…" style="flex:1">
+        <label style="display:flex;align-items:center;gap:7px;cursor:pointer;white-space:nowrap">
+          <input type="checkbox" id="modsShowAdvanced"> Show advanced
+        </label>
+        <button class="btn" id="modsRestoreDefaultsBtn">Restore defaults</button>
+      </div>
+      <div id="modsSettingsList" style="margin-top:12px"></div>
+    </div>
+
+    <div class="section" id="modsAddonsSection" hidden>
+      <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:0 0 10px">Addons</h3>
+      <p class="note" style="margin:0 0 10px">Optional extra fixes on top of the main mod — each is
+        installed/removed independently.</p>
+      <div id="modsAddonsList"></div>
+    </div>
+  </div>
+
   <!-- CACHE -->
   <div class="pane" id="pane-cache">
     <div class="section">
@@ -704,7 +733,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
 
 <script>
 "use strict";
-const FRONTEND_VERSION="1.21.0";
+const FRONTEND_VERSION="1.22.0";
 const $=s=>document.querySelector(s);
 const api=async(p,opts)=>{const r=await fetch(p,opts);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j};
 const post=(p,body)=>api(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
@@ -896,27 +925,36 @@ $("#srMode").addEventListener("change",()=>{
 ["#dlssPreset","#srRatio","#fgMode","#rrPreset","#fpsCap","#extraEnv","#extraArgs"].forEach(s=>$(s).addEventListener("input",()=>{manualEdit=false;buildString()}));
 
 /* ---------- DLSS preset info pop-up ----------
-   Sourced from NVIDIA's DLSS 4.5 preset guidance and the dxvk-nvapi preset
-   enum as of Aug 2026. J/K are the 1st-gen (DLSS 4.0) transformer model, L/M
-   the 2nd-gen (DLSS 4.5) one; N/O are reserved slots dxvk-nvapi already
-   exposes but NVIDIA hasn't attached behaviour to yet, expected to matter
-   once DLSS 5 actually ships (Fall 2026). */
+   Sourced directly from NVIDIA's own Streamline SDK headers (github.com/
+   NVIDIAGameWorks/Streamline), which are authoritative for what each render
+   preset letter actually does - verified Aug 2026, since earlier guesses in
+   this file turned out wrong. Super Resolution (sl_dlss.h, DLSSPreset) and
+   Ray Reconstruction (sl_dlss_d.h, DLSSDPreset) are SEPARATE enums that
+   happen to share letter names but do NOT mean the same thing per letter:
+   SR's working presets are J/K/L/M (1st-gen/2nd-gen transformer); N and O
+   are defined but explicitly commented "Reverts to default, not recommended
+   to use" - so they're deliberately excluded from the SR dropdown below.
+   RR's enum is different again: only D ("Default model (transformer)") and
+   E ("Latest transformer model, must use if DoF guide is needed") do
+   anything - every other RR letter, including K/L/M/N/O, is commented
+   "Reverts to default" in NVIDIA's header. dxvk-nvapi's DXVK_NVAPI_DRS_
+   NGX_DLSS_{SR,RR}_OVERRIDE_RENDER_PRESET_SELECTION env vars pass these
+   same letters straight through to the driver (its README points at the
+   classic NvApiDriverSettings.h header for the value list), so the same
+   per-feature meanings apply. "latest" is real too, confirmed by dxvk-nvapi's
+   own README example overriding both SR and RR presets to latest via the
+   raw DRS setting IDs. */
 const SR_PRESET_INFO={
-  render_preset_j:{title:"J — early 1st-gen Transformer",desc:"An early build of the DLSS 4.0 transformer Super Resolution model, shipped just ahead of K. K superseded it almost immediately — J is mainly a fallback for the handful of early DLSS 4 titles pinned to it. Pick K instead unless a specific game recommends J."},
-  render_preset_k:{title:"K — 1st-gen Transformer, recommended baseline",desc:"The DLSS 4.0 transformer Super Resolution model. NVIDIA's recommended default for RTX 20/30-series cards, where the 2nd-gen model's extra compute cost isn't worth it — good all-round balance of quality and performance, and a safe universal pick if you're unsure."},
-  render_preset_l:{title:"L — 2nd-gen Transformer, Ultra Performance",desc:"The DLSS 4.5 2nd-gen transformer model, tuned for the heaviest upscale ratios (Ultra Performance, especially at 4K). Recovers detail the 1st-gen model loses at aggressive scaling. Best on 40/50-series cards pushing a high output resolution from a low render resolution."},
-  render_preset_m:{title:"M — 2nd-gen Transformer, general purpose",desc:"The DLSS 4.5 2nd-gen transformer model, NVIDIA's general-purpose pick — tuned around Performance mode but also recommended for Balanced/Quality on 40/50-series cards. The best default if your card supports it."},
-  render_preset_n:{title:"N — reserved",desc:"Defined in the driver/dxvk-nvapi preset enum but with no published NVIDIA behaviour yet (Aug 2026) — selecting it likely just falls back to the driver default under the hood. Expected to gain meaning alongside DLSS 5."},
-  render_preset_o:{title:"O — reserved",desc:"Reserved alongside N, not yet assigned a model. Recent GeForce driver strings reference DLSS 5 neural-rendering presets ('DLSS-NR Presets') that aren't live in any game yet — O may end up mapped to one once DLSS 5 actually ships (NVIDIA has said Fall 2026). Safe to try; expect no visible change today."},
+  render_preset_j:{title:"J — early 1st-gen Transformer",desc:"Similar to preset K - may show slightly less ghosting at the cost of extra flickering. NVIDIA's own guidance recommends K over J for most cases; J is mainly for the handful of titles that specifically pin to it."},
+  render_preset_k:{title:"K — 1st-gen Transformer, recommended baseline",desc:"NVIDIA's default preset for DLAA/Balanced/Quality modes. Transformer-based - the best image-quality preset at a higher performance cost than the older CNN models."},
+  render_preset_l:{title:"L — 2nd-gen Transformer, Ultra Performance",desc:"NVIDIA's default preset for Ultra Performance mode. Sharper, more stable image with less ghosting than J/K, at a higher performance cost - built for the most aggressive upscale ratios."},
+  render_preset_m:{title:"M — 2nd-gen Transformer, Performance",desc:"NVIDIA's default preset for Performance mode. Similar image-quality gains to L but closer in speed to J/K - the general-purpose 2nd-gen pick."},
   render_preset_latest:{title:"Latest / recommended",desc:"Always resolves to whichever preset NVIDIA currently recommends for the game/GPU combination, without hardcoding a letter — set it and forget it; it stays current as new presets ship."},
 };
 const RR_PRESET_INFO={
-  on:{title:"Default preset",desc:"Turns Ray Reconstruction on without pinning a specific model — the game/driver default preset applies."},
-  render_preset_k:{title:"K — 1st-gen Transformer RR",desc:"The DLSS 4.0 transformer Ray Reconstruction model — current recommended default. A big step over the old CNN RR presets for denoising ray-traced lighting and reflections."},
-  render_preset_l:{title:"L — 2nd-gen Transformer RR, heavy ray tracing",desc:"The DLSS 4.5 2nd-gen transformer RR model, tuned for the heaviest ray-traced scenes / lowest RR input resolutions. Pairs naturally with Super Resolution preset L."},
-  render_preset_m:{title:"M — 2nd-gen Transformer RR, general purpose",desc:"The DLSS 4.5 2nd-gen transformer RR model, general-purpose pick — pairs naturally with Super Resolution preset M for a consistent 2nd-gen look."},
-  render_preset_n:{title:"N — reserved",desc:"Defined in the driver/dxvk-nvapi preset enum but with no published NVIDIA behaviour yet (Aug 2026). Expected to gain meaning alongside DLSS 5."},
-  render_preset_o:{title:"O — reserved",desc:"Reserved alongside N, not yet assigned a model — likely tied to DLSS 5's neural-rendering pipeline once it ships (NVIDIA has said Fall 2026). Safe to try; expect no visible change today."},
+  on:{title:"Default preset",desc:"Turns Ray Reconstruction on without pinning a specific model — the game/driver default preset applies (same as preset D below)."},
+  render_preset_d:{title:"D — default transformer model",desc:"NVIDIA's default Ray Reconstruction model. Ray Reconstruction only has two presets that actually do anything, D and E - every other letter (F through O, including K/L/M which matter for Super Resolution) silently reverts to this same default in NVIDIA's own driver, so there's no separate quality-tier ladder here like Super Resolution has."},
+  render_preset_e:{title:"E — latest transformer model",desc:"NVIDIA's newest Ray Reconstruction model - required if a game's depth-of-field guide needs it. Worth trying if D doesn't look right; otherwise the two are close."},
   render_preset_latest:{title:"Latest / recommended",desc:"Always resolves to whichever RR preset NVIDIA currently recommends for the game/GPU combination — set it and forget it."},
 };
 function showPresetPop(selectEl,info){
@@ -1049,7 +1087,7 @@ function renderGrid(filter=""){
       <div class="body">
         <img loading="lazy" src="https://cdn.cloudflare.steamstatic.com/steam/apps/${g.appid}/header.jpg"
              data-appid="${g.appid}" data-fallback="0" alt="">
-        <div class="meta"><div class="nameRow"><b>${esc(g.name)}</b>${g.has_ultraplus?`<button class="ultraplusbadge" data-ultraplus="${g.appid}" title="Ultra+ mods are set up in this game — click to open Ultra+ Manager"><img src="${ULTRAPLUS_LOGO}" alt="">ULTRA+</button>`:g.ultraplus_supported?`<button class="ultraplusbadge dim" data-ultraplus-info="${esc(g.ultraplus_url||"")}" title="Ultra+ mods are available for this game — click for details"><img src="${ULTRAPLUS_LOGO}" alt="">ULTRA+ available</button>`:""}</div><small>${(statusById[g.appid]||{}).installing?("installing"+((statusById[g.appid]||{}).pct!=null?" · "+(statusById[g.appid]||{}).pct+"%":"…")):(g._uninstalled?"not installed":(g.size_bytes?fmtMB(g.size_bytes):"—"))}</small></div>
+        <div class="meta"><div class="nameRow"><b>${esc(g.name)}</b>${g.has_ultraplus?`<button class="ultraplusbadge" title="Ultra+ mods are set up in this game — click to manage"><img src="${ULTRAPLUS_LOGO}" alt="">ULTRA+</button>`:g.ultraplus_supported?`<button class="ultraplusbadge dim" title="Ultra+ mods are available for this game — click to install"><img src="${ULTRAPLUS_LOGO}" alt="">ULTRA+ available</button>`:""}</div><small>${(statusById[g.appid]||{}).installing?("installing"+((statusById[g.appid]||{}).pct!=null?" · "+(statusById[g.appid]||{}).pct+"%":"…")):(g._uninstalled?"not installed":(g.size_bytes?fmtMB(g.size_bytes):"—"))}</small></div>
         ${g._uninstalled?`<button class="installbtn" data-install="${g.appid}">Install</button>`:`<button class="playbtn" data-play="${g.appid}" title="Play">▶</button>`}
       </div>
       <div class="cardbar"><i></i></div>
@@ -1089,10 +1127,8 @@ $("#grid").addEventListener("click",e=>{
   const ub=e.target.closest(".ultraplusbadge");
   if(ub){
     e.stopPropagation();
-    if(ub.hasAttribute("data-ultraplus-info")){
-      const infoUrl=ub.getAttribute("data-ultraplus-info");
-      if(infoUrl)window.open(infoUrl,"_blank","noopener");
-    }else openUltraPlusManager();
+    const card=ub.closest(".card");
+    if(card){openGame(card.dataset.appid);switchTab("mods")}
     return;
   }
   const c=e.target.closest(".card");
@@ -1456,7 +1492,7 @@ async function openGame(appid){
   }catch(e){loadStringIntoUI("")}
   loadUltraPlus(appid);
   refreshCapabilities();
-  loadLibrary().then(()=>loadDLSS(appid));loadCache(appid);loadBench(appid);loadCompat(appid);loadSteamShader();loadShaderEnv();loadCachedPdb(appid);loadReshade(appid);
+  loadLibrary().then(()=>loadDLSS(appid));loadCache(appid);loadBench(appid);loadCompat(appid);loadSteamShader();loadShaderEnv();loadCachedPdb(appid);loadReshade(appid);loadMods(appid);
 }
 
 async function loadDLSS(appid){
@@ -1582,6 +1618,204 @@ $("#reshadeRemoveBtn").addEventListener("click",async()=>{
   try{
     await post("/api/reshade/remove",{appid:current.appid});
     toast("Removed");loadReshade(current.appid);
+  }catch(e){toast(e.message,true)}
+});
+
+/* ---------- Ultra+ Mods ---------- */
+$("#modsHeadingLogo").src=ULTRAPLUS_LOGO;
+window._modsState=null;
+async function loadMods(appid){
+  const box=$("#modsStatus");
+  box.innerHTML='<p class="note">Checking…</p>';
+  $("#modsVersionRow").hidden=true;$("#modsSkipUE4SSRow").hidden=true;
+  $("#modsInstallBtn").hidden=true;$("#modsRemoveBtn").hidden=true;
+  $("#modsPresetRow").hidden=true;$("#modsPresetHint").hidden=true;
+  $("#modsSettingsSection").hidden=true;$("#modsAddonsSection").hidden=true;
+  try{
+    const d=await api(`/api/game/${appid}/mods`);
+    window._modsState=d;
+    if(!d.supported){
+      box.innerHTML='<p class="note">No Ultra+ mod is published for this game.</p>';
+      return;
+    }
+    const g=games.find(x=>x.appid===appid);
+    if(g&&g.has_ultraplus!==!!d.installed){g.has_ultraplus=!!d.installed;renderGrid($("#search").value)}
+    if(d.installed){
+      box.innerHTML=`
+        <div class="item">
+          <div class="top"><b>${esc(d.full_name)}</b>
+            <span class="chip g">v${esc(d.installed.version||"?")}</span></div>
+          <div class="path mono">${d.installed.installed_files.length} files tracked</div>
+        </div>`;
+      $("#modsRemoveBtn").hidden=false;
+      if(d.presets&&d.presets.length){
+        $("#modsPreset").innerHTML=d.presets.map(p=>`<option value="${esc(p)}">${esc(p)}</option>`).join("");
+        $("#modsPresetRow").hidden=false;
+        $("#modsPresetHint").hidden=d.presets.length>1;
+      }
+      loadModsSettings(appid);
+    }else{
+      box.innerHTML=`<p class="note">${esc(d.full_name)} has an Ultra+ mod available${d.url?` — <a href="${esc(d.url)}" target="_blank" rel="noopener noreferrer" style="color:var(--compiled)">details</a>`:""}.</p>`;
+    }
+    if(d.versions&&d.versions.length){
+      $("#modsVersion").innerHTML=d.versions.map((v,i)=>`<option value="${i}">v${esc(v.version)} — ${esc((v.updated||"").slice(0,10))}</option>`).join("");
+      $("#modsVersionRow").hidden=false;
+      $("#modsSkipUE4SSRow").hidden=false;
+      $("#modsInstallBtn").hidden=false;
+      $("#modsInstallBtn").textContent=d.installed?"Reinstall / update":"Install";
+    }else if(!d.installed){
+      box.innerHTML+='<p class="note">No downloadable version found in the mod catalog right now.</p>';
+    }
+    loadModsAddons(appid);
+  }catch(e){box.innerHTML=`<p class="note">${esc(e.message)}</p>`}
+}
+
+/* ---------- Ultra+ settings editor ---------- */
+async function loadModsSettings(appid){
+  const sec=$("#modsSettingsSection");
+  try{
+    const d=await api(`/api/game/${appid}/mods/settings`);
+    if(!d.settings||!d.settings.length){sec.hidden=true;return}
+    sec.hidden=false;
+    const bucket={};
+    for(const s of d.settings)(bucket[s.category]=bucket[s.category]||[]).push(s);
+    const renderRow=s=>{
+      const opts=s.options.slice();
+      if(s.value!=null&&s.value!==""&&!opts.includes(s.value))opts.unshift(s.value);
+      const searchText=esc((s.name+" "+s.key+" "+(s.description||"")).toLowerCase());
+      return `<div class="item" data-setting-name="${searchText}" data-advanced="${s.advanced?1:0}">
+        <div class="top">
+          <b title="${esc(s.description||"")}">${esc(s.name)}</b>
+          <select class="modsSettingSelect" data-key="${esc(s.key)}">
+            ${opts.map(o=>`<option value="${esc(o)}"${o===s.value?" selected":""}>${esc(o)}</option>`).join("")}
+          </select>
+        </div>
+        ${s.description?`<div class="path">${esc(s.description)}</div>`:""}
+      </div>`;
+    };
+    $("#modsSettingsList").innerHTML=(d.categories||[]).filter(c=>bucket[c]&&bucket[c].length).map(c=>`
+      <details open style="margin-bottom:14px">
+        <summary style="cursor:pointer;font-weight:600;padding:6px 0">${esc(c)} <span class="chip m">${bucket[c].length}</span></summary>
+        ${bucket[c].map(renderRow).join("")}
+      </details>`).join("");
+    applyModsSettingsFilter();
+  }catch(e){sec.hidden=true}
+}
+function applyModsSettingsFilter(){
+  const q=($("#modsSettingsSearch").value||"").toLowerCase().trim();
+  const showAdvanced=$("#modsShowAdvanced").checked;
+  $("#modsSettingsList").querySelectorAll("[data-setting-name]").forEach(row=>{
+    const matchesSearch=!q||row.dataset.settingName.includes(q);
+    const matchesAdvanced=showAdvanced||row.dataset.advanced==="0";
+    row.hidden=!(matchesSearch&&matchesAdvanced);
+  });
+}
+$("#modsSettingsSearch").addEventListener("input",applyModsSettingsFilter);
+$("#modsShowAdvanced").addEventListener("change",applyModsSettingsFilter);
+$("#modsSettingsList").addEventListener("change",async e=>{
+  const sel=e.target.closest(".modsSettingSelect");
+  if(!sel||!current)return;
+  const key=sel.dataset.key;
+  try{
+    await post("/api/mods/settings/set",{appid:current.appid,key,value:sel.value});
+    toast(`${key} = ${sel.value}`);
+  }catch(err){toast(err.message,true)}
+});
+$("#modsRestoreDefaultsBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  if(!await pccConfirm("Restore all Ultra+ settings to the mod's shipped defaults?",{yes:"Restore",danger:true}))return;
+  try{
+    await post("/api/mods/settings/restore_defaults",{appid:current.appid});
+    toast("Restored defaults");
+    loadModsSettings(current.appid);
+  }catch(e){toast(e.message,true)}
+});
+
+/* ---------- Ultra+ addons ---------- */
+async function loadModsAddons(appid){
+  const sec=$("#modsAddonsSection");
+  try{
+    const d=await api(`/api/game/${appid}/mods/addons`);
+    if(!d.addons||!d.addons.length){sec.hidden=true;return}
+    sec.hidden=false;
+    $("#modsAddonsList").innerHTML=d.addons.map(a=>{
+      const inst=a.installed;
+      const v=a.versions&&a.versions[0];
+      return `<div class="item">
+        <div class="top"><b>${esc(a.name)}</b>${inst?`<span class="chip g">v${esc(inst.version||"?")}</span>`:""}</div>
+        ${a.description?`<div class="path">${esc(a.description)}</div>`:""}
+        <div class="row" style="margin-top:8px">
+          ${inst
+            ?`<button class="btn danger modsAddonRemove" data-addon="${esc(a.file_name)}">Remove</button>`
+            :(v?`<button class="btn green modsAddonInstall" data-addon="${esc(a.file_name)}" data-url="${esc(v.url)}" data-filename="${esc(v.filename)}">Install</button>`
+              :'<span class="chip m">no downloadable version found</span>')}
+        </div>
+        <div class="bar" data-addon-bar="${esc(a.file_name)}"><i></i></div>
+      </div>`;
+    }).join("");
+  }catch(e){sec.hidden=true}
+}
+$("#modsAddonsList").addEventListener("click",async e=>{
+  if(!current)return;
+  const installBtn=e.target.closest(".modsAddonInstall");
+  if(installBtn){
+    installBtn.disabled=true;
+    try{
+      const {task}=await post("/api/mods/addons/install",{
+        appid:current.appid,file_name:installBtn.dataset.addon,
+        download_url:installBtn.dataset.url,filename:installBtn.dataset.filename,
+      });
+      trackTask(task,`[data-addon-bar="${CSS.escape(installBtn.dataset.addon)}"]`,(t)=>{
+        installBtn.disabled=false;
+        if(t.result)toast(`Installed v${t.result.version}`);
+        loadModsAddons(current.appid);
+      });
+    }catch(err){toast(err.message,true);installBtn.disabled=false}
+    return;
+  }
+  const removeBtn=e.target.closest(".modsAddonRemove");
+  if(removeBtn){
+    if(!await pccConfirm("Remove this addon?",{yes:"Remove",danger:true}))return;
+    try{
+      await post("/api/mods/addons/remove",{appid:current.appid,file_name:removeBtn.dataset.addon});
+      toast("Removed");loadModsAddons(current.appid);
+    }catch(err){toast(err.message,true)}
+  }
+});
+$("#modsInstallBtn").addEventListener("click",async()=>{
+  if(!current||!window._modsState)return;
+  const d=window._modsState;
+  const idx=parseInt($("#modsVersion").value,10);
+  const v=d.versions[idx];
+  if(!v)return toast("Pick a version first",true);
+  const btn=$("#modsInstallBtn");btn.disabled=true;
+  try{
+    const {task}=await post("/api/mods/install",{
+      appid:current.appid, download_url:v.url, filename:v.filename,
+      skip_ue4ss:$("#modsSkipUE4SS").checked,
+    });
+    trackTask(task,"#modsBar",(t)=>{
+      btn.disabled=false;
+      if(t.result)toast(`Installed v${t.result.version}`);
+      loadMods(current.appid);
+    },"#modsDetail");
+  }catch(e){toast(e.message,true);btn.disabled=false}
+});
+$("#modsRemoveBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  if(!await pccConfirm(`Remove the Ultra+ mod from ${current.name}?`,{yes:"Remove",danger:true}))return;
+  try{
+    await post("/api/mods/remove",{appid:current.appid});
+    toast("Removed");loadMods(current.appid);
+  }catch(e){toast(e.message,true)}
+});
+$("#modsApplyPresetBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  const preset=$("#modsPreset").value;
+  if(!preset)return;
+  try{
+    await post("/api/mods/apply_preset",{appid:current.appid,preset});
+    toast(`Applied preset: ${preset}`);
   }catch(e){toast(e.message,true)}
 });
 
@@ -2071,61 +2305,6 @@ async function loadHardware(){
   }catch(e){$("#hwBody").innerHTML=`<p class="note">${esc(e.message)}</p>`}
 }
 
-/* ---------- Ultra+ Manager ---------- */
-$("#umHeadingLogo").src=ULTRAPLUS_LOGO;
-async function loadUltraplusManager(){
-  try{
-    const st=await api("/api/ultraplus_manager/status");
-    const upToDate=st.installed_tag&&st.installed_tag===st.bundled_tag;
-    $("#umStatus").textContent=st.installed
-      ?`Installed at ${st.path}`+(st.installed_tag?(upToDate?" (up to date)":` (${st.installed_tag}, ${st.bundled_tag} available)`):"")
-      :"Not installed yet";
-    $("#umLaunchBtn").disabled=!st.installed;
-    $("#umInstallBundledBtn").textContent=st.installed?(upToDate?"Reinstall":"Update"):"Install Ultra+ Manager";
-  }catch(e){$("#umStatus").textContent="Couldn't check status"}
-}
-$("#umInstallBundledBtn").addEventListener("click",async()=>{
-  const btn=$("#umInstallBundledBtn");btn.disabled=true;const label=btn.textContent;btn.textContent="Installing…";
-  try{
-    const {task}=await post("/api/ultraplus_manager/install_bundled",{});
-    const iv=setInterval(async()=>{
-      try{
-        const t=await api("/api/tasks/"+task);
-        if(t.detail)btn.textContent=t.detail.length>18?t.detail.slice(0,18)+"…":t.detail;
-        if(t.status==="done"||t.status==="error"){
-          clearInterval(iv);toast(t.detail,t.status==="error");btn.disabled=false;
-          await loadUltraplusManager();
-        }
-      }catch(e){clearInterval(iv);btn.disabled=false;btn.textContent=label}
-    },800);
-  }catch(e){toast(e.message,true);btn.disabled=false;btn.textContent=label}
-});
-$("#umBrowseBtn").addEventListener("click",()=>openBrowse("umZipPath"));
-$("#umInstallBtn").addEventListener("click",async()=>{
-  const path=$("#umZipPath").value.trim();
-  if(!path){toast("Enter or browse to the downloaded zip",true);return}
-  const btn=$("#umInstallBtn");btn.disabled=true;btn.textContent="Installing…";
-  try{
-    await post("/api/ultraplus_manager/install",{zip:path});
-    toast("Ultra+ Manager installed");
-    await loadUltraplusManager();
-  }catch(e){toast(e.message,true)}
-  btn.disabled=false;btn.textContent="Install from zip";
-});
-async function openUltraPlusManager(){
-  // No CLI hook into UM for a specific game (it's GUI-only) - this opens the
-  // app itself; the game is picked inside it, same as launching it by hand.
-  try{
-    await post("/api/ultraplus_manager/launch",{});
-    toast("Opening Ultra+ Manager — pick the game there");
-  }catch(e){
-    toast("Ultra+ Manager isn't installed yet — install it from Settings",true);
-    $("#settingsPop").hidden=false;
-    loadUltraplusManager();
-  }
-}
-$("#umLaunchBtn").addEventListener("click",openUltraPlusManager);
-
 /* ---------- settings ---------- */
 $("#settingsBtn").addEventListener("click",async()=>{
   const pop=$("#settingsPop");pop.hidden=!pop.hidden;
@@ -2134,7 +2313,6 @@ $("#settingsBtn").addEventListener("click",async()=>{
       $("#keyStatus").textContent=s.sgdb_api_key_set?`Key saved (${s.sgdb_api_key_hint})`:"No key set — Steam CDN art only";
     }catch(e){}
     loadProtonList();
-    loadUltraplusManager();
   }
 });
 

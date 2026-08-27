@@ -26,7 +26,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.21.0"
+VERSION = "1.22.0"
 PORT = int(os.environ.get("PCC_PORT", "8686"))
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path.home() / ".local/share/proton-command-center"
@@ -1022,6 +1022,14 @@ def scan_ultraplus(install_path):
 
 ULTRAPLUS_GAMEDATA_URL = "https://d25cpafae92g0h.cloudfront.net/gamedata.json"
 ULTRAPLUS_MODS_URL = "https://d25cpafae92g0h.cloudfront.net/mods_manifest.json"
+ULTRAPLUS_ADDONS_URL = "https://d25cpafae92g0h.cloudfront.net/addons_manifest.json"
+# Global (not per-game) polish data for the settings editor: which category
+# each setting key displays under, a curated description/name that overrides
+# the mod's own parser_friendly_settings.ini where present. Same official
+# CloudFront bucket the real Ultra+ Manager reads at startup.
+ULTRAPLUS_UI_CATEGORIES_URL = "https://d25cpafae92g0h.cloudfront.net/ui_categories.json"
+ULTRAPLUS_DESC_OVERRIDES_URL = "https://d25cpafae92g0h.cloudfront.net/description_overrides.json"
+ULTRAPLUS_NAME_OVERRIDES_URL = "https://d25cpafae92g0h.cloudfront.net/name_overrides.json"
 
 
 def _fetch_json(url):
@@ -1062,6 +1070,13 @@ def ultraplus_catalog() -> dict:
             "full_name": info.get("full_name") or key,
             "search_terms": [t.lower() for t in search_terms.get(key, [key])],
             "url": info.get("nexus_url") or info.get("wiki_url") or "",
+            # Needed to resolve install paths when actually installing a mod
+            # (see resolve_executable_path/resolve_unreal_project_path below).
+            "exe_path": info.get("exe_path") or "",
+            "ue_game_path": info.get("ue_game_path") or "",
+            "install_root_only": bool(info.get("install_root_only")),
+            "mod_filename_prefixes": info.get("mod_filename_prefixes") or [],
+            "addons": info.get("addons") or [],
         }
     data = {"games": games}
     state["ultraplus_catalog"] = {"ts": now, "data": data}
@@ -1092,116 +1107,843 @@ def match_ultraplus_catalog(name: str, catalog: dict):
     return None
 
 
-ULTRAPLUS_DIR = DATA_DIR / "tools" / "ultraplus-manager"
-ULTRAPLUS_NEXUS_URL = "https://www.nexusmods.com/site/mods/1586"
+# --------------------------------------------------------------------------
+# Ultra+ mod install (ports of Ultra+ Manager's C# install logic, fixed and
+# verified in the linux-parity Avalonia port this same session: zip-slip
+# guard, content-aware file routing, UE4SS-signature cleanup, and staged/
+# atomic writes so a failed install can never truncate the user's live
+# config). PCC installs mods itself now rather than launching the separate
+# Ultra+ Manager app - see README's Credits section for attribution.
+# --------------------------------------------------------------------------
 
-# Our own linux-parity fork/build of Ultra+ Manager (theultraplace.com's
-# official app is Windows-only via WinUI 3; this is a from-scratch Avalonia
-# port we build and host ourselves), self-contained linux-x64, published as
-# a GitLab release asset rather than bundled in-repo (43MB compressed).
-ULTRAPLUS_BUNDLED_URL = ("https://gitlab.com/mrcgibb9876/ultraplus-manager/-/releases/"
-                         "ultraplus-manager-v0.1.1/downloads/"
-                         "UltraPlusManager-Linux-linux-parity-bdb7190.tar.gz")
-ULTRAPLUS_BUNDLED_TAG = "ultraplus-manager-v0.1.1"
+def _extract_version_from_filename(filename):
+    """'<Game> Ultra Plus vX.Y.Z.zip' -> 'X.Y.Z'. Port of
+    ModVersionService.ExtractVersionFromFileName."""
+    name = filename.rsplit(".", 1)[0] if "." in filename else filename
+    idx = name.lower().rfind(" v")
+    if idx < 0:
+        return "Unknown"
+    version = name[idx + 2:]
+    version = re.sub(r"[-_]gamepass", "", version, flags=re.I)
+    return version.strip()
 
 
-def ultraplus_manager_binary():
-    exe = ULTRAPLUS_DIR / "UltraPlusManager.Linux"
-    return exe if exe.is_file() else None
-
-
-def ultraplus_manager_status() -> dict:
-    exe = ultraplus_manager_binary()
+def list_mod_versions(game_key):
+    """Last 5 released Ultra+ mod versions for a game, from the same
+    mods_manifest.json used by ultraplus_catalog() but cached far more
+    briefly (checked right before an install, not just to render a badge).
+    Port of ModVersionService.GetLast5VersionsAsync."""
     state = load_state()
-    return {"installed": exe is not None, "path": str(exe) if exe else None,
-            "bundled_tag": ULTRAPLUS_BUNDLED_TAG,
-            "installed_tag": state.get("ultraplus_manager_tag")}
-
-
-def install_ultraplus_manager(zip_path_str) -> dict:
-    """Unpack a manually-downloaded 'UltraPlus Manager Linux' zip into
-    DATA_DIR/tools. Nexus Mods has no anonymous/API download for non-premium
-    accounts, so this is a two-step flow: the Settings button opens the mod
-    page in a browser, and this call points PCC at whatever the user saved
-    from there (typically ~/Downloads)."""
-    import zipfile
-    src = Path(zip_path_str).expanduser()
-    if not src.is_file():
-        raise RuntimeError(f"File not found: {src}")
-    if src.suffix.lower() != ".zip":
-        raise RuntimeError("Expected the Ultra+ Manager Linux .zip from Nexus Mods")
-    with zipfile.ZipFile(src) as zf:
-        names = [n for n in zf.namelist() if n and not n.endswith("/")]
-        for n in names:
-            if n.startswith("/") or ".." in n.split("/"):
-                raise RuntimeError(f"unsafe path in archive: {n}")
-        roots = {n.split("/", 1)[0] for n in names if "/" in n}
-        with tempfile.TemporaryDirectory() as tmp:
-            zf.extractall(tmp)
-            tmp_path = Path(tmp)
-            payload = tmp_path / next(iter(roots)) if len(roots) == 1 else tmp_path
-            if not (payload / "UltraPlusManager.Linux").is_file():
-                raise RuntimeError("Archive doesn't look like UltraPlus Manager Linux "
-                                   "(no UltraPlusManager.Linux binary inside)")
-            ULTRAPLUS_DIR.parent.mkdir(parents=True, exist_ok=True)
-            if ULTRAPLUS_DIR.exists():
-                shutil.rmtree(ULTRAPLUS_DIR)
-            shutil.move(str(payload), str(ULTRAPLUS_DIR))
-    exe = ULTRAPLUS_DIR / "UltraPlusManager.Linux"
-    exe.chmod(exe.stat().st_mode | 0o111)
-    state = load_state()
-    state.pop("ultraplus_manager_tag", None)
-    save_state(state)
-    return ultraplus_manager_status()
-
-
-def install_ultraplus_manager_bundled(task_id) -> None:
-    """Download our own linux-parity build (see ULTRAPLUS_BUNDLED_URL) and
-    unpack it into ULTRAPLUS_DIR, same layout as install_ultraplus_manager's
-    Nexus-zip flow but self-serve — no manual download required."""
-    import tarfile, io
-    TASKS[task_id] = {"status": "running", "progress": 5,
-                      "detail": "Downloading Ultra+ Manager"}
-    try:
-        data = _gh_bytes(ULTRAPLUS_BUNDLED_URL, task_id)
-        TASKS[task_id]["detail"] = "Extracting"
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
-            for m in tar.getmembers():
-                if m.name.startswith("/") or ".." in m.name.split("/"):
-                    raise RuntimeError(f"unsafe path in archive: {m.name}")
-            names = [n for n in tar.getnames() if n and not n.endswith("/")]
-            roots = {n.split("/", 1)[0] for n in names if "/" in n}
-            with tempfile.TemporaryDirectory() as tmp:
-                tar.extractall(tmp)
-                tmp_path = Path(tmp)
-                payload = tmp_path / next(iter(roots)) if len(roots) == 1 else tmp_path
-                if not (payload / "UltraPlusManager.Linux").is_file():
-                    raise RuntimeError("bundled archive is missing UltraPlusManager.Linux")
-                ULTRAPLUS_DIR.parent.mkdir(parents=True, exist_ok=True)
-                if ULTRAPLUS_DIR.exists():
-                    shutil.rmtree(ULTRAPLUS_DIR)
-                shutil.move(str(payload), str(ULTRAPLUS_DIR))
-        exe = ULTRAPLUS_DIR / "UltraPlusManager.Linux"
-        exe.chmod(exe.stat().st_mode | 0o111)
-        state = load_state()
-        state["ultraplus_manager_tag"] = ULTRAPLUS_BUNDLED_TAG
+    cache = state.get("ultraplus_mods_manifest")
+    now = time.time()
+    if cache and now - cache.get("ts", 0) < 300:
+        manifest = cache["data"]
+    else:
+        manifest = _fetch_json(ULTRAPLUS_MODS_URL)
+        state["ultraplus_mods_manifest"] = {"ts": now, "data": manifest}
         save_state(state)
-        TASKS[task_id] = {"status": "done", "progress": 100,
-                          "detail": "Ultra+ Manager installed"}
+
+    prefix = (game_key + " Ultra").lower()
+    versions = []
+    for f in manifest.get("files", []):
+        filename = f.get("filename", "")
+        low = filename.lower()
+        if not low.startswith(prefix) or not low.endswith(".zip") or "gamepass" in low:
+            continue
+        versions.append({
+            "filename": filename,
+            "url": f.get("url", ""),
+            "updated": f.get("updated", ""),
+            "size": f.get("size", 0),
+            "description": f.get("description", ""),
+            "version": _extract_version_from_filename(filename),
+        })
+    versions.sort(key=lambda v: v["updated"], reverse=True)
+    return versions[:5]
+
+
+def _resolve_case_insensitive_path(root, relative_path):
+    """Walks relative_path under root segment-by-segment, falling back to a
+    case-insensitive directory listing at each level. Port of
+    GamePathResolver.ResolveCaseInsensitivePath."""
+    current = Path(root)
+    segments = [s for s in relative_path.replace("\\", "/").split("/") if s]
+    for i, segment in enumerate(segments):
+        is_last = i == len(segments) - 1
+        candidate = current / segment
+        if candidate.exists():
+            current = candidate
+            continue
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            return None
+        match = next((e for e in entries if e.name.lower() == segment.lower()
+                     and (is_last or e.is_dir())), None)
+        if match is None:
+            return None
+        current = match
+    return current
+
+
+def resolve_executable_path(game_key, install_path, catalog):
+    """Trusts the catalog's exe_path first (exact, then case-insensitive),
+    falls back to the largest-.exe heuristic PCC already uses for ReShade.
+    Port of GamePathResolver.ResolveExecutablePath."""
+    info = catalog.get("games", {}).get(game_key, {})
+    exe_path = info.get("exe_path")
+    if exe_path:
+        exact = Path(install_path) / exe_path.replace("\\", "/")
+        if exact.is_file():
+            return exact
+        resolved = _resolve_case_insensitive_path(install_path, exe_path)
+        if resolved and resolved.is_file():
+            return resolved
+    return _find_game_exe(install_path)
+
+
+def resolve_unreal_project_path(game_key, install_path, catalog, executable_path):
+    """Port of GamePathResolver.ResolveUnrealProjectPath."""
+    info = catalog.get("games", {}).get(game_key, {})
+    if info.get("install_root_only"):
+        return Path(install_path)
+    ue_game_path = info.get("ue_game_path")
+    if ue_game_path:
+        exact = Path(install_path) / ue_game_path.replace("\\", "/")
+        if exact.is_dir():
+            return exact
+        resolved = _resolve_case_insensitive_path(install_path, ue_game_path)
+        if resolved and resolved.is_dir():
+            return resolved
+    if not executable_path:
+        return None
+    current = Path(executable_path).parent
+    for _ in range(5):
+        parent = current.parent
+        if current.name.lower().startswith("win") and parent.name.lower() == "binaries":
+            return parent.parent
+        if current.name.lower() == "binaries":
+            return parent
+        if parent == current:
+            break
+        current = parent
+    return None
+
+
+ROOT_INJECTION_FILES = {"dwmapi.dll", "version.dll", "winmm.dll",
+                        "xinput1_3.dll", "xinput1_4.dll"}
+
+
+def _get_safe_segments(archive_path):
+    """Rejects rooted/absolute paths and any '..' segment - the zip-slip
+    guard. Port of ModArchivePathMapper.GetSafeSegments."""
+    if not archive_path:
+        return []
+    normalized = archive_path.replace("\\", "/")
+    if normalized.startswith("/") or ":" in normalized:
+        raise ValueError(f"Archive entry has an absolute path: {archive_path}")
+    normalized = normalized.strip("/")
+    segments = [s for s in normalized.split("/") if s and s != "."]
+    if any(s == ".." for s in segments):
+        raise ValueError(f"Archive entry escapes the installation directory: {archive_path}")
+    return segments
+
+
+def _combine_safely(root_path, segments):
+    """Combines root_path with segments and re-verifies the result is still
+    under the root - defense in depth against zip-slip even though
+    _get_safe_segments already rejects '..'. Port of
+    ModArchivePathMapper.CombineSafely."""
+    if not root_path:
+        raise RuntimeError("Could not resolve destination root.")
+    root = Path(root_path).resolve()
+    dest = root.joinpath(*segments).resolve() if segments else root
+    try:
+        dest.relative_to(root)
+    except ValueError:
+        raise ValueError(f"Archive destination escapes the installation directory: {dest}")
+    return dest
+
+
+def _find_binaries_win_index(segments):
+    for i in range(len(segments) - 1):
+        if segments[i].lower() != "binaries" or not segments[i + 1].lower().startswith("win"):
+            continue
+        if i > 0 and segments[i - 1].lower() == "engine":
+            continue
+        return i
+    return -1
+
+
+def _find_content_paks_index(segments):
+    for i in range(len(segments) - 1):
+        if segments[i].lower() == "content" and segments[i + 1].lower() == "paks":
+            return i
+    return -1
+
+
+def resolve_destination_path(archive_path, install_root, project_path,
+                             executable_path, install_root_only):
+    """Routes one archive entry to its real on-disk destination:
+    Binaries/Win* -> executable directory, Content/Paks -> Unreal project
+    directory, root-injection files (ue4ss/ prefix or a known loader DLL
+    name) -> executable directory, else the install root. Raises ValueError
+    on any path-traversal attempt. Port of
+    ModArchivePathMapper.ResolveDestinationPath."""
+    segments = _get_safe_segments(archive_path)
+    if not segments:
+        return None
+
+    if install_root_only:
+        return _combine_safely(install_root, segments)
+
+    exe_dir = Path(executable_path).parent if executable_path else None
+
+    idx = _find_binaries_win_index(segments)
+    if idx >= 0:
+        if not exe_dir:
+            raise RuntimeError("Could not resolve the game executable directory.")
+        return _combine_safely(exe_dir, segments[idx + 2:])
+
+    idx = _find_content_paks_index(segments)
+    if idx >= 0:
+        if not project_path:
+            raise RuntimeError("Could not resolve the Unreal project directory.")
+        return _combine_safely(project_path, segments[idx:])
+
+    if segments[0].lower() == "ue4ss" or (len(segments) == 1 and segments[0].lower() in ROOT_INJECTION_FILES):
+        if not exe_dir:
+            raise RuntimeError("Could not resolve the game executable directory.")
+        return _combine_safely(exe_dir, segments)
+
+    return _combine_safely(install_root, segments)
+
+
+_ULTRAPLUS_MOD_DIRS = ("ultraplusextensions", "uobjectcachemod")
+
+
+def should_install_with_user_managed_ue4ss(archive_path):
+    """When the user manages their own UE4SS, only Ultra+-owned mod files
+    and Content .pak/.ucas/.utoc files still install. Port of
+    UltraPlusArchiveFileFilter.ShouldInstallWithUserManagedUE4SS."""
+    if not archive_path:
+        return False
+    low = archive_path.replace("\\", "/").lower()
+    for d in _ULTRAPLUS_MOD_DIRS:
+        if f"/mods/{d}/" in low or low.endswith(f"/mods/{d}") or low.startswith(f"mods/{d}/"):
+            return True
+    is_package = low.endswith((".pak", ".ucas", ".utoc"))
+    is_content = low.startswith("content/") or "/content/" in low
+    return is_package and is_content
+
+
+def is_signature_path(path):
+    """Port of UE4SSSignatureCleanup.IsSignaturePath."""
+    if not path:
+        return False
+    return any(s.lower() == "ue4ss_signatures" for s in re.split(r"[\\/]", str(path)))
+
+
+def _find_signature_directory(signature_file_path):
+    directory = Path(signature_file_path).parent
+    while directory != directory.parent:
+        if directory.name.lower() == "ue4ss_signatures":
+            return directory
+        directory = directory.parent
+    return None
+
+
+def synchronize_signature_directories(current_signature_files):
+    """Deletes UE4SS_Signatures files left over from a previous mod version
+    (anything not in current_signature_files), then removes now-empty
+    subdirectories. Port of
+    UE4SSSignatureCleanup.SynchronizeSignatureDirectories."""
+    if not current_signature_files:
+        return 0
+    by_directory = {}
+    for f in current_signature_files:
+        if not is_signature_path(f):
+            continue
+        full_path = Path(f).resolve()
+        sig_dir = _find_signature_directory(full_path)
+        if sig_dir is not None:
+            by_directory.setdefault(sig_dir, set()).add(full_path)
+
+    deleted = 0
+    for sig_dir, expected in by_directory.items():
+        if not sig_dir.is_dir():
+            continue
+        for existing in sig_dir.rglob("*"):
+            if existing.is_dir() or existing.resolve() in expected:
+                continue
+            existing.unlink()
+            deleted += 1
+        for sub in sorted((p for p in sig_dir.rglob("*") if p.is_dir()),
+                          key=lambda p: len(str(p)), reverse=True):
+            try:
+                next(sub.iterdir())
+            except StopIteration:
+                sub.rmdir()
+    return deleted
+
+
+_CONFIG_SETTING_PATTERN = re.compile(r"^(?P<indent>[ \t]*)(?P<key>\w+)=(?P<value>.*)$")
+_INLINE_COMMENT_MARKER = "; "
+
+
+def _strip_inline_comment(value):
+    idx = value.find(_INLINE_COMMENT_MARKER)
+    return value[:idx].rstrip() if idx > 0 else value
+
+
+def _get_inline_comment(value):
+    idx = value.find(_INLINE_COMMENT_MARKER)
+    return value[idx:] if idx > 0 else ""
+
+
+def _read_config_values(content):
+    """Reads every assigned value, keyed case-insensitively. Comment lines,
+    section headers, and blank lines are skipped (they can't match the
+    \\w+ key pattern)."""
+    values = {}
+    for line in re.split(r"\r\n|\r|\n", content):
+        m = _CONFIG_SETTING_PATTERN.match(line.rstrip())
+        if m:
+            values[m.group("key").lower()] = (m.group("key"), _strip_inline_comment(m.group("value")).strip())
+    return values
+
+
+def _apply_user_config_value(shipped_line, user_values):
+    """Rewrites a shipped assignment with the user's value, keeping the
+    shipped key text and inline comment. Any non-assignment line, or one
+    whose key the user never set, passes through unchanged."""
+    m = _CONFIG_SETTING_PATTERN.match(shipped_line.rstrip())
+    if not m:
+        return shipped_line
+    entry = user_values.get(m.group("key").lower())
+    if entry is None:
+        return shipped_line
+    _, user_value = entry
+    return f"{m.group('indent')}{m.group('key')}={user_value}{_get_inline_comment(m.group('value'))}"
+
+
+def merge_config_contents(backup_content, new_config_content):
+    """Merges the user's previous config values into the newly-shipped
+    config. The shipped file is the structural base (its keys, comments,
+    and ordering win); only the values the user actually assigned are
+    carried across, matched case-insensitively. Port of the fixed
+    ModService.MergeConfigContents (Linux Ultra+ Manager, this session)."""
+    if not backup_content:
+        return new_config_content or ""
+    if not new_config_content:
+        return ""
+    user_values = _read_config_values(backup_content)
+    if not user_values:
+        return new_config_content
+    lines = re.split(r"\r\n|\r|\n", new_config_content)
+    return "\n".join(_apply_user_config_value(line, user_values) for line in lines)
+
+
+def mod_config_dir(game_key, install_path, catalog):
+    """Where UltraPlusConfig.ini/keybinds.ini/preset_*.ini live for an
+    installed mod: <executable dir>/ue4ss/Mods/UltraPlusExtensions/scripts/config,
+    the same layout install_mod's root-injection routing branch writes them
+    to. Returns None if the executable can't be resolved."""
+    exe = resolve_executable_path(game_key, install_path, catalog)
+    if not exe:
+        return None
+    return Path(exe).parent / "ue4ss" / "Mods" / "UltraPlusExtensions" / "scripts" / "config"
+
+
+def list_presets(config_dir):
+    """preset_<name>.ini files shipped alongside UltraPlusConfig.ini inside
+    the mod's own config dir. Port of PresetService.GetAvailablePresets."""
+    d = Path(config_dir)
+    if not d.is_dir():
+        return []
+    return sorted(p.stem[len("preset_"):] for p in d.glob("preset_*.ini"))
+
+
+def apply_preset(config_dir, preset_name):
+    """Rewrites UltraPlusConfig.ini's matching keys from preset_<name>.ini,
+    keeping the config file's own structure/comments (same line-rewrite as
+    merge_config_contents). Port of PresetService.ApplyPreset, adapted to
+    operate directly on the file since PCC has no separate settings model."""
+    config_path = Path(config_dir) / "UltraPlusConfig.ini"
+    preset_path = Path(config_dir) / f"preset_{preset_name}.ini"
+    if not preset_path.is_file():
+        raise RuntimeError(f"Preset not found: {preset_name}")
+    if not config_path.is_file():
+        raise RuntimeError("UltraPlusConfig.ini not found - install the mod first.")
+    preset_values = _read_config_values(preset_path.read_text(errors="replace"))
+    lines = config_path.read_text(errors="replace").splitlines()
+    lines = [_apply_user_config_value(line, preset_values) for line in lines]
+    tmp = config_path.with_suffix(".ini.tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    tmp.replace(config_path)
+    return {"applied": preset_name}
+
+
+def ultraplus_overrides() -> dict:
+    """ui_categories.json (display grouping) + description_overrides.json +
+    name_overrides.json - global (not per-game) polish data the settings
+    editor uses. Cached 6h, same pattern as ultraplus_catalog()."""
+    state = load_state()
+    cache = state.get("ultraplus_overrides")
+    now = time.time()
+    if cache and now - cache.get("ts", 0) < 21600:
+        return cache["data"]
+    data = {
+        "categories": _fetch_json(ULTRAPLUS_UI_CATEGORIES_URL),
+        "descriptions": _fetch_json(ULTRAPLUS_DESC_OVERRIDES_URL),
+        "names": _fetch_json(ULTRAPLUS_NAME_OVERRIDES_URL),
+    }
+    state["ultraplus_overrides"] = {"ts": now, "data": data}
+    save_state(state)
+    return data
+
+
+def _parse_parser_friendly_settings(content):
+    """Parses 'Key.Property=Value' blocks (Comment/Type/Default/Category/
+    Values|UserSettings/ValueType/Min/Max/Step/Shortcut) into {key: {prop:
+    val}}, lowercasing property names, stripping wrapping quotes off Comment.
+    Port of ConfigService.LoadParserFriendlySettings (minus WinUI wiring)."""
+    settings = {}
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or "=" not in line or "." not in line.split("=", 1)[0]:
+            continue
+        left, _, value = line.partition("=")
+        key, _, prop = left.partition(".")
+        key, prop = key.strip(), prop.strip().lower()
+        if not key or not prop:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+            value = value[1:-1]
+        settings.setdefault(key, {})[prop] = value
+    return settings
+
+
+def _synthesize_numeric_options(min_v, max_v, step, value_type):
+    """Discrete dropdown values by walking Min->Max in Step increments - port
+    of NumericRangeConverter (the real app renders numeric settings as a
+    dropdown of computed values, not a slider/free-entry box). Capped at
+    1000 steps as a sanity bound against a malformed/huge range."""
+    try:
+        lo, hi, st = float(min_v), float(max_v), float(step)
+    except (TypeError, ValueError):
+        return []
+    if st <= 0 or hi < lo:
+        return []
+    n = min(int((hi - lo) / st) + 1, 1000)
+    out = []
+    for i in range(n):
+        v = lo + i * st
+        if (value_type or "").lower() == "int":
+            out.append(str(int(round(v))))
+        else:
+            out.append(f"{v:.6f}".rstrip("0").rstrip(".") or "0")
+    return out
+
+
+def list_mod_settings(config_dir, overrides) -> list:
+    """Combines parser_friendly_settings.ini's schema with UltraPlusConfig
+    .ini's current values and the global override JSONs into a flat,
+    key-sorted list of editable settings. Port of ConfigService.LoadConfig's
+    setting-assembly (minus WinUI control wiring - the real app only ever
+    renders enum/numeric dropdowns, no slider/checkbox/textbox)."""
+    config_dir = Path(config_dir)
+    ini_path = config_dir / "UltraPlusConfig.ini"
+    if not ini_path.is_file():
+        return []
+    schema_path = config_dir / "parser_friendly_settings.ini"
+    current = _read_config_values(ini_path.read_text(errors="replace"))
+    schema = (_parse_parser_friendly_settings(schema_path.read_text(errors="replace"))
+              if schema_path.is_file() else {})
+    desc_overrides = overrides.get("descriptions", {})
+    name_overrides = overrides.get("names", {})
+    key_category = {}
+    for cat, keys in overrides.get("categories", {}).items():
+        for k in keys:
+            key_category.setdefault(k, cat)
+
+    out = []
+    for real_key, value in current.values():
+        sc = schema.get(real_key, {})
+        comment = sc.get("comment", "")
+        use_mod_desc = comment.startswith("!")
+        if use_mod_desc:
+            comment = comment[1:].strip()
+        description = comment if use_mod_desc else (desc_overrides.get(real_key) or comment)
+        setting_type = "numeric" if sc.get("type", "").lower() == "numeric" else "enum"
+        if setting_type == "numeric":
+            options = _synthesize_numeric_options(sc.get("min"), sc.get("max"),
+                                                   sc.get("step"), sc.get("valuetype"))
+        else:
+            raw = sc.get("values") or sc.get("usersettings") or ""
+            options = [v.strip() for v in raw.split(",") if v.strip()]
+        out.append({
+            "key": real_key,
+            "name": name_overrides.get(real_key) or real_key,
+            "description": description,
+            "category": key_category.get(real_key, "Other"),
+            "type": setting_type,
+            "options": options,
+            "value": value,
+            "default": sc.get("default", ""),
+            "advanced": sc.get("category", "").lower() == "advanced",
+        })
+    out.sort(key=lambda s: s["key"].lower())
+    return out
+
+
+def set_mod_setting(config_dir, key, value) -> dict:
+    """Rewrites one key in UltraPlusConfig.ini, same line-rewrite-preserving
+    -comments approach as _apply_user_config_value/merge_config_contents;
+    appends a new line if the key isn't already present. Touches an empty
+    'config_modified' sentinel file after saving, matching the real app."""
+    config_path = Path(config_dir) / "UltraPlusConfig.ini"
+    if not config_path.is_file():
+        raise RuntimeError("UltraPlusConfig.ini not found - install the mod first.")
+    lines = config_path.read_text(errors="replace").splitlines()
+    user_values = {key.lower(): (key, value)}
+    new_lines = [_apply_user_config_value(line, user_values) for line in lines]
+    found = any(m and m.group("key").lower() == key.lower()
+                for m in (_CONFIG_SETTING_PATTERN.match(l.rstrip()) for l in lines))
+    if not found:
+        new_lines.append(f"{key}={value}")
+    tmp = config_path.with_suffix(".ini.tmp")
+    tmp.write_text("\n".join(new_lines) + "\n")
+    tmp.replace(config_path)
+    (Path(config_dir) / "config_modified").touch()
+    return {"key": key, "value": value}
+
+
+def restore_mod_defaults(config_dir) -> dict:
+    config_path = Path(config_dir) / "UltraPlusConfig.ini"
+    default_path = config_path.with_suffix(".default")
+    if not default_path.is_file():
+        raise RuntimeError("No default snapshot found for this mod.")
+    shutil.copy2(default_path, config_path)
+    return {"restored": True}
+
+
+_USER_OWNED_FILE_NAMES = {"ultraplusconfig.ini", "keybinds.ini"}
+_STAGED_SUFFIX = ".incoming"
+
+
+def _redirect_user_owned_file_to_staging(destination_path):
+    """Sends a user-owned file to a staging name so extraction never writes
+    over the copy the user has been editing."""
+    if destination_path is not None and destination_path.name.lower() in _USER_OWNED_FILE_NAMES:
+        return destination_path.with_name(destination_path.name + _STAGED_SUFFIX)
+    return destination_path
+
+
+def _apply_staged_user_owned_file(staged_path):
+    """Merges one staged file over the user's copy, or adopts it wholesale
+    on a first install, writing through a temp file so an interrupted write
+    can never truncate the user's config."""
+    target_path = staged_path.with_name(staged_path.name[:-len(_STAGED_SUFFIX)])
+    applied = [target_path]
+    if target_path.name.lower() == "ultraplusconfig.ini":
+        default_path = target_path.with_suffix(".default")
+        shutil.copy2(staged_path, default_path)
+        applied.append(default_path)
+    if target_path.is_file():
+        merged = merge_config_contents(target_path.read_text(errors="replace"),
+                                       staged_path.read_text(errors="replace"))
+        tmp = target_path.with_suffix(target_path.suffix + ".tmp")
+        tmp.write_text(merged)
+        tmp.replace(target_path)
+        staged_path.unlink()
+    else:
+        staged_path.replace(target_path)
+    return applied
+
+
+def _encode_url_path(url):
+    """The Ultra+ mods manifest ships download URLs with literal spaces (and
+    potentially other unsafe characters) in the path - e.g. '.../Robocop
+    Unfinished Business Ultra Plus v0.1.1.zip'. urllib/http.client reject
+    those outright ('URL can't contain control characters'), so percent-
+    encode just the path component before making the request."""
+    parts = urllib.parse.urlsplit(url)
+    path = urllib.parse.quote(parts.path, safe="/%")
+    return urllib.parse.urlunsplit(parts._replace(path=path))
+
+
+def install_mod(appid, install_path, game_key, catalog, download_url, filename,
+                skip_ue4ss, task_id=None) -> dict:
+    """Downloads and installs one Ultra+ mod version: zip-slip guard,
+    content-aware routing, UE4SS-signature cleanup, and staged/atomic
+    writes for the user-owned config files so a failed or interrupted
+    install can never truncate the user's live config. Port of
+    ModService.InstallModFromDataAsync (Linux Ultra+ Manager, fixed and
+    live-verified this session)."""
+    import zipfile, io
+
+    if task_id:
+        TASKS[task_id] = {"status": "running", "progress": 5, "detail": "Downloading mod"}
+    data = _gh_bytes(_encode_url_path(download_url), task_id)
+    if task_id:
+        TASKS[task_id]["detail"] = "Extracting"
+
+    install_root_only = bool(catalog.get("games", {}).get(game_key, {}).get("install_root_only"))
+    executable_path = None if install_root_only else resolve_executable_path(game_key, install_path, catalog)
+    project_path = None if install_root_only else resolve_unreal_project_path(
+        game_key, install_path, catalog, executable_path)
+
+    if not install_root_only and not executable_path:
+        raise RuntimeError("Could not locate the game executable - mod was not installed "
+                           "to avoid deploying files to the wrong folder.")
+    if not install_root_only and not project_path:
+        raise RuntimeError("Could not locate the Unreal project directory for this game.")
+
+    installed_files = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for entry in zf.infolist():
+                if entry.is_dir():
+                    continue
+                if skip_ue4ss and not should_install_with_user_managed_ue4ss(entry.filename):
+                    continue
+                dest = resolve_destination_path(
+                    entry.filename, install_path, project_path,
+                    str(executable_path) if executable_path else None, install_root_only)
+                if dest is None:
+                    continue
+                dest = _redirect_user_owned_file_to_staging(dest)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(entry) as src, open(dest, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                installed_files.append(dest)
+
+        if not installed_files:
+            raise RuntimeError("No files were installed from the mod archive.")
+
+        signature_files = [f for f in installed_files if is_signature_path(f)]
+        if signature_files:
+            synchronize_signature_directories(signature_files)
+
+        final_files = []
+        for f in installed_files:
+            if str(f).endswith(_STAGED_SUFFIX):
+                final_files.extend(_apply_staged_user_owned_file(f))
+            else:
+                final_files.append(f)
+
+        version = _extract_version_from_filename(filename)
+        final_paths = {str(p) for p in final_files}
+        state = load_state()
+        installs = state.setdefault("mod_installs", {})
+        previous = installs.get(appid)
+        if previous:
+            # A version can ship a smaller file set than the one it's
+            # replacing (e.g. downgrading v1.0.0 -> v0.1.1, which drops
+            # keybinds.ini/changelog.txt/preset_uplus_defaults.ini) - delete
+            # whatever the old install tracked that the new one didn't
+            # rewrite, so Remove later isn't left with orphans.
+            for f in previous.get("installed_files", []):
+                if f not in final_paths:
+                    Path(f).unlink(missing_ok=True)
+        installs[appid] = {
+            "game_key": game_key,
+            "version": version,
+            "filename": filename,
+            "installed_files": sorted(final_paths),
+            "installed_date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        save_state(state)
+
+        if task_id:
+            TASKS[task_id] = {"status": "done", "progress": 100,
+                              "detail": f"Installed v{version}",
+                              "result": {"version": version}}
+        return {"installed": True, "version": version, "files": len(final_files)}
+    except Exception:
+        for f in installed_files:
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def _install_mod_task(task_id, appid, install_path, game_key, catalog,
+                      download_url, filename, skip_ue4ss):
+    try:
+        install_mod(appid, install_path, game_key, catalog, download_url,
+                   filename, skip_ue4ss, task_id=task_id)
     except Exception as e:
         TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
 
 
-def launch_ultraplus_manager() -> dict:
-    """UltraPlus Manager has no CLI flag to jump to a specific game (checked
-    the shipped binary/DLL for --game/--appid style args - it's GUI-only, you
-    pick the game inside it), so this opens the app itself rather than any
-    one game's settings."""
-    exe = ultraplus_manager_binary()
-    if not exe:
-        raise RuntimeError("Ultra+ Manager isn't installed yet - get it from Settings")
-    _spawn_detached([str(exe)])
-    return {"launched": True}
+def remove_mod(appid) -> dict:
+    """Deletes every file this install tracked and forgets it. Port of
+    remove_reshade's shape."""
+    state = load_state()
+    installs = state.get("mod_installs", {})
+    rec = installs.pop(appid, None)
+    if not rec:
+        raise RuntimeError("No mod install tracked for this game.")
+    for f in rec.get("installed_files", []):
+        Path(f).unlink(missing_ok=True)
+    save_state(state)
+    return {"removed": True}
+
+
+def _addons_manifest() -> dict:
+    """addons_manifest.json - a separate CloudFront manifest from
+    mods_manifest.json, one entry per addon-version zip. Cached 5min like
+    list_mod_versions' manifest cache."""
+    state = load_state()
+    cache = state.get("ultraplus_addons_manifest")
+    now = time.time()
+    if cache and now - cache.get("ts", 0) < 300:
+        return cache["data"]
+    manifest = _fetch_json(ULTRAPLUS_ADDONS_URL)
+    state["ultraplus_addons_manifest"] = {"ts": now, "data": manifest}
+    save_state(state)
+    return manifest
+
+
+def list_addons(game_key, catalog, appid) -> list:
+    """Per-game optional extra fixes (e.g. Avowed's DisableVRS/EnhancedRT/
+    FixPuddles), declared in gamedata.json's addons[] and downloaded from
+    addons_manifest.json under filenames '{GameKey} {AddonName} Ultra Plus
+    v{version}.zip' - a separate archive per addon, not bundled in the main
+    mod's own zip."""
+    addons = catalog.get("games", {}).get(game_key, {}).get("addons") or []
+    if not addons:
+        return []
+    manifest = _addons_manifest()
+    installed = load_state().get("addon_installs", {}).get(appid, {})
+    out = []
+    for a in addons:
+        file_name = a.get("FileName") or a.get("Name")
+        if not file_name:
+            continue
+        prefix = f"{game_key} {file_name}".lower()
+        versions = sorted(
+            ({"filename": f["filename"], "url": f.get("url", ""),
+              "updated": f.get("updated", ""),
+              "version": _extract_version_from_filename(f["filename"])}
+             for f in manifest.get("files", [])
+             if f.get("filename", "").lower().startswith(prefix)
+             and f.get("filename", "").lower().endswith(".zip")),
+            key=lambda v: v["updated"], reverse=True)
+        out.append({
+            "name": a.get("Name") or file_name, "file_name": file_name,
+            "description": a.get("Description") or "",
+            "installed": installed.get(file_name),
+            "versions": versions[:5],
+        })
+    return out
+
+
+def install_addon(appid, install_path, game_key, catalog, file_name,
+                  download_url, filename, task_id=None) -> dict:
+    """Downloads one addon zip; routes .pak/.ucas/.sig/.utoc to the Paks
+    ~mods dir (flat - just the filename, matching the real app's
+    AddonFilePlacement.ResolveDestinationPath, NOT the nested-path routing
+    install_mod's resolve_destination_path uses for the main mod) and .asi
+    beside the exe. Tracks installed files per-addon so a later remove_addon
+    can undo exactly this install, and a re-download of an updated version
+    cleans up the previous version's files first (same reconciliation
+    install_mod already does)."""
+    import zipfile, io
+    if task_id:
+        TASKS[task_id] = {"status": "running", "progress": 5, "detail": "Downloading addon"}
+    data = _gh_bytes(_encode_url_path(download_url), task_id)
+    if task_id:
+        TASKS[task_id]["detail"] = "Extracting"
+
+    install_root_only = bool(catalog.get("games", {}).get(game_key, {}).get("install_root_only"))
+    executable_path = None if install_root_only else resolve_executable_path(game_key, install_path, catalog)
+    project_path = None if install_root_only else resolve_unreal_project_path(
+        game_key, install_path, catalog, executable_path)
+    exe_dir = Path(executable_path).parent if executable_path else None
+
+    installed_files = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for entry in zf.infolist():
+                if entry.is_dir():
+                    continue
+                segments = _get_safe_segments(entry.filename)
+                if not segments:
+                    continue
+                fname = segments[-1]
+                low = fname.lower()
+                if low.endswith((".pak", ".ucas", ".sig", ".utoc")):
+                    if not project_path:
+                        raise RuntimeError("Could not resolve the Unreal project directory for this game.")
+                    dest = _combine_safely(project_path, ["Content", "Paks", "~mods", fname])
+                elif low.endswith(".asi"):
+                    if not exe_dir:
+                        raise RuntimeError("Could not resolve the game executable directory.")
+                    dest = _combine_safely(exe_dir, [fname])
+                else:
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(entry) as src, open(dest, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                installed_files.append(dest)
+
+        if not installed_files:
+            raise RuntimeError("No .pak/.asi files found in the addon archive.")
+
+        version = _extract_version_from_filename(filename)
+        state = load_state()
+        addon_installs = state.setdefault("addon_installs", {}).setdefault(appid, {})
+        previous = addon_installs.get(file_name)
+        new_paths = {str(p) for p in installed_files}
+        if previous:
+            for f in previous.get("installed_files", []):
+                if f not in new_paths:
+                    Path(f).unlink(missing_ok=True)
+        addon_installs[file_name] = {
+            "version": version, "filename": filename,
+            "installed_files": sorted(new_paths),
+            "installed_date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        save_state(state)
+        if task_id:
+            TASKS[task_id] = {"status": "done", "progress": 100,
+                              "detail": f"Installed v{version}", "result": {"version": version}}
+        return {"installed": True, "version": version, "files": len(installed_files)}
+    except Exception:
+        for f in installed_files:
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def _install_addon_task(task_id, appid, install_path, game_key, catalog,
+                        file_name, download_url, filename):
+    try:
+        install_addon(appid, install_path, game_key, catalog, file_name,
+                     download_url, filename, task_id=task_id)
+    except Exception as e:
+        TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
+
+
+def remove_addon(appid, file_name) -> dict:
+    state = load_state()
+    addon_installs = state.get("addon_installs", {}).get(appid, {})
+    rec = addon_installs.pop(file_name, None)
+    if not rec:
+        raise RuntimeError("No addon install tracked for this game/addon.")
+    for f in rec.get("installed_files", []):
+        Path(f).unlink(missing_ok=True)
+    if not addon_installs:
+        state.get("addon_installs", {}).pop(appid, None)
+    save_state(state)
+    return {"removed": True}
 
 
 def dedupe_dll_library() -> None:
@@ -3680,8 +4422,49 @@ class Handler(BaseHTTPRequestHandler):
                     state.setdefault("ultraplus_seen", {})[m.group(1)] = bool(result.get("installed"))
                     save_state(state)
                 self._json(result)
-            elif self.path == "/api/ultraplus_manager/status":
-                self._json(ultraplus_manager_status())
+            elif m := re.match(r"^/api/game/(\d+)/mods$", self.path):
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(m.group(1))
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                catalog = ultraplus_catalog()
+                matched = match_ultraplus_catalog(g["name"], catalog)
+                if not matched:
+                    self._json({"supported": False}); return
+                game_key, info = matched
+                rec = load_state().get("mod_installs", {}).get(m.group(1))
+                config_dir = mod_config_dir(game_key, g["install_path"], catalog) if rec else None
+                self._json({
+                    "supported": True, "game_key": game_key, "full_name": info["full_name"],
+                    "url": info["url"], "installed": rec, "versions": list_mod_versions(game_key),
+                    "presets": list_presets(config_dir) if config_dir else [],
+                })
+            elif m := re.match(r"^/api/game/(\d+)/mods/settings$", self.path):
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(m.group(1))
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                catalog = ultraplus_catalog()
+                matched = match_ultraplus_catalog(g["name"], catalog)
+                if not matched:
+                    self._json({"settings": [], "categories": []}); return
+                game_key, _ = matched
+                config_dir = mod_config_dir(game_key, g["install_path"], catalog)
+                if not config_dir or not (config_dir / "UltraPlusConfig.ini").is_file():
+                    self._json({"settings": [], "categories": []}); return
+                overrides = ultraplus_overrides()
+                self._json({
+                    "settings": list_mod_settings(config_dir, overrides),
+                    "categories": list(overrides.get("categories", {}).keys()) + ["Other"],
+                })
+            elif m := re.match(r"^/api/game/(\d+)/mods/addons$", self.path):
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(m.group(1))
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                catalog = ultraplus_catalog()
+                matched = match_ultraplus_catalog(g["name"], catalog)
+                self._json({"addons": list_addons(matched[0], catalog, m.group(1)) if matched else []})
             elif self.path == "/api/progress":
                 self._json({"games": install_progress(root)})
             elif self.path == "/api/owned_games":
@@ -3797,15 +4580,92 @@ class Handler(BaseHTTPRequestHandler):
                     bool(body.get("enable")), body.get("size_bytes")))
             elif self.path == "/api/backup/restore":
                 self._json(restore_backup(body["archive"]))
-            elif self.path == "/api/ultraplus_manager/install":
-                self._json(install_ultraplus_manager(body["zip"]))
-            elif self.path == "/api/ultraplus_manager/install_bundled":
+            elif self.path == "/api/mods/install":
+                appid = body["appid"]
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(appid)
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                catalog = ultraplus_catalog()
+                matched = match_ultraplus_catalog(g["name"], catalog)
+                if not matched:
+                    self._json({"error": "no Ultra+ mod catalog entry for this game"}, 400); return
+                game_key, _ = matched
                 tid = str(uuid.uuid4())
-                threading.Thread(target=install_ultraplus_manager_bundled,
-                                 args=(tid,), daemon=True).start()
+                TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
+                threading.Thread(target=_install_mod_task,
+                                 args=(tid, appid, g["install_path"], game_key, catalog,
+                                       body["download_url"], body["filename"],
+                                       bool(body.get("skip_ue4ss"))),
+                                 daemon=True).start()
                 self._json({"task": tid})
-            elif self.path == "/api/ultraplus_manager/launch":
-                self._json(launch_ultraplus_manager())
+            elif self.path == "/api/mods/remove":
+                self._json(remove_mod(body["appid"]))
+            elif self.path == "/api/mods/apply_preset":
+                appid = body["appid"]
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(appid)
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                catalog = ultraplus_catalog()
+                matched = match_ultraplus_catalog(g["name"], catalog)
+                if not matched:
+                    self._json({"error": "no Ultra+ mod catalog entry for this game"}, 400); return
+                game_key, _ = matched
+                config_dir = mod_config_dir(game_key, g["install_path"], catalog)
+                if not config_dir:
+                    self._json({"error": "could not resolve the game's config directory"}, 400); return
+                self._json(apply_preset(config_dir, body["preset"]))
+            elif self.path == "/api/mods/settings/set":
+                appid = body["appid"]
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(appid)
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                catalog = ultraplus_catalog()
+                matched = match_ultraplus_catalog(g["name"], catalog)
+                if not matched:
+                    self._json({"error": "no Ultra+ mod catalog entry for this game"}, 400); return
+                game_key, _ = matched
+                config_dir = mod_config_dir(game_key, g["install_path"], catalog)
+                if not config_dir:
+                    self._json({"error": "could not resolve the game's config directory"}, 400); return
+                self._json(set_mod_setting(config_dir, body["key"], body["value"]))
+            elif self.path == "/api/mods/settings/restore_defaults":
+                appid = body["appid"]
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(appid)
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                catalog = ultraplus_catalog()
+                matched = match_ultraplus_catalog(g["name"], catalog)
+                if not matched:
+                    self._json({"error": "no Ultra+ mod catalog entry for this game"}, 400); return
+                game_key, _ = matched
+                config_dir = mod_config_dir(game_key, g["install_path"], catalog)
+                if not config_dir:
+                    self._json({"error": "could not resolve the game's config directory"}, 400); return
+                self._json(restore_mod_defaults(config_dir))
+            elif self.path == "/api/mods/addons/install":
+                appid = body["appid"]
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(appid)
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                catalog = ultraplus_catalog()
+                matched = match_ultraplus_catalog(g["name"], catalog)
+                if not matched:
+                    self._json({"error": "no Ultra+ mod catalog entry for this game"}, 400); return
+                game_key, _ = matched
+                tid = str(uuid.uuid4())
+                TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
+                threading.Thread(target=_install_addon_task,
+                                 args=(tid, appid, g["install_path"], game_key, catalog,
+                                       body["file_name"], body["download_url"], body["filename"]),
+                                 daemon=True).start()
+                self._json({"task": tid})
+            elif self.path == "/api/mods/addons/remove":
+                self._json(remove_addon(body["appid"], body["file_name"]))
             elif self.path == "/api/proton/install":
                 tid = str(uuid.uuid4())
                 threading.Thread(target=install_ge_proton,

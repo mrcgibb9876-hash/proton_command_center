@@ -273,6 +273,548 @@ class PCCTests(unittest.TestCase):
         st = pcc.scan_ultraplus(self.root / "steamapps/common/TestGame")
         self.assertFalse(st["installed"])
 
+    # ---- Ultra+ mod install (ported from Ultra+ Manager's C# fixes) ----
+
+    def _fake_ue_game(self):
+        d = self.root / "steamapps/common/TestGame"
+        exe_dir = d / "Binaries/Win64"
+        exe_dir.mkdir(parents=True, exist_ok=True)
+        exe = exe_dir / "TestGame-Win64-Shipping.exe"
+        exe.write_bytes(b"MZ")
+        return d, exe
+
+    def _fake_catalog(self):
+        return {"games": {"TestGame": {
+            "full_name": "Test Game", "search_terms": ["testgame"], "url": "",
+            "exe_path": "Binaries/Win64/TestGame-Win64-Shipping.exe",
+            "ue_game_path": "", "install_root_only": False,
+            "mod_filename_prefixes": [],
+        }}}
+
+    def test_encode_url_path_escapes_spaces(self):
+        # Regression: the Ultra+ mods manifest ships download URLs with
+        # literal spaces in the filename (e.g. RoboCop: Rogue City -
+        # Unfinished Business), which real http.client rejects outright.
+        url = ("https://cdn.example/mods/RobocopUnfinishedBusiness/"
+               "RobocopUnfinishedBusiness Ultra Plus v0.1.1.zip")
+        encoded = pcc._encode_url_path(url)
+        self.assertNotIn(" ", encoded)
+        self.assertEqual(encoded, ("https://cdn.example/mods/RobocopUnfinishedBusiness/"
+                                   "RobocopUnfinishedBusiness%20Ultra%20Plus%20v0.1.1.zip"))
+
+    def test_encode_url_path_leaves_ordinary_url_unchanged(self):
+        url = "https://cdn.example/mods/Foo/Foo_v1.0.0.zip"
+        self.assertEqual(pcc._encode_url_path(url), url)
+
+    def test_get_safe_segments_rejects_parent_traversal(self):
+        with self.assertRaises(ValueError):
+            pcc._get_safe_segments("../../etc/passwd")
+
+    def test_get_safe_segments_rejects_absolute_path(self):
+        with self.assertRaises(ValueError):
+            pcc._get_safe_segments("/etc/passwd")
+        with self.assertRaises(ValueError):
+            pcc._get_safe_segments("C:/Windows/evil.dll")
+
+    def test_get_safe_segments_allows_ordinary_path(self):
+        self.assertEqual(
+            pcc._get_safe_segments("ue4ss/Mods/UltraPlusExtensions/main.lua"),
+            ["ue4ss", "Mods", "UltraPlusExtensions", "main.lua"])
+
+    def test_resolve_destination_path_install_root_only(self):
+        d, exe = self._fake_ue_game()
+        r = pcc.resolve_destination_path("some/file.txt", str(d), None, None, True)
+        self.assertEqual(r, (d / "some/file.txt").resolve())
+
+    def test_resolve_destination_path_binaries_win_goes_beside_exe(self):
+        d, exe = self._fake_ue_game()
+        r = pcc.resolve_destination_path(
+            "Binaries/Win64/ue4ss/UE4SS.dll", str(d), str(d), str(exe), False)
+        self.assertEqual(r, (exe.parent / "ue4ss/UE4SS.dll").resolve())
+
+    def test_resolve_destination_path_content_paks_goes_under_project(self):
+        d, exe = self._fake_ue_game()
+        r = pcc.resolve_destination_path(
+            "Content/Paks/~mods/999_Mod_P.pak", str(d), str(d), str(exe), False)
+        self.assertEqual(r, (d / "Content/Paks/~mods/999_Mod_P.pak").resolve())
+
+    def test_resolve_destination_path_root_injection_dll_beside_exe(self):
+        d, exe = self._fake_ue_game()
+        r = pcc.resolve_destination_path("dwmapi.dll", str(d), str(d), str(exe), False)
+        self.assertEqual(r, (exe.parent / "dwmapi.dll").resolve())
+
+    def test_resolve_destination_path_unrecognized_falls_back_to_root(self):
+        d, exe = self._fake_ue_game()
+        r = pcc.resolve_destination_path("readme.txt", str(d), str(d), str(exe), False)
+        self.assertEqual(r, (d / "readme.txt").resolve())
+
+    def test_resolve_destination_path_engine_binaries_not_treated_as_game_binaries(self):
+        d, exe = self._fake_ue_game()
+        r = pcc.resolve_destination_path(
+            "Engine/Binaries/Win64/SomeEngineDll.dll", str(d), str(d), str(exe), False)
+        self.assertEqual(r, (d / "Engine/Binaries/Win64/SomeEngineDll.dll").resolve())
+
+    def test_resolve_executable_and_project_path_from_catalog(self):
+        d, exe = self._fake_ue_game()
+        catalog = self._fake_catalog()
+        resolved_exe = pcc.resolve_executable_path("TestGame", str(d), catalog)
+        self.assertEqual(Path(resolved_exe), exe)
+        project = pcc.resolve_unreal_project_path("TestGame", str(d), catalog, resolved_exe)
+        self.assertEqual(Path(project), d)
+
+    def test_should_install_with_user_managed_ue4ss_allows_ultraplus_files(self):
+        self.assertTrue(pcc.should_install_with_user_managed_ue4ss(
+            "Binaries/Win64/ue4ss/Mods/UltraPlusExtensions/scripts/main.lua"))
+        self.assertTrue(pcc.should_install_with_user_managed_ue4ss(
+            "Content/Paks/~mods/999_Mod_P.pak"))
+
+    def test_should_install_with_user_managed_ue4ss_rejects_ue4ss_runtime(self):
+        self.assertFalse(pcc.should_install_with_user_managed_ue4ss(
+            "Binaries/Win64/ue4ss/UE4SS.dll"))
+        self.assertFalse(pcc.should_install_with_user_managed_ue4ss("dwmapi.dll"))
+
+    def test_is_signature_path(self):
+        self.assertTrue(pcc.is_signature_path("/a/b/UE4SS_Signatures/foo.lua"))
+        self.assertFalse(pcc.is_signature_path("/a/b/c.lua"))
+
+    def test_synchronize_signature_directories_deletes_stale_files(self):
+        sig_dir = Path(self.tmp.name) / "ue4ss/UE4SS_Signatures"
+        sig_dir.mkdir(parents=True)
+        stale = sig_dir / "OldMod.lua"
+        kept = sig_dir / "NewMod.lua"
+        stale.write_text("stale")
+        kept.write_text("kept")
+        deleted = pcc.synchronize_signature_directories([kept])
+        self.assertEqual(deleted, 1)
+        self.assertFalse(stale.exists())
+        self.assertTrue(kept.exists())
+
+    def test_merge_config_contents_case_insensitive_key_matching(self):
+        result = pcc.merge_config_contents("raytracing=enabled", "RayTracing=disabled")
+        self.assertEqual(result, "RayTracing=enabled")
+
+    def test_merge_config_contents_preserves_shipped_comment_not_backup(self):
+        backup = "Quality=Low; old comment from a previous release"
+        new = "Quality=High; current release comment"
+        self.assertEqual(pcc.merge_config_contents(backup, new),
+                         "Quality=Low; current release comment")
+
+    def test_merge_config_contents_section_header_passthrough(self):
+        result = pcc.merge_config_contents("Key=uservalue", "[Section]\nKey=newvalue")
+        self.assertEqual(result.splitlines(), ["[Section]", "Key=uservalue"])
+
+    def test_list_presets_and_apply_preset(self):
+        config_dir = Path(self.tmp.name) / "config"
+        config_dir.mkdir()
+        (config_dir / "UltraPlusConfig.ini").write_text(
+            "; header\nQuality=Medium\nRayTracing=off\n")
+        (config_dir / "preset_performance.ini").write_text("Quality=Low\nRayTracing=off\n")
+        self.assertEqual(pcc.list_presets(str(config_dir)), ["performance"])
+        pcc.apply_preset(str(config_dir), "performance")
+        applied = (config_dir / "UltraPlusConfig.ini").read_text()
+        self.assertIn("Quality=Low", applied)
+        self.assertIn("; header", applied)
+
+    # ---- Settings editor (parser_friendly_settings.ini + override JSONs) ----
+
+    def test_parse_parser_friendly_settings_real_shape(self):
+        content = (
+            'BetterReflectionSDFs.Comment="game/off/on; improves quality"\n'
+            "BetterReflectionSDFs.Type=enum\n"
+            "BetterReflectionSDFs.Default=game\n"
+            "BetterReflectionSDFs.Category=Advanced\n"
+            "BetterReflectionSDFs.UserSettings=game,off,on\n"
+            "\n"
+            'Bloom.Comment="Bloom intensity (0.0 = off)"\n'
+            "Bloom.Type=numeric\n"
+            "Bloom.ValueType=float\n"
+            "Bloom.Min=0\n"
+            "Bloom.Max=3\n"
+            "Bloom.Step=0.1\n"
+        )
+        parsed = pcc._parse_parser_friendly_settings(content)
+        self.assertEqual(parsed["BetterReflectionSDFs"]["comment"], "game/off/on; improves quality")
+        self.assertEqual(parsed["BetterReflectionSDFs"]["type"], "enum")
+        self.assertEqual(parsed["BetterReflectionSDFs"]["usersettings"], "game,off,on")
+        self.assertEqual(parsed["Bloom"]["type"], "numeric")
+        self.assertEqual(parsed["Bloom"]["min"], "0")
+        self.assertEqual(parsed["Bloom"]["step"], "0.1")
+
+    def test_synthesize_numeric_options_int_and_float(self):
+        self.assertEqual(pcc._synthesize_numeric_options(0, 3, 1, "int"), ["0", "1", "2", "3"])
+        self.assertEqual(pcc._synthesize_numeric_options(0, 1, 0.5, "float"), ["0", "0.5", "1"])
+
+    def test_synthesize_numeric_options_rejects_bad_ranges(self):
+        self.assertEqual(pcc._synthesize_numeric_options(5, 0, 1, "int"), [])  # hi < lo
+        self.assertEqual(pcc._synthesize_numeric_options(0, 10, 0, "int"), [])  # step<=0
+        self.assertEqual(pcc._synthesize_numeric_options("game", 3, 1, "int"), [])  # non-numeric
+
+    def test_synthesize_numeric_options_caps_step_count(self):
+        # A malformed/huge range must not synthesize an unbounded list.
+        self.assertEqual(len(pcc._synthesize_numeric_options(0, 1000000, 0.0001, "float")), 1000)
+
+    def _fake_settings_config_dir(self):
+        config_dir = Path(self.tmp.name) / "settings_config"
+        config_dir.mkdir()
+        (config_dir / "UltraPlusConfig.ini").write_text(
+            "; header\n"
+            "BetterReflectionSDFs=game\n"
+            "Bloom=1.0\n"
+            "LegacyNoSchema=off\n"
+        )
+        (config_dir / "UltraPlusConfig.default").write_text(
+            "; header\n"
+            "BetterReflectionSDFs=game\n"
+            "Bloom=1.0\n"
+            "LegacyNoSchema=off\n"
+        )
+        (config_dir / "parser_friendly_settings.ini").write_text(
+            'BetterReflectionSDFs.Comment="!Mod-provided description wins"\n'
+            "BetterReflectionSDFs.Type=enum\n"
+            "BetterReflectionSDFs.Default=game\n"
+            "BetterReflectionSDFs.Category=Advanced\n"
+            "BetterReflectionSDFs.UserSettings=game,off,on\n"
+            "\n"
+            'Bloom.Comment="Bloom intensity"\n'
+            "Bloom.Type=numeric\n"
+            "Bloom.ValueType=float\n"
+            "Bloom.Min=0\n"
+            "Bloom.Max=2\n"
+            "Bloom.Step=0.5\n"
+        )
+        return config_dir
+
+    def test_list_mod_settings_enum_and_numeric_and_missing_schema(self):
+        config_dir = self._fake_settings_config_dir()
+        overrides = {
+            "categories": {"Reflections": ["BetterReflectionSDFs"]},
+            "descriptions": {"BetterReflectionSDFs": "Override description - should NOT win"},
+            "names": {"Bloom": "Bloom Intensity"},
+        }
+        settings = {s["key"]: s for s in pcc.list_mod_settings(config_dir, overrides)}
+        self.assertEqual(set(settings), {"BetterReflectionSDFs", "Bloom", "LegacyNoSchema"})
+
+        sdf = settings["BetterReflectionSDFs"]
+        self.assertEqual(sdf["type"], "enum")
+        self.assertEqual(sdf["options"], ["game", "off", "on"])
+        self.assertEqual(sdf["category"], "Reflections")
+        self.assertTrue(sdf["advanced"])
+        # Comment starts with '!' -> mod's own description wins over the override.
+        self.assertEqual(sdf["description"], "Mod-provided description wins")
+
+        bloom = settings["Bloom"]
+        self.assertEqual(bloom["type"], "numeric")
+        self.assertEqual(bloom["options"], ["0", "0.5", "1", "1.5", "2"])
+        self.assertEqual(bloom["name"], "Bloom Intensity")
+        self.assertEqual(bloom["category"], "Other")  # not in the categories override
+
+        legacy = settings["LegacyNoSchema"]
+        self.assertEqual(legacy["type"], "enum")  # no schema entry at all -> enum fallback
+        self.assertEqual(legacy["options"], [])
+        self.assertEqual(legacy["value"], "off")
+
+    def test_list_mod_settings_description_override_wins_without_bang(self):
+        config_dir = self._fake_settings_config_dir()
+        # Remove the '!' so the override should win instead of the mod's own comment.
+        content = (config_dir / "parser_friendly_settings.ini").read_text()
+        content = content.replace('"!Mod-provided description wins"', '"Plain mod comment"')
+        (config_dir / "parser_friendly_settings.ini").write_text(content)
+        overrides = {"categories": {}, "descriptions": {"BetterReflectionSDFs": "Curated override"},
+                    "names": {}}
+        settings = {s["key"]: s for s in pcc.list_mod_settings(config_dir, overrides)}
+        self.assertEqual(settings["BetterReflectionSDFs"]["description"], "Curated override")
+
+    def test_set_mod_setting_preserves_comments_and_appends_new_key(self):
+        config_dir = self._fake_settings_config_dir()
+        pcc.set_mod_setting(str(config_dir), "Bloom", "1.5")
+        content = (config_dir / "UltraPlusConfig.ini").read_text()
+        self.assertIn("Bloom=1.5", content)
+        self.assertIn("; header", content)
+        self.assertTrue((config_dir / "config_modified").is_file())
+
+        pcc.set_mod_setting(str(config_dir), "BrandNewKey", "on")
+        content = (config_dir / "UltraPlusConfig.ini").read_text()
+        self.assertIn("BrandNewKey=on", content)
+
+    def test_set_mod_setting_requires_existing_ini(self):
+        config_dir = Path(self.tmp.name) / "no_ini"
+        config_dir.mkdir()
+        with self.assertRaises(RuntimeError):
+            pcc.set_mod_setting(str(config_dir), "Bloom", "1.5")
+
+    def test_restore_mod_defaults(self):
+        config_dir = self._fake_settings_config_dir()
+        pcc.set_mod_setting(str(config_dir), "Bloom", "2.0")
+        self.assertIn("Bloom=2.0", (config_dir / "UltraPlusConfig.ini").read_text())
+        pcc.restore_mod_defaults(str(config_dir))
+        self.assertIn("Bloom=1.0", (config_dir / "UltraPlusConfig.ini").read_text())
+
+    # ---- Addons ----
+
+    def _fake_addon_catalog(self):
+        return {"games": {"TestGame": {
+            "full_name": "Test Game", "search_terms": ["testgame"], "url": "",
+            "exe_path": "Binaries/Win64/TestGame-Win64-Shipping.exe",
+            "ue_game_path": "", "install_root_only": False, "mod_filename_prefixes": [],
+            "addons": [{"Name": "Disable VRS", "FileName": "DisableVRS", "Description": "Turns off VRS"}],
+        }}}
+
+    class _FakeAddonResp:
+        def __init__(self, payload):
+            self.payload, self._pos = payload, 0
+            self.headers = {"Content-Length": str(len(payload))}
+        def read(self, n=None):
+            if n is None:
+                c, self._pos = self.payload[self._pos:], len(self.payload); return c
+            c = self.payload[self._pos:self._pos + n]; self._pos += n; return c
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
+    def test_list_addons_matches_manifest_filename_prefix(self):
+        d, exe = self._fake_ue_game()
+        catalog = self._fake_addon_catalog()
+        real_fetch = pcc._fetch_json
+        pcc._fetch_json = lambda url: {"files": [
+            {"filename": "TestGame DisableVRS Ultra Plus v1.0.0.zip",
+             "url": "http://x/a.zip", "updated": "2026-01-01T00:00:00"},
+            {"filename": "OtherGame DisableVRS Ultra Plus v1.0.0.zip",
+             "url": "http://x/b.zip", "updated": "2026-01-01T00:00:00"},
+        ]} if "addons_manifest" in url else real_fetch(url)
+        try:
+            addons = pcc.list_addons("TestGame", catalog, "999")
+        finally:
+            pcc._fetch_json = real_fetch
+        self.assertEqual(len(addons), 1)
+        self.assertEqual(addons[0]["file_name"], "DisableVRS")
+        self.assertEqual(len(addons[0]["versions"]), 1)
+        self.assertEqual(addons[0]["versions"][0]["version"], "1.0.0")
+        self.assertIsNone(addons[0]["installed"])
+
+    def test_install_addon_routes_pak_and_asi_then_remove(self):
+        d, exe = self._fake_ue_game()
+        catalog = self._fake_addon_catalog()
+
+        import io, zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("DisableVRS_P.pak", "pak data")
+            zf.writestr("DisableVRS.asi", "asi data")
+        pcc.urllib.request.urlopen = lambda req, timeout=0: self._FakeAddonResp(buf.getvalue())
+
+        r = pcc.install_addon("999", str(d), "TestGame", catalog, "DisableVRS",
+                              "http://x/DisableVRS.zip", "TestGame DisableVRS Ultra Plus v1.0.0.zip")
+        self.assertTrue(r["installed"])
+        self.assertEqual(r["files"], 2)
+        pak_path = d / "Content/Paks/~mods/DisableVRS_P.pak"
+        asi_path = exe.parent / "DisableVRS.asi"
+        self.assertTrue(pak_path.is_file())
+        self.assertTrue(asi_path.is_file())
+
+        rec = pcc.load_state()["addon_installs"]["999"]["DisableVRS"]
+        self.assertEqual(rec["version"], "1.0.0")
+        self.assertEqual(set(rec["installed_files"]), {str(pak_path), str(asi_path)})
+
+        removed = pcc.remove_addon("999", "DisableVRS")
+        self.assertTrue(removed["removed"])
+        self.assertFalse(pak_path.exists())
+        self.assertFalse(asi_path.exists())
+        with self.assertRaises(RuntimeError):
+            pcc.remove_addon("999", "DisableVRS")
+
+    def test_install_addon_rejects_path_traversal(self):
+        d, exe = self._fake_ue_game()
+        catalog = self._fake_addon_catalog()
+        import io, zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("../../evil.pak", "pwned")
+        pcc.urllib.request.urlopen = lambda req, timeout=0: self._FakeAddonResp(buf.getvalue())
+        with self.assertRaises(ValueError):
+            pcc.install_addon("999", str(d), "TestGame", catalog, "DisableVRS",
+                              "http://x/DisableVRS.zip", "TestGame DisableVRS Ultra Plus v1.0.0.zip")
+
+    def test_install_mod_full_flow_and_update_and_remove(self):
+        d, exe = self._fake_ue_game()
+        catalog = self._fake_catalog()
+
+        def build_zip(quality_value):
+            import io, zipfile
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                zf.writestr("dwmapi.dll", "loader")
+                zf.writestr("Binaries/Win64/ue4ss/UE4SS.dll", "ue4ss")
+                zf.writestr(
+                    "Binaries/Win64/ue4ss/Mods/UltraPlusExtensions/scripts/config/UltraPlusConfig.ini",
+                    f"; Ultra+ config\nQuality={quality_value}\nRayTracing=off\n")
+                zf.writestr(
+                    "Binaries/Win64/ue4ss/Mods/UltraPlusExtensions/scripts/config/preset_performance.ini",
+                    "Quality=Low\n")
+                zf.writestr("Content/Paks/~mods/999_TestGame_P.pak", "pak data")
+            return buf.getvalue()
+
+        class FakeResp:
+            def __init__(self, payload):
+                self.payload, self._pos = payload, 0
+                self.headers = {"Content-Length": str(len(payload))}
+            def read(self, n=None):
+                if n is None:
+                    c, self._pos = self.payload[self._pos:], len(self.payload)
+                    return c
+                c = self.payload[self._pos:self._pos + n]
+                self._pos += n
+                return c
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+
+        def checked_urlopen(payload):
+            # A raw space in the request would make real http.client raise
+            # "URL can't contain control characters" - assert it never
+            # reaches urlopen un-encoded (regression: RoboCop's manifest URL).
+            def _open(req, timeout=0):
+                self.assertNotIn(" ", req.full_url)
+                return FakeResp(payload)
+            return _open
+
+        zip_v1 = build_zip("Medium")
+        pcc.urllib.request.urlopen = checked_urlopen(zip_v1)
+
+        r = pcc.install_mod("12345", str(d), "TestGame", catalog,
+                            "http://example/mod v1.0.0.zip", "TestGame Ultra Plus v1.0.0.zip",
+                            skip_ue4ss=False)
+        self.assertTrue(r["installed"])
+        self.assertEqual(r["version"], "1.0.0")
+
+        config_path = exe.parent / "ue4ss/Mods/UltraPlusExtensions/scripts/config/UltraPlusConfig.ini"
+        self.assertTrue((exe.parent / "dwmapi.dll").is_file())
+        self.assertTrue((exe.parent / "ue4ss/UE4SS.dll").is_file())
+        self.assertTrue((d / "Content/Paks/~mods/999_TestGame_P.pak").is_file())
+        self.assertIn("Quality=Medium", config_path.read_text())
+        self.assertFalse(Path(str(config_path) + ".incoming").exists())  # staged file must not linger
+
+        rec = pcc.load_state()["mod_installs"]["12345"]
+        self.assertEqual(rec["version"], "1.0.0")
+        self.assertIn(str(config_path), rec["installed_files"])
+
+        # Simulate the user editing a setting, then reinstalling a new
+        # version - the edit must survive the merge.
+        config_path.write_text(config_path.read_text().replace("Quality=Medium", "Quality=Ultra"))
+        zip_v2 = build_zip("Medium")  # shipped default unchanged in v2
+        pcc.urllib.request.urlopen = checked_urlopen(zip_v2)
+        r2 = pcc.install_mod("12345", str(d), "TestGame", catalog,
+                             "http://example/mod v1.0.1.zip", "TestGame Ultra Plus v1.0.1.zip",
+                             skip_ue4ss=False)
+        self.assertEqual(r2["version"], "1.0.1")
+        self.assertIn("Quality=Ultra", config_path.read_text())
+        self.assertFalse(Path(str(config_path) + ".incoming").exists())
+        default_path = config_path.with_suffix(".default")
+        self.assertIn("Quality=Medium", default_path.read_text())
+
+        removed = pcc.remove_mod("12345")
+        self.assertTrue(removed["removed"])
+        self.assertFalse((exe.parent / "dwmapi.dll").exists())
+        with self.assertRaises(RuntimeError):
+            pcc.remove_mod("12345")
+
+    def test_install_mod_reinstall_with_fewer_files_cleans_up_orphans(self):
+        # Regression: RoboCop's v0.1.1 archive doesn't ship keybinds.ini/
+        # changelog.txt/preset_*.ini that v1.0.0 does. Installing v1.0.0
+        # then "updating" to v0.1.1 must delete those now-orphaned files,
+        # not just silently stop tracking them (which left Remove unable
+        # to clean them up).
+        d, exe = self._fake_ue_game()
+        catalog = self._fake_catalog()
+
+        class FakeResp:
+            def __init__(self, payload):
+                self.payload, self._pos = payload, 0
+                self.headers = {"Content-Length": str(len(payload))}
+            def read(self, n=None):
+                if n is None:
+                    c, self._pos = self.payload[self._pos:], len(self.payload)
+                    return c
+                c = self.payload[self._pos:self._pos + n]
+                self._pos += n
+                return c
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+
+        import io, zipfile
+
+        def build_big_zip():
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                zf.writestr("dwmapi.dll", "loader")
+                zf.writestr(
+                    "Binaries/Win64/ue4ss/Mods/UltraPlusExtensions/scripts/config/UltraPlusConfig.ini",
+                    "Quality=Medium\n")
+                zf.writestr(
+                    "Binaries/Win64/ue4ss/Mods/UltraPlusExtensions/scripts/config/keybinds.ini",
+                    "Sprint=Shift\n")
+                zf.writestr(
+                    "Binaries/Win64/ue4ss/Mods/UltraPlusExtensions/scripts/config/changelog.txt",
+                    "notes")
+            return buf.getvalue()
+
+        def build_small_zip():
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                zf.writestr("dwmapi.dll", "loader")
+                zf.writestr(
+                    "Binaries/Win64/ue4ss/Mods/UltraPlusExtensions/scripts/config/UltraPlusConfig.ini",
+                    "Quality=Medium\n")
+            return buf.getvalue()
+
+        pcc.urllib.request.urlopen = lambda req, timeout=0: FakeResp(build_big_zip())
+        pcc.install_mod("12345", str(d), "TestGame", catalog,
+                        "http://example/mod v1.0.0.zip", "TestGame Ultra Plus v1.0.0.zip",
+                        skip_ue4ss=False)
+        keybinds = exe.parent / "ue4ss/Mods/UltraPlusExtensions/scripts/config/keybinds.ini"
+        changelog = exe.parent / "ue4ss/Mods/UltraPlusExtensions/scripts/config/changelog.txt"
+        self.assertTrue(keybinds.is_file())
+        self.assertTrue(changelog.is_file())
+
+        pcc.urllib.request.urlopen = lambda req, timeout=0: FakeResp(build_small_zip())
+        r = pcc.install_mod("12345", str(d), "TestGame", catalog,
+                            "http://example/mod v0.1.1.zip", "TestGame Ultra Plus v0.1.1.zip",
+                            skip_ue4ss=False)
+        self.assertEqual(r["version"], "0.1.1")
+        self.assertFalse(keybinds.exists(), "orphaned file from the old version must be deleted")
+        self.assertFalse(changelog.exists(), "orphaned file from the old version must be deleted")
+
+        rec = pcc.load_state()["mod_installs"]["12345"]
+        self.assertNotIn(str(keybinds), rec["installed_files"])
+        self.assertNotIn(str(changelog), rec["installed_files"])
+
+    def test_install_mod_rejects_path_traversal_archive(self):
+        d, exe = self._fake_ue_game()
+        catalog = self._fake_catalog()
+
+        class FakeResp:
+            def __init__(self, payload):
+                self.payload, self._pos = payload, 0
+                self.headers = {"Content-Length": str(len(payload))}
+            def read(self, n=None):
+                if n is None:
+                    c, self._pos = self.payload[self._pos:], len(self.payload)
+                    return c
+                c = self.payload[self._pos:self._pos + n]
+                self._pos += n
+                return c
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+
+        import io, zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("../../etc/evil.txt", "pwned")
+        pcc.urllib.request.urlopen = lambda req, timeout=0: FakeResp(buf.getvalue())
+
+        with self.assertRaises(ValueError):
+            pcc.install_mod("12345", str(d), "TestGame", catalog,
+                            "http://example/mod.zip", "TestGame Ultra Plus v1.0.0.zip",
+                            skip_ue4ss=False)
+        self.assertFalse((Path(self.tmp.name) / "etc/evil.txt").exists())
+
     def test_swap_refuses_type_mismatch(self):
         game_dll = self.root / "steamapps/common/TestGame/Engine/nvngx_dlss.dll"
         wrong = pcc.DLL_LIBRARY / "nvngx_dlssg.dll"

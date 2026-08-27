@@ -1,8 +1,8 @@
 # Maintainer: Marc Gibb
 pkgname=proton-command-center
-pkgver=1.21.0
+pkgver=1.22.0
 pkgrel=1
-pkgdesc="Per-game launch options, Proton selection, DLSS DLL management, ReShade injection, MangoHud benchmarks, and controller navigation for Steam on Linux"
+pkgdesc="Per-game launch options, Proton selection, DLSS DLL management, ReShade injection, native Ultra+ mod install, MangoHud benchmarks, and controller navigation for Steam on Linux"
 arch=('any')
 _repo=proton_command_center
 url="https://github.com/mrcgibb9876-hash/proton_command_center"

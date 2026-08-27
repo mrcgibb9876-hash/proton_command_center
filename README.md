@@ -110,12 +110,11 @@ and an Ultra+ mod loader toggle (`WINEDLLOVERRIDES=dwmapi=n,b`) for UE4SS-based
 mods from [theultraplace.com](https://theultraplace.com) - it forces Proton to
 load dwmapi.dll from disk instead of its own stub. Opening a game whose folder
 has a `ue4ss/` directory shows what Ultra+ found there (the loader DLL, any
-companion `.asi` fixes); the files themselves come from Ultra+ Manager, not
-Command Center.
+companion `.asi` fixes); as of 1.22.0 those files are installed by Command
+Center itself, from the Mods tab.
 
 A game with Ultra+ set up gets an **ULTRA+** badge on its library card - click
-the logo to launch Ultra+ Manager. Get the manager itself, or point Command
-Center at an already-downloaded copy, from *Settings → Ultra+ Manager*.
+the logo to jump to its Mods tab.
 
 
 Options that the selected build can't act on are greyed out with the reason. The
@@ -160,6 +159,20 @@ ReShade only loads once the game process actually reads its proxy DLL from
 disk instead of Proton's own - add `WINEDLLOVERRIDES=dxgi=n,b` (or whichever
 DLL was installed) to the game's launch options; the ReShade tab has a button
 that adds this for you once it's installed.
+
+### Mods tab
+
+Installs, updates, and removes [Ultra+](https://theultraplace.com) mods
+directly - no separate Ultra+ Manager app needed. If the game has a published
+mod, pick a version and install; reinstalling over an existing copy updates it
+while merging your `UltraPlusConfig.ini`/`keybinds.ini` edits into the new
+shipped file, and any presets the mod ships (`preset_*.ini`) show up as
+one-click apply. Remove deletes every file that install tracked and nothing
+else.
+
+Skip "I manage my own UE4SS" if you run UE4SS yourself already - it installs
+only the mod's own files and Content `.pak`/`.ucas`/`.utoc` packages, not the
+UE4SS runtime or loader DLL.
 
 ### Shader cache tab
 
@@ -281,12 +294,14 @@ never kills a running game.
 
 ## Credits
 
-Ultra+, Ultra+ Manager, and the UE4SS-based mods they cover are made by the
-Ultra+ team at [theultraplace.com](https://theultraplace.com) and distributed
-via [Nexus Mods](https://www.nexusmods.com/site/mods/1586). Command Center
-doesn't install or modify any of their files itself - it only detects what
-Ultra+ Manager already put in a game's folder and launches the app; all
-Ultra+ branding and assets (including the logo shown on tagged library cards)
-belong to their respective owners.
+Ultra+ and the UE4SS-based mods it covers are made by the Ultra+ team at
+[theultraplace.com](https://theultraplace.com). As of 1.22.0, Command Center
+installs, updates, and removes these mods directly, fetching from the same
+public game-data and mod catalog the official apps use - it no longer
+requires the separate Ultra+ Manager application to do this. This is an
+independent, unofficial integration; Command Center is not affiliated with
+or endorsed by the Ultra+ team, and all Ultra+ branding, mod content, and
+the game-data catalog (including the logo shown on tagged library cards)
+remain the property of their respective owners.
 
 MIT. Copyright (c) 2026 Marc Gibb.
