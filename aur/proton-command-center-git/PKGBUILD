@@ -1,9 +1,9 @@
 # Maintainer: Marc Gibb
 pkgname=proton-command-center-git
 _pkgname=proton-command-center
-pkgver=1.1.0.r0.g0000000
+pkgver=1.23.0.r1.g9a38453
 pkgrel=1
-pkgdesc="Per-game launch options, Proton selection, DLSS DLL management, MangoHud benchmarks, and controller navigation for Steam on Linux (git version)"
+pkgdesc="Per-game launch options, Proton selection, DLSS DLL management, ReShade injection, native Ultra+ mod install, MangoHud benchmarks, and controller navigation for Steam on Linux (git version)"
 arch=('any')
 url="https://github.com/mrcgibb9876-hash/proton_command_center"
 license=('MIT')
@@ -11,8 +11,6 @@ depends=('python' 'xdg-utils' 'curl')
 optdepends=(
     'steam: the storefront this manages (required in practice)'
     'mangohud: performance overlay toggle and benchmark tab'
-    'gamescope: compositor wrapper toggle in the launch builder'
-    'gamemode: performance wrapper toggle in the launch builder'
     'nvidia-utils: DLSS DLL management and driver-aware compile tracking'
 )
 makedepends=('git')
