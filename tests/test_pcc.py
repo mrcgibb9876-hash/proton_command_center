@@ -1726,6 +1726,93 @@ class PCCTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 pcc.set_environment_shaders(True, bad)
 
+    # -- DLSS render-preset control (DXVK-NVAPI DRS layer) ------------------
+
+    def test_ngx_render_presets_parsed_from_header(self):
+        """SR/RR/FG/NR are separate enums in NVIDIA's own header with
+        different ceilings - must not collapse to one shared letter range."""
+        self.assertEqual(pcc.NGX_RENDER_PRESETS["sr"],
+                          list("abcdefghijklmno") + ["latest"])
+        self.assertEqual(pcc.NGX_RENDER_PRESETS["rr"],
+                          list("abcdefghijklmno") + ["latest"])
+        self.assertEqual(pcc.NGX_RENDER_PRESETS["fg"][:5], list("abcde"))
+        self.assertEqual(pcc.NGX_RENDER_PRESETS["fg"][-2:], ["default", "latest"])
+        self.assertEqual(len(pcc.NGX_RENDER_PRESETS["fg"]), 28)  # A-Z + default + latest
+        self.assertEqual(pcc.NGX_RENDER_PRESETS["nr"],
+                          ["a", "b", "c", "d", "latest"])
+        # SR and RR happen to share the same letters today but must be
+        # independent lists, not one shared object/enum a future header
+        # change could accidentally desync.
+        self.assertIsNot(pcc.NGX_RENDER_PRESETS["sr"], pcc.NGX_RENDER_PRESETS["rr"])
+
+    def test_preset_symbol_casing_matches_header(self):
+        self.assertEqual(pcc._preset_symbol("a"), "A")
+        self.assertEqual(pcc._preset_symbol("o"), "O")
+        self.assertEqual(pcc._preset_symbol("latest"), "Latest")
+        self.assertEqual(pcc._preset_symbol("default"), "Default")
+
+    def test_nvapi_dll_dlss_support_reads_real_build_strings(self):
+        """A build's nvapi64.dll is probed for literal setting-name and
+        RENDER_PRESET_<X> byte strings - a build whose dxvk-nvapi predates a
+        letter genuinely doesn't have that string compiled in, so this must
+        correctly narrow the ceiling rather than always returning it whole."""
+        tool_dir = Path(self.tmp.name) / "protonbuild"
+        dll_dir = tool_dir / "files/lib/wine/nvapi/x86_64-windows"
+        dll_dir.mkdir(parents=True)
+        # Fake dxvk-nvapi that only knows SR up through preset C (no D..O,
+        # no latest) and has never heard of RR presets or the debug var at
+        # all - simulates an old build.
+        blob = (b"...NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION..."
+                b"RENDER_PRESET_A RENDER_PRESET_B RENDER_PRESET_C ...")
+        (dll_dir / "nvapi64.dll").write_bytes(blob)
+        support = pcc.nvapi_dll_dlss_support(tool_dir)
+        self.assertEqual(support["sr"], ["a", "b", "c"])
+        self.assertEqual(support["rr"], [])   # setting name itself absent
+        self.assertEqual(support["fg"], [])
+        self.assertFalse(support["debug_indicator"])
+
+    def test_nvapi_dll_dlss_support_missing_build_fails_empty_not_open(self):
+        """No nvapi64.dll at all (build not installed, or too old to ship
+        one) - must return the all-empty shape, not raise or fabricate
+        support the DLL can't actually prove."""
+        support = pcc.nvapi_dll_dlss_support(Path(self.tmp.name) / "nope")
+        self.assertEqual(support,
+                          {"sr": [], "rr": [], "fg": [], "nr": [],
+                           "debug_indicator": False})
+
+    def test_proton_capabilities_includes_dlss_presets_and_ceiling(self):
+        root = Path(self.tmp.name) / "capsroot"
+        build = root / "compatibilitytools.d/GE-Proton11-1"
+        dll_dir = build / "files/lib/wine/nvapi/x86_64-windows"
+        dll_dir.mkdir(parents=True)
+        build.joinpath("proton").write_text("PROTON_ENABLE_WAYLAND")
+        (dll_dir / "nvapi64.dll").write_bytes(
+            b"NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION RENDER_PRESET_A "
+            b"RENDER_PRESET_Latest DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS")
+        real = pcc._compat_dirs
+        pcc._compat_dirs = lambda r: [Path(r) / "compatibilitytools.d"]
+        try:
+            cap = pcc.proton_capabilities(root)
+        finally:
+            pcc._compat_dirs = real
+        self.assertIn("dlss_presets", cap)
+        self.assertEqual(cap["dlss_presets"]["GE-Proton11-1"]["sr"],
+                          ["a", "latest"])
+        self.assertTrue(cap["dlss_presets"]["GE-Proton11-1"]["debug_indicator"])
+        self.assertEqual(cap["dlss_preset_ceiling"], pcc.NGX_RENDER_PRESETS)
+
+    def test_dlss_preset_defaults_round_trip(self):
+        """The 'global default' is a saved template only - get/set just
+        persists it, no game's launch options are touched by these calls."""
+        self.assertEqual(pcc.get_dlss_preset_defaults(), {})
+        settings = {"srMode": "quality", "srPreset": "render_preset_latest",
+                    "rrPreset": "render_preset_f", "drsCompact": True}
+        pcc.set_dlss_preset_defaults(settings)
+        self.assertEqual(pcc.get_dlss_preset_defaults(), settings)
+        # overwrite, not merge
+        pcc.set_dlss_preset_defaults({"srMode": "balanced"})
+        self.assertEqual(pcc.get_dlss_preset_defaults(), {"srMode": "balanced"})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -481,16 +481,10 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
           <option value="custom">Custom ratio…</option>
         </select>
         <input type="number" id="srRatio" min="33" max="100" placeholder="%" style="width:76px;display:none">
-        <select id="dlssPreset">
-          <option value="">Preset: game default</option>
-          <option value="render_preset_j">J (transformer)</option>
-          <option value="render_preset_k">K (transformer)</option>
-          <option value="render_preset_l">L (2nd-gen transformer)</option>
-          <option value="render_preset_m">M (2nd-gen transformer)</option>
-          <option value="render_preset_latest">Latest / recommended</option>
-        </select>
+        <select id="dlssPreset"><option value="">Preset: game default</option></select>
       </div>
-      <p class="note">Custom scaling ratio needs a recent Proton (dxvk-nvapi 0.9.1+).</p>
+      <p class="note">Custom scaling ratio needs a recent Proton (dxvk-nvapi 0.9.1+). Preset list is read from
+        the selected Proton build's own dxvk-nvapi — greyed-out presets aren't compiled into that build.</p>
     </div>
     <div class="section">
       <h3>DLSS Frame Generation</h3>
@@ -511,11 +505,31 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
         <select id="rrPreset">
           <option value="">Off (game default)</option>
           <option value="on">Force on (default preset)</option>
-          <option value="render_preset_d">Force on · preset D (default transformer)</option>
-          <option value="render_preset_e">Force on · preset E (latest transformer)</option>
-          <option value="render_preset_latest">Force on · latest</option>
         </select>
       </div>
+    </div>
+    <div class="section">
+      <h3>DLSS preset options</h3>
+      <p class="note">Picking a render preset only tells the game which model to use — it doesn't fetch the model
+        itself. Turn on "DLSS auto-updater (NGX)" in the toggle list above too, or the preset may not exist yet
+        in this game's bundled DLSS DLL.</p>
+      <label class="row" style="align-items:center;gap:8px">
+        <input type="checkbox" id="drsCompact" checked>
+        <span class="note" style="margin:0">Emit as one compact <code>DXVK_NVAPI_DRS_SETTINGS=...</code> line (default). Unchecked emits one
+          <code>DXVK_NVAPI_DRS_&lt;KEY&gt;=</code> variable per setting instead — same effect, easier to read/edit by hand.</span>
+      </label>
+      <label class="row" style="align-items:center;gap:8px;margin-top:8px">
+        <input type="checkbox" id="dlssDebugIndicator">
+        <span class="note" style="margin:0">On-screen DLSS indicator (debug) — DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS. NGX remembers this setting in the
+          game's own prefix once it's launched with it on, so turning this off writes an explicit "off" line rather
+          than just deleting the variable — launch the game once more after unchecking to actually clear the overlay.</span>
+      </label>
+      <div class="row" style="margin-top:10px">
+        <button class="btn" id="dlssSaveDefault">Save as global default</button>
+        <button class="btn" id="dlssApplyDefault">Apply global default</button>
+      </div>
+      <p class="note">The global default is a template only — saving it never touches any game's launch options by
+        itself. "Apply" copies it into the SR/RR/FG controls above for the game you're currently editing.</p>
     </div>
     <div class="section">
       <h3>Frame rate cap</h3>
@@ -766,6 +780,7 @@ const TOGGLES=[
  {id:"fsr4upgrade",needs:"PROTON_FSR4_UPGRADE",label:"FSR4 upgrade",hint:"PROTON_FSR4_UPGRADE=1 — upgrades FSR 3.1 DLLs to FSR 4. RDNA4 only in practice; on your NVIDIA GPU this won't do anything useful.",env:"PROTON_FSR4_UPGRADE=1"},
  {id:"noesync",needs:"PROTON_NO_ESYNC",label:"Disable esync",hint:"PROTON_NO_ESYNC=1 — turns off eventfd synchronisation. A troubleshooting switch: try it only if a game hangs or crashes on launch, since esync is normally a performance win.",env:"PROTON_NO_ESYNC=1"},
  {id:"vkd3dheap",label:"VKD3D descriptor heap (experimental)",hint:"VKD3D_CONFIG=descriptor_heap — enables vkd3d-proton's newer Vulkan descriptor-heap path for D3D12 titles, meant to eventually replace the current descriptor-buffer implementation. Still opt-in upstream because of unresolved NVIDIA driver bugs (crashes/visual corruption reported in some titles, e.g. Ready or Not) — worth trying per-game, not as a default. (PROTON_VKD3D_HEAP=1 was the old opt-in for this and is being removed upstream; don't set it alongside this.)",env:"VKD3D_CONFIG=descriptor_heap"},
+ {id:"ngxupdater",needs:"PROTON_ENABLE_NGX_UPDATER",label:"DLSS auto-updater (NGX)",hint:"PROTON_ENABLE_NGX_UPDATER=1 — the DLSS render-preset overrides below (DXVK_NVAPI_DRS_*) only pick which preset the game's own DLSS DLL should use; they don't fetch newer DLSS libraries. This lets Proton's own updater install newer DLSS DLLs so a picked preset (e.g. a recent transformer model) actually exists in the game to select. Turn this on alongside any render-preset override.",env:"PROTON_ENABLE_NGX_UPDATER=1"},
  {id:"ultraplus",label:"Ultra+ mod loader",hint:"WINEDLLOVERRIDES=dwmapi=n,b;version=n,b — two separate hijacks for two separate things. dwmapi.dll is the UE4SS build Ultra+ Manager drops in, loading UE4SS itself and UltraPlusExtensions. version.dll is a generic ASI loader (Ultimate ASI Loader) some games additionally need to run standalone .asi companion fixes (e.g. NaniteRayTracingFix.asi) that aren't part of UE4SS at all - harmless to leave on for games that don't have any. The status note below only appears once a game is open, and only means something if the files are already in the game folder — installed separately via Ultra+ Manager or, for the .asi fixes, wherever that fix is distributed.",env:"WINEDLLOVERRIDES=dwmapi=n,b;version=n,b"},
 ];
 let manualEdit=false;
@@ -804,8 +819,56 @@ function selectedToolDir(){
   if(!sel||!sel.value) return null;          // "Steam default" - build unknown
   return PROTON_CAPS.tools[sel.value] ? sel.value : null;
 }
+// Fallback preset lists used only when no specific Proton build is selected
+// (Steam default) - PROTON_CAPS has nothing to probe in that case, so we
+// can't know what's really supported. Once a real build is picked, its own
+// dlss_preset_ceiling/dlss_presets data (parsed from NVIDIA's own header and
+// probed against that build's actual nvapi64.dll) takes over completely.
+const SR_PRESET_FALLBACK=["j","k","l","m","latest"];
+const RR_PRESET_FALLBACK=["d","e","f","latest"];
+function populatePresetDropdown(selectEl,feature,fallback){
+  const tool=selectedToolDir();
+  const ceiling=(PROTON_CAPS.dlss_preset_ceiling&&PROTON_CAPS.dlss_preset_ceiling[feature])||fallback;
+  const known=tool&&PROTON_CAPS.dlss_presets&&PROTON_CAPS.dlss_presets[tool]&&PROTON_CAPS.dlss_presets[tool][feature];
+  const cur=selectEl.value;
+  const keep=[...selectEl.options].filter(o=>!o.value.startsWith("render_preset_"));
+  selectEl.innerHTML="";keep.forEach(o=>selectEl.appendChild(o));
+  const infoTable=feature==="sr"?SR_PRESET_INFO:feature==="rr"?RR_PRESET_INFO:{};
+  // "latest" (and "default") float to the top of the dynamic choices - NVIDIA's
+  // current recommendation, not whatever the highest letter happens to be.
+  const ordered=[...ceiling].sort((a,b)=>{
+    const rank=v=>v==="latest"?0:v==="default"?1:2;
+    const ra=rank(a),rb=rank(b);
+    return ra!==rb?ra-rb:a.localeCompare(b);
+  });
+  for(const letter of ordered){
+    const value="render_preset_"+letter;
+    const opt=document.createElement("option");
+    opt.value=value;
+    const label=(infoTable[value]&&infoTable[value].title)
+      ||(letter==="latest"?"Latest / recommended":letter==="default"?"Default":`Preset ${letter.toUpperCase()}`);
+    const supported=!known||known.includes(letter);   // unknown build -> fail open, don't grey out
+    opt.textContent=supported?label:label+" (needs newer Proton)";
+    opt.disabled=!supported;
+    selectEl.appendChild(opt);
+  }
+  // A value set by loadStringIntoUI before this game's real Proton build had
+  // loaded (dropdown still held the previous game's options) is retried here
+  // once the right build's option list actually exists.
+  const pending=selectEl.dataset.pending;
+  if(pending){
+    if([...selectEl.options].some(o=>o.value===pending&&!o.disabled)){
+      selectEl.value=pending;delete selectEl.dataset.pending;return;
+    }
+    return;   // still can't resolve it yet - leave current selection alone
+  }
+  if([...selectEl.options].some(o=>o.value===cur&&!o.disabled))selectEl.value=cur;
+  else if(cur.startsWith("render_preset_"))selectEl.value="";  // no longer valid for this build
+}
 function applyCapabilities(){
   const tool=selectedToolDir();
+  populatePresetDropdown($("#dlssPreset"),"sr",SR_PRESET_FALLBACK);
+  populatePresetDropdown($("#rrPreset"),"rr",RR_PRESET_FALLBACK);
   for(const t of TOGGLES){
     if(!t.needs) continue;
     const input=document.querySelector(`#toggles input[data-id="${t.id}"]`);
@@ -863,6 +926,17 @@ function renderToggles(){
     }
   });
 }
+// DXVK-NVAPI accepts NGX_* DRS settings two equivalent ways; PCC can emit
+// either. Compact is one DXVK_NVAPI_DRS_SETTINGS=k=v,k=v,... token (preferred
+// for Steam launch options - shorter, and Steam doesn't limit token count but
+// a giant space-separated line is harder to read); per-var is one
+// DXVK_NVAPI_DRS_<KEY>=<VALUE> token per setting (easier to hand-edit/grep).
+function ngxToLaunchTokens(ngx,compact){
+  const keys=Object.keys(ngx);
+  if(!keys.length)return[];
+  if(compact)return["DXVK_NVAPI_DRS_SETTINGS="+keys.map(k=>k+"="+ngx[k]).join(",")];
+  return keys.map(k=>"DXVK_NVAPI_DRS_"+k+"="+ngx[k]);
+}
 function buildString(){
   if(manualEdit)return;
   const on=new Set([...document.querySelectorAll("#toggles input:checked")].map(i=>i.dataset.id));
@@ -875,18 +949,34 @@ function buildString(){
   }
   const srMode=$("#srMode").value,srPreset=$("#dlssPreset").value,
         fg=$("#fgMode").value,rr=$("#rrPreset").value,cap=$("#fpsCap").value;
-  if(srMode||srPreset)env.push("DXVK_NVAPI_DRS_NGX_DLSS_SR_OVERRIDE=on");
-  if(srMode)env.push("DXVK_NVAPI_DRS_NGX_DLSS_SR_MODE="+srMode);
+  // NGX_* settings all go through the DXVK-NVAPI DRS layer and are collected
+  // separately so they can be emitted as either syntax (see ngxToLaunchTokens).
+  const ngx={};
+  if(srMode||srPreset)ngx.NGX_DLSS_SR_OVERRIDE="on";
+  if(srMode)ngx.NGX_DLSS_SR_MODE=srMode;
   if(srMode==="custom"&&$("#srRatio").value)
-    env.push("DXVK_NVAPI_DRS_NGX_DLSS_SR_OVERRIDE_SCALING_RATIO="+$("#srRatio").value);
-  if(srPreset)env.push("DXVK_NVAPI_DRS_NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION="+srPreset);
+    ngx.NGX_DLSS_SR_OVERRIDE_SCALING_RATIO=$("#srRatio").value;
+  if(srPreset)ngx.NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION=srPreset;
   if(fg!==""){
-    env.push("DXVK_NVAPI_DRS_NGX_DLSS_FG_OVERRIDE=on");
-    if(fg!=="0")env.push("DXVK_NVAPI_DRS_NGX_DLSSG_MULTI_FRAME_COUNT="+fg);
+    ngx.NGX_DLSS_FG_OVERRIDE="on";
+    if(fg!=="0")ngx.NGX_DLSSG_MULTI_FRAME_COUNT=fg;
   }
   if(rr){
-    env.push("DXVK_NVAPI_DRS_NGX_DLSS_RR_OVERRIDE=on");
-    if(rr!=="on")env.push("DXVK_NVAPI_DRS_NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION="+rr);
+    ngx.NGX_DLSS_RR_OVERRIDE="on";
+    if(rr!=="on")ngx.NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION=rr;
+  }
+  env.push(...ngxToLaunchTokens(ngx,$("#drsCompact").checked));
+  // The on-screen DLSS indicator is sticky: NGX persists it into the game's
+  // own prefix once launched with it on, so turning the checkbox off must
+  // still emit an explicit "off" line (not just drop the variable) or the
+  // overlay never clears. dataset.present tracks "this line exists in the
+  // saved string in some form", set from loadStringIntoUI on open.
+  const dbg=$("#dlssDebugIndicator");
+  if(dbg.checked){
+    env.push("DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS=DLSSIndicator=1024,DLSSGIndicator=2");
+    dbg.dataset.present="1";
+  }else if(dbg.dataset.present==="1"){
+    env.push("DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS=DLSSIndicator=0,DLSSGIndicator=0");
   }
   if(cap)env.push("DXVK_FRAME_RATE="+cap);
   const extraEnv=$("#extraEnv").value.trim();
@@ -922,40 +1012,61 @@ $("#srMode").addEventListener("change",()=>{
   $("#srRatio").style.display=$("#srMode").value==="custom"?"":"none";
   manualEdit=false;buildString();
 });
-["#dlssPreset","#srRatio","#fgMode","#rrPreset","#fpsCap","#extraEnv","#extraArgs"].forEach(s=>$(s).addEventListener("input",()=>{manualEdit=false;buildString()}));
+["#dlssPreset","#srRatio","#fgMode","#rrPreset","#fpsCap","#extraEnv","#extraArgs","#drsCompact"].forEach(s=>$(s).addEventListener("input",()=>{manualEdit=false;buildString()}));
+$("#dlssDebugIndicator").addEventListener("change",()=>{manualEdit=false;buildString()});
+/* ---------- DLSS preset global default (template only, applied on demand) ---------- */
+function currentDlssPresetSettings(){
+  return{srMode:$("#srMode").value,srPreset:$("#dlssPreset").value,srRatio:$("#srRatio").value,
+    fgMode:$("#fgMode").value,rrPreset:$("#rrPreset").value,drsCompact:$("#drsCompact").checked};
+}
+$("#dlssSaveDefault").addEventListener("click",async()=>{
+  try{await post("/api/dlss_preset_defaults",{settings:currentDlssPresetSettings()});
+    toast("Saved as global default — this only updates the template, no game was touched");}
+  catch(e){toast(e.message,true)}
+});
+$("#dlssApplyDefault").addEventListener("click",async()=>{
+  try{
+    const d=await api("/api/dlss_preset_defaults");
+    if(!Object.keys(d).length){toast("No global default saved yet",true);return}
+    $("#srMode").value=d.srMode||"";
+    $("#srRatio").value=d.srRatio||"";
+    $("#srRatio").style.display=$("#srMode").value==="custom"?"":"none";
+    $("#dlssPreset").dataset.pending=d.srPreset||"";$("#dlssPreset").value=d.srPreset||"";
+    $("#fgMode").value=d.fgMode||"";
+    $("#rrPreset").dataset.pending=d.rrPreset||"";$("#rrPreset").value=d.rrPreset||"";
+    $("#drsCompact").checked=d.drsCompact!==false;
+    manualEdit=false;buildString();
+    toast("Global default applied to this game — click Save to Steam to write it");
+  }catch(e){toast(e.message,true)}
+});
 
 /* ---------- DLSS preset info pop-up ----------
-   Sourced directly from NVIDIA's own Streamline SDK headers (github.com/
-   NVIDIAGameWorks/Streamline), which are authoritative for what each render
-   preset letter actually does - verified Aug 2026, since earlier guesses in
-   this file turned out wrong. Super Resolution (sl_dlss.h, DLSSPreset) and
-   Ray Reconstruction (sl_dlss_d.h, DLSSDPreset) are SEPARATE enums that
-   happen to share letter names but do NOT mean the same thing per letter:
-   SR's working presets are J/K/L/M (1st-gen/2nd-gen transformer); N and O
-   are defined but explicitly commented "Reverts to default, not recommended
-   to use" - so they're deliberately excluded from the SR dropdown below.
-   RR's enum is different again: only D ("Default model (transformer)") and
-   E ("Latest transformer model, must use if DoF guide is needed") do
-   anything - every other RR letter, including K/L/M/N/O, is commented
-   "Reverts to default" in NVIDIA's header. dxvk-nvapi's DXVK_NVAPI_DRS_
-   NGX_DLSS_{SR,RR}_OVERRIDE_RENDER_PRESET_SELECTION env vars pass these
-   same letters straight through to the driver (its README points at the
-   classic NvApiDriverSettings.h header for the value list), so the same
-   per-feature meanings apply. "latest" is real too, confirmed by dxvk-nvapi's
-   own README example overriding both SR and RR presets to latest via the
-   raw DRS setting IDs. */
+   The full set of selectable letters per feature (SR/RR each go up to O,
+   FG up to Z) comes from the backend, parsed straight out of NVIDIA's own
+   NvApiDriverSettings.h and narrowed to what the selected Proton build's
+   dxvk-nvapi actually recognizes (see populatePresetDropdown/PROTON_CAPS).
+   These INFO tables are just optional descriptive text for the handful of
+   letters worth explaining - a letter with no entry here still shows up in
+   the dropdown (as "Preset X"), just without a tooltip. Preset meanings
+   shift as NVIDIA ships new DLSS generations (earlier notes in this file
+   claiming everything past D/E "reverts to default" for Ray Reconstruction
+   were already wrong by DLSS 4.5 - F is now RR's current recommended
+   transformer model, nvngx_dlssd.dll 310.7.128) - "latest" is deliberately
+   the one this file treats as the recommended default, precisely so it
+   doesn't need updating every time NVIDIA moves the goalposts again. */
 const SR_PRESET_INFO={
   render_preset_j:{title:"J — early 1st-gen Transformer",desc:"Similar to preset K - may show slightly less ghosting at the cost of extra flickering. NVIDIA's own guidance recommends K over J for most cases; J is mainly for the handful of titles that specifically pin to it."},
-  render_preset_k:{title:"K — 1st-gen Transformer, recommended baseline",desc:"NVIDIA's default preset for DLAA/Balanced/Quality modes. Transformer-based - the best image-quality preset at a higher performance cost than the older CNN models."},
-  render_preset_l:{title:"L — 2nd-gen Transformer, Ultra Performance",desc:"NVIDIA's default preset for Ultra Performance mode. Sharper, more stable image with less ghosting than J/K, at a higher performance cost - built for the most aggressive upscale ratios."},
-  render_preset_m:{title:"M — 2nd-gen Transformer, Performance",desc:"NVIDIA's default preset for Performance mode. Similar image-quality gains to L but closer in speed to J/K - the general-purpose 2nd-gen pick."},
-  render_preset_latest:{title:"Latest / recommended",desc:"Always resolves to whichever preset NVIDIA currently recommends for the game/GPU combination, without hardcoding a letter — set it and forget it; it stays current as new presets ship."},
+  render_preset_k:{title:"K — 1st-gen Transformer",desc:"NVIDIA's former default preset for DLAA/Balanced/Quality modes. Transformer-based - strong image quality at a higher cost than the older CNN models."},
+  render_preset_l:{title:"L — 2nd-gen Transformer, Ultra Performance",desc:"NVIDIA's former default preset for Ultra Performance mode. Sharper, more stable image with less ghosting than J/K, at a higher performance cost - built for the most aggressive upscale ratios."},
+  render_preset_m:{title:"M — 2nd-gen Transformer, Performance",desc:"NVIDIA's former default preset for Performance mode. Similar image-quality gains to L but closer in speed to J/K - the general-purpose 2nd-gen pick."},
+  render_preset_latest:{title:"Latest / recommended",desc:"As of DLSS 4.5, \"latest\" means whichever preset NVIDIA currently recommends for this feature - NOT simply the highest lettered preset available. It stays current as new presets ship, without you having to track which letter is best this month."},
 };
 const RR_PRESET_INFO={
-  on:{title:"Default preset",desc:"Turns Ray Reconstruction on without pinning a specific model — the game/driver default preset applies (same as preset D below)."},
-  render_preset_d:{title:"D — default transformer model",desc:"NVIDIA's default Ray Reconstruction model. Ray Reconstruction only has two presets that actually do anything, D and E - every other letter (F through O, including K/L/M which matter for Super Resolution) silently reverts to this same default in NVIDIA's own driver, so there's no separate quality-tier ladder here like Super Resolution has."},
-  render_preset_e:{title:"E — latest transformer model",desc:"NVIDIA's newest Ray Reconstruction model - required if a game's depth-of-field guide needs it. Worth trying if D doesn't look right; otherwise the two are close."},
-  render_preset_latest:{title:"Latest / recommended",desc:"Always resolves to whichever RR preset NVIDIA currently recommends for the game/GPU combination — set it and forget it."},
+  on:{title:"Default preset",desc:"Turns Ray Reconstruction on without pinning a specific model — whatever the driver currently defaults to applies."},
+  render_preset_d:{title:"D — default transformer model",desc:"NVIDIA's original default Ray Reconstruction model."},
+  render_preset_e:{title:"E — transformer model",desc:"An intermediate Ray Reconstruction model - required if a game's depth-of-field guide needs it."},
+  render_preset_f:{title:"F — DLSS 4.5 current model",desc:"NVIDIA's current recommended Ray Reconstruction preset as of DLSS 4.5 (nvngx_dlssd.dll 310.7.128). This is what \"latest\" resolves to today."},
+  render_preset_latest:{title:"Latest / recommended",desc:"As of DLSS 4.5 this resolves to preset F - but the point of picking \"latest\" instead of a specific letter is that it keeps tracking NVIDIA's current recommendation as that changes, rather than a value that goes stale."},
 };
 function showPresetPop(selectEl,info){
   if(!info){hidePresetPop();return}
@@ -979,26 +1090,60 @@ document.addEventListener("click",e=>{
 });
 window.addEventListener("keydown",e=>{if(e.key==="Escape"&&!$("#presetPop").hidden)hidePresetPop()});
 $("#launchStr").addEventListener("input",()=>{manualEdit=true});
-/* naive reverse-parse: light the toggles a saved string matches */
+/* naive reverse-parse: light the toggles a saved string matches. NGX_* values
+   can be found either as DXVK_NVAPI_DRS_<KEY>=<VALUE> (per-var) or bundled
+   inside one DXVK_NVAPI_DRS_SETTINGS=k=v,k=v,... (compact) - since neither
+   form uses spaces inside a value, stopping at [^,\s] (not just \s) is what
+   makes the same regex work against both syntaxes. */
 function loadStringIntoUI(str){
   document.querySelectorAll("#toggles input").forEach(i=>{
     const t=TOGGLES.find(t=>t.id===i.dataset.id);
     i.checked=!!(t.env&&t.env.split(" ").every(e=>str.includes(e))||t.wrap&&new RegExp("\\b"+t.wrap+"\\b").test(str)||t.arg&&new RegExp("(^|\\s)"+t.arg.replace(/[-]/g,"\\$&")+"(\\s|$)").test(str));
   });
-  const sr=str.match(/SR_OVERRIDE_RENDER_PRESET_SELECTION=(\S+)/);
-  $("#dlssPreset").value=sr?sr[1]:"";
-  const md=str.match(/DLSS_SR_MODE=(\S+)/);
+  // Was this saved as one compact DXVK_NVAPI_DRS_SETTINGS= line, or several
+  // DXVK_NVAPI_DRS_<KEY>= ones? Remembered so re-saving keeps the same shape
+  // instead of silently switching format on the user.
+  $("#drsCompact").checked=/DXVK_NVAPI_DRS_SETTINGS=/.test(str)||!/DXVK_NVAPI_DRS_NGX_/.test(str);
+  const setPending=(sel,val)=>{sel.dataset.pending=val;sel.value=val;};
+  const sr=str.match(/SR_OVERRIDE_RENDER_PRESET_SELECTION=([^,\s]+)/);
+  setPending($("#dlssPreset"),sr?sr[1]:"");
+  const md=str.match(/DLSS_SR_MODE=([^,\s]+)/);
   $("#srMode").value=md?md[1]:"";
   $("#srRatio").style.display=$("#srMode").value==="custom"?"":"none";
   const ra=str.match(/SR_OVERRIDE_SCALING_RATIO=(\d+)/);
   $("#srRatio").value=ra?ra[1]:"";
   const mf=str.match(/DLSSG_MULTI_FRAME_COUNT=(\d)/);
   $("#fgMode").value=mf?mf[1]:(/DLSS_FG_OVERRIDE=on/.test(str)?"0":"");
-  const rp=str.match(/RR_OVERRIDE_RENDER_PRESET_SELECTION=(\S+)/);
-  $("#rrPreset").value=rp?rp[1]:(/DLSS_RR_OVERRIDE=on/.test(str)?"on":"");
+  const rp=str.match(/RR_OVERRIDE_RENDER_PRESET_SELECTION=([^,\s]+)/);
+  setPending($("#rrPreset"),rp?rp[1]:(/DLSS_RR_OVERRIDE=on/.test(str)?"on":""));
   const fc=str.match(/DXVK_FRAME_RATE=(\d+)/);
   $("#fpsCap").value=fc?fc[1]:"";
-  $("#extraEnv").value="";$("#extraArgs").value="";
+  // On-screen indicator: NGX persists it in the prefix once used, so a saved
+  // "off" line (0,0) still means "this has been used before" - dataset.present
+  // must reflect that even though the checkbox itself stays unchecked.
+  const dbgOn=/DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS=DLSSIndicator=1024/.test(str);
+  const dbgLinePresent=/DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS=/.test(str);
+  $("#dlssDebugIndicator").checked=dbgOn;
+  $("#dlssDebugIndicator").dataset.present=dbgLinePresent?"1":"";
+  // Anything else that looks like KEY=VALUE and isn't one of the settings
+  // this panel understands is preserved verbatim in extraEnv rather than
+  // silently dropped the next time a toggle rebuilds the string.
+  const managedKeys=new Set(["DXVK_FRAME_RATE","DXVK_NVAPI_DRS_SETTINGS","DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS"]);
+  for(const t of TOGGLES){
+    if(t.env){for(const piece of t.env.split(" ")){const eq=piece.indexOf("=");if(eq>0)managedKeys.add(piece.slice(0,eq));}}
+  }
+  const wrapWords=new Set(TOGGLES.filter(t=>t.wrap).map(t=>t.wrap));
+  const beforeCmd=str.split("%command%")[0];
+  const leftover=beforeCmd.split(/\s+/).filter(Boolean).filter(tok=>{
+    if(wrapWords.has(tok))return false;
+    const eq=tok.indexOf("=");
+    if(eq<0)return false;              // not KEY=VALUE shaped - drop (shouldn't happen before %command%)
+    const key=tok.slice(0,eq);
+    return !managedKeys.has(key)&&!key.startsWith("DXVK_NVAPI_DRS_");
+  });
+  $("#extraEnv").value=leftover.join(" ");
+  const after=str.split("%command%")[1];
+  $("#extraArgs").value=after?after.trim():"";
   $("#launchStr").value=str;manualEdit=!!str;
   if(!str){manualEdit=false;buildString()}
 }

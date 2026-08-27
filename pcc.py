@@ -2074,6 +2074,217 @@ def friendly_dlss(version) -> dict:
     return {"gen": gen, "short": short}
 
 
+# --------------------------------------------------------------------------
+# DLSS render-preset control (DXVK-NVAPI DRS layer)
+# --------------------------------------------------------------------------
+# Verbatim excerpt of the four render-preset-selection enums from NVIDIA's own
+# NvApiDriverSettings.h (github.com/NVIDIA/nvapi, commit d08488f - the exact
+# revision dxvk-nvapi's own README points at for deducing DXVK_NVAPI_DRS_*
+# values). SR and RR only go up to preset O, FG goes all the way to Z plus a
+# separate Default sentinel, and NR only has A-D - these are NVIDIA's own
+# per-feature limits, not something to guess or share across one enum.
+_NGX_RENDER_PRESET_ENUMS = """
+enum EValues_NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION {
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_OFF     = 0,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_A = 1,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_B = 2,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_C = 3,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_D = 4,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_E = 5,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_F = 6,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_G = 7,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_H = 8,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_I = 9,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_J = 10,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_K = 11,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_L = 12,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_M = 13,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_N = 14,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_O = 15,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_Latest = 0x00ffffff,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_NUM_VALUES = 17,
+    NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_DEFAULT = NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION_OFF
+};
+
+enum EValues_NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION {
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_OFF     = 0,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_A = 1,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_B = 2,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_C = 3,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_D = 4,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_E = 5,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_F = 6,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_G = 7,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_H = 8,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_I = 9,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_J = 10,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_K = 11,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_L = 12,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_M = 13,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_N = 14,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_O = 15,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_Latest = 0x00ffffff,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_NUM_VALUES = 17,
+    NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_DEFAULT = NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION_OFF
+};
+
+enum EValues_NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION {
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_OFF     = 0,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_A = 1,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_B = 2,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_C = 3,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_D = 4,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_E = 5,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_F = 6,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_G = 7,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_H = 8,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_I = 9,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_J = 10,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_K = 11,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_L = 12,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_M = 13,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_N = 14,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_O = 15,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_P = 16,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_Q = 17,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_R = 18,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_S = 19,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_T = 20,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_U = 21,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_V = 22,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_W = 23,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_X = 24,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_Y = 25,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_Z = 26,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_Default = 0x00fffffe,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_Latest = 0x00ffffff,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_NUM_VALUES = 29,
+    NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_DEFAULT = NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION_OFF
+};
+
+enum EValues_NGX_DLSS_NR_OVERRIDE_RENDER_PRESET_SELECTION {
+    NGX_DLSS_NR_OVERRIDE_RENDER_PRESET_SELECTION_OFF     = 0,
+    NGX_DLSS_NR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_A = 1,
+    NGX_DLSS_NR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_B = 2,
+    NGX_DLSS_NR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_C = 3,
+    NGX_DLSS_NR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_D = 4,
+    NGX_DLSS_NR_OVERRIDE_RENDER_PRESET_SELECTION_RENDER_PRESET_Latest = 0x00ffffff,
+    NGX_DLSS_NR_OVERRIDE_RENDER_PRESET_SELECTION_NUM_VALUES = 6,
+    NGX_DLSS_NR_OVERRIDE_RENDER_PRESET_SELECTION_DEFAULT = NGX_DLSS_NR_OVERRIDE_RENDER_PRESET_SELECTION_OFF
+};
+"""
+
+
+def _parse_ngx_preset_enum(header_text: str, enum_name: str) -> list:
+    """Pulls the RENDER_PRESET_<X> members out of one C enum block, lowercased
+    (e.g. 'a', 'o', 'latest', 'default'). Skips the OFF/NUM_VALUES/DEFAULT
+    bookkeeping members - those aren't selectable presets."""
+    m = re.search(re.escape("enum " + enum_name + " {") + r"(.*?)\};",
+                  header_text, re.S)
+    if not m:
+        return []
+    values = []
+    for line in m.group(1).splitlines():
+        line = line.strip().rstrip(",")
+        if "=" not in line:
+            continue
+        name = line.split("=", 1)[0].strip()
+        if "RENDER_PRESET_" not in name:
+            continue
+        token = name.rsplit("RENDER_PRESET_", 1)[1]
+        if re.fullmatch(r"[A-Z]|Latest|Default", token):
+            values.append(token.lower())
+    return values
+
+
+NGX_RENDER_PRESETS = {
+    "sr": _parse_ngx_preset_enum(_NGX_RENDER_PRESET_ENUMS,
+                                 "EValues_NGX_DLSS_SR_OVERRIDE_RENDER_PRESET_SELECTION"),
+    "rr": _parse_ngx_preset_enum(_NGX_RENDER_PRESET_ENUMS,
+                                 "EValues_NGX_DLSS_RR_OVERRIDE_RENDER_PRESET_SELECTION"),
+    "fg": _parse_ngx_preset_enum(_NGX_RENDER_PRESET_ENUMS,
+                                 "EValues_NGX_DLSS_FG_OVERRIDE_RENDER_PRESET_SELECTION"),
+    "nr": _parse_ngx_preset_enum(_NGX_RENDER_PRESET_ENUMS,
+                                 "EValues_NGX_DLSS_NR_OVERRIDE_RENDER_PRESET_SELECTION"),
+}
+
+
+def _preset_symbol(token: str) -> str:
+    """'a' -> 'A', 'latest' -> 'Latest' - matches the header's own casing for
+    the RENDER_PRESET_<Symbol> members, so it can be looked for verbatim in a
+    build's compiled nvapi64.dll."""
+    return token.upper() if len(token) == 1 else token.capitalize()
+
+
+def _nvapi_dll_path(tool_dir: Path):
+    p = Path(tool_dir) / "files/lib/wine/nvapi/x86_64-windows/nvapi64.dll"
+    return p if p.is_file() else None
+
+
+def nvapi_dll_dlss_support(tool_dir: Path) -> dict:
+    """Which NGX DLSS render presets this Proton build's bundled dxvk-nvapi
+    actually recognizes, per feature, plus whether it knows the debug
+    on-screen-indicator setting at all.
+
+    Every Proton/Proton-GE build ships its own compiled dxvk-nvapi as
+    nvapi64.dll. An older build's dxvk-nvapi simply doesn't have a preset
+    letter compiled in as a string constant if that preset didn't exist in
+    NVIDIA's header yet when it was built - so a literal byte search against
+    the real installed binary is a genuine per-build capability probe, not a
+    hardcoded Proton-version table. NGX_RENDER_PRESETS (parsed from NVIDIA's
+    own header above) is the ceiling; this narrows it to what THIS build can
+    actually parse.
+    """
+    empty = {"sr": [], "rr": [], "fg": [], "nr": [], "debug_indicator": False}
+    path = _nvapi_dll_path(tool_dir)
+    if not path:
+        return empty
+    try:
+        blob = path.read_bytes()
+    except OSError:
+        return empty
+
+    def supported(feature_key, values):
+        setting = f"NGX_DLSS_{feature_key}_OVERRIDE_RENDER_PRESET_SELECTION".encode()
+        if setting not in blob:
+            return []
+        out = []
+        for v in values:
+            # plain substring containment would let e.g. "RENDER_PRESET_L"
+            # false-positive-match inside "RENDER_PRESET_Latest" - the
+            # lookahead requires the token not continue into more identifier
+            # characters, so single letters can't accidentally match a
+            # longer name that happens to start with them.
+            pattern = re.compile(rb"RENDER_PRESET_" +
+                                 re.escape(_preset_symbol(v).encode()) +
+                                 rb"(?![A-Za-z0-9_])")
+            if pattern.search(blob):
+                out.append(v)
+        return out
+
+    return {
+        "sr": supported("SR", NGX_RENDER_PRESETS["sr"]),
+        "rr": supported("RR", NGX_RENDER_PRESETS["rr"]),
+        "fg": supported("FG", NGX_RENDER_PRESETS["fg"]),
+        "nr": supported("NR", NGX_RENDER_PRESETS["nr"]),
+        "debug_indicator": b"DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS" in blob,
+    }
+
+
+def get_dlss_preset_defaults() -> dict:
+    """The saved 'global default' DLSS preset template - a starting point a
+    user can apply to whichever game they're looking at, not something
+    auto-pushed into every game's own launch options."""
+    return load_state().get("dlss_preset_defaults", {})
+
+
+def set_dlss_preset_defaults(settings: dict) -> dict:
+    state = load_state()
+    state["dlss_preset_defaults"] = settings
+    save_state(state)
+    return settings
+
+
 def _gh_json(url):
     req = urllib.request.Request(url, headers={"User-Agent": "pcc",
                                                "Accept": "application/vnd.github+json"})
@@ -2991,11 +3202,13 @@ def proton_capabilities(root: Path) -> dict:
     A var outside `known` is invisible to us, not absent - callers must leave
     those enabled.
     """
-    per_tool = {name: sorted(proton_env_vars(d))
-                for name, d in _tool_dirs(root).items()}
+    tool_dirs = _tool_dirs(root)
+    per_tool = {name: sorted(proton_env_vars(d)) for name, d in tool_dirs.items()}
     known = sorted(set().union(*(set(v) for v in per_tool.values()))
                    if per_tool else [])
-    return {"tools": per_tool, "known": known}
+    dlss_presets = {name: nvapi_dll_dlss_support(d) for name, d in tool_dirs.items()}
+    return {"tools": per_tool, "known": known, "dlss_presets": dlss_presets,
+            "dlss_preset_ceiling": NGX_RENDER_PRESETS}
 
 
 def list_compat_tools(root: Path):
@@ -4557,6 +4770,8 @@ class Handler(BaseHTTPRequestHandler):
                             "steam_api_key_set": bool(skey.strip())})
             elif m := re.match(r"^/api/tasks/([\w-]+)$", self.path):
                 self._json(TASKS.get(m.group(1), {"status": "unknown"}))
+            elif self.path == "/api/dlss_preset_defaults":
+                self._json(get_dlss_preset_defaults())
             else:
                 self._json({"error": "not found"}, 404)
         except Exception as e:
@@ -4575,6 +4790,8 @@ class Handler(BaseHTTPRequestHandler):
             elif m := re.match(r"^/api/game/(\d+)/launch_options$", self.path):
                 self._json(set_launch_options(root, m.group(1), body.get("value", ""),
                                               close_steam=bool(body.get("close_steam"))))
+            elif self.path == "/api/dlss_preset_defaults":
+                self._json(set_dlss_preset_defaults(body.get("settings", {})))
             elif self.path == "/api/env/shaders":
                 self._json(set_environment_shaders(
                     bool(body.get("enable")), body.get("size_bytes")))
