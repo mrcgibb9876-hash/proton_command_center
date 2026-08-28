@@ -966,6 +966,31 @@ class PCCTests(unittest.TestCase):
         r2 = pcc.detect_game_graphics_api(exe)
         self.assertEqual(r2["api"], "d3d11")
 
+    def test_find_game_exe_prefers_exe_with_graphics_api_import(self):
+        """Regression: live-testing surfaced a real case (The Witcher 3)
+        where a 642MB setup_redlauncher.exe at the game root dwarfs the
+        real 86MB bin/x64/witcher3.exe, so the old plain largest-file
+        heuristic always picked the launcher stub. A launcher/installer has
+        no reason to import a graphics API DLL; the real game exe always
+        does - a checkable PE-import signal, not another size/name guess."""
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        huge_launcher = d / "setup_launcher.exe"
+        huge_launcher.write_bytes(b"x" * 5_000_000)  # not a valid PE - no imports at all
+        (d / "bin/x64").mkdir(parents=True)
+        real_exe = d / "bin/x64/Game.exe"
+        real_exe.write_bytes(_build_fake_pe64(regular_dlls=["d3d11.dll"]))
+        self.assertEqual(pcc._find_game_exe(d), real_exe)
+
+    def test_find_game_exe_falls_back_to_largest_when_none_import_graphics_api(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        small = d / "small.exe"
+        small.write_bytes(b"x" * 1_000)
+        large = d / "large.exe"
+        large.write_bytes(b"y" * 5_000)
+        self.assertEqual(pcc._find_game_exe(d), large)
+
     # ---- RHI: ReShade install ----
     def _fake_game_exe(self, dlls=("d3d11.dll",)):
         d = self.root / "steamapps/common/TestGame"
@@ -1007,18 +1032,22 @@ class PCCTests(unittest.TestCase):
 
     def test_scan_game_reshade_remembers_override_exe(self):
         """Regression: after installing against a manually-overridden exe
-        (because _find_game_exe's largest-.exe heuristic picked the wrong
-        one - a real launcher/setup binary bigger than the actual game exe,
-        confirmed live against The Witcher 3), status must keep reporting
-        the exe that was actually used, not re-run the same wrong guess."""
+        (because a manual exe-override was needed in the first place - e.g.
+        two candidates both import a graphics API, a genuinely ambiguous
+        case the import-based heuristic still can't resolve on its own),
+        status must keep reporting the exe that was actually used, not
+        re-run the auto-detect guess."""
         d = self.root / "steamapps/common/TestGame"
         d.mkdir(parents=True, exist_ok=True)
-        decoy = d / "setup_launcher.exe"
-        decoy.write_bytes(b"x" * 50_000)  # bigger than the real fake PE below
+        # Both are valid PE64s that import a graphics DLL, so the
+        # graphics-API-import heuristic can't distinguish them by that
+        # signal alone - it falls back to size, picking the larger decoy.
+        decoy = d / "launcher.exe"
+        decoy.write_bytes(_build_fake_pe64(regular_dlls=["d3d11.dll"]) + b"\x00" * 10_000)
         (d / "bin/x64").mkdir(parents=True)
         real_exe = d / "bin/x64/Game.exe"
         real_exe.write_bytes(_build_fake_pe64(regular_dlls=["d3d11.dll"]))
-        # sanity: the auto-detect heuristic really would pick the wrong one
+        # sanity: the auto-detect heuristic really would pick the (larger) decoy
         self.assertEqual(pcc._find_game_exe(d), decoy)
 
         engine_dir = pcc.RESHADE_STAGING_DIR / "9.9.9"
@@ -1536,6 +1565,25 @@ class PCCTests(unittest.TestCase):
         self.assertEqual(r["deployed"], 1)
         self.assertEqual((d / "renodx-dlss5.addon64").read_bytes(), b"fake renodx dlss5 addon binary")
         self.assertEqual((d / "nvngx_dlssnr.dll").read_bytes(), b"fake dlssnr dll")
+
+    def test_deploy_reshade_addons_reports_skipped_with_reason(self):
+        """Regression: a real user hit this - RenoDX DLSS5 has no 32-bit
+        build, and their ReShade install had (incorrectly, from a separate
+        exe-detection bug) recorded bitness=32, so deploy silently returned
+        0 with no explanation. Skipped addons must now say why."""
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        state = pcc.load_state()
+        state["reshade_addons_catalog"] = {"ts": pcc.time.time(), "data": [
+            {"id": "renodx-dlss5", "name": "RenoDX DLSS5 Setup (RTX 50 Series only)",
+             "description": "", "download_url32": None, "download_url64": "http://x/dlss5.zip",
+             "zip_member": "renodx-dlss5.addon64", "repository_url": ""}]}
+        pcc.save_state(state)
+        r = pcc.deploy_reshade_addons(str(d), ["renodx-dlss5"], 32)
+        self.assertEqual(r["deployed"], 0)
+        self.assertEqual(len(r["skipped"]), 1)
+        self.assertIn("32-bit", r["skipped"][0])
+        self.assertFalse((d / "renodx-dlss5.addon32").exists())
 
     def test_deploy_renodx_dlss5_never_overwrites_existing_nr_dll(self):
         import zipfile, io

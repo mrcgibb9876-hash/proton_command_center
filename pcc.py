@@ -2394,10 +2394,22 @@ def restore_dll(game_dll_path) -> dict:
 
 
 def _find_game_exe(install_path):
-    """Best-effort: the largest .exe in the install tree, skipping obvious
-    installers/redistributables/anti-cheat launchers by name. Nothing on disk
-    says which file is the real game binary, so this is a heuristic - the
-    API-override dropdown in the UI exists for when it guesses wrong."""
+    """Best-effort: prefers the largest .exe that actually imports a known
+    graphics API DLL (d3d9/d3d11/d3d12/dxgi/opengl32/vulkan-1) over one that
+    doesn't, skipping obvious installers/redistributables/anti-cheat
+    launchers by name first. A pure launcher/installer stub - however large
+    - has no reason to link against a graphics API at all, while the real
+    game binary always does; this is a real, checkable signal (PE import
+    table), not another name-based guess. Confirmed against a real case
+    live: The Witcher 3 ships a 642MB `setup_redlauncher.exe` at its
+    install root - far bigger than the real `bin/x64/witcher3.exe` (86MB)
+    - which the old largest-file-wins heuristic (also RHI's own approach,
+    per PeHeaderService.FindGameExe - not solved better upstream either)
+    always picked instead. Only the top candidates by size are PE-scanned
+    (bounded cost regardless of how many .exe files a game ships), and
+    falls back to the plain largest-file heuristic if none of them import
+    a graphics DLL - the API-override field in the UI exists for when even
+    this guesses wrong."""
     base = Path(install_path)
     if not base.is_dir():
         return None
@@ -2405,7 +2417,7 @@ def _find_game_exe(install_path):
     SKIP_NAME_HINTS = ("unins", "redist", "vcredist", "directx", "dxsetup",
                        "crashreporter", "crashpad", "easyanticheat",
                        "battleye", "vc_redist")
-    best, best_size = None, -1
+    candidates = []
     for dirpath, dirnames, filenames in os.walk(base):
         dirnames[:] = [d for d in dirnames if d.lower() not in SKIP_DIRS]
         for fn in filenames:
@@ -2417,9 +2429,23 @@ def _find_game_exe(install_path):
                 size = p.stat().st_size
             except OSError:
                 continue
-            if size > best_size:
-                best, best_size = p, size
-    return best
+            candidates.append((size, p))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0], reverse=True)
+
+    best_with_api, best_with_api_size = None, -1
+    for size, p in candidates[:10]:
+        try:
+            _, regular, delay = pe_imports(p)
+            api = detect_graphics_api(regular, delay)
+        except Exception:
+            continue
+        if api and size > best_with_api_size:
+            best_with_api, best_with_api_size = p, size
+    if best_with_api:
+        return best_with_api
+    return candidates[0][1]
 
 
 # --------------------------------------------------------------------------
@@ -3667,10 +3693,15 @@ def deploy_reshade_addons(install_path, addon_ids, bitness, task_id=None) -> dic
     deployments = state.setdefault("rhi_addon_deployments", {})
     prev = set(deployments.get(str(install_path), []))
     new_files = set()
+    skipped = []
 
     for aid in addon_ids:
         addon = catalog.get(aid)
-        if not addon or not addon.get(url_key):
+        if not addon:
+            skipped.append(f"{aid} (not in catalog)")
+            continue
+        if not addon.get(url_key):
+            skipped.append(f"{addon['name']} (no {bitness}-bit build available)")
             continue
         if task_id:
             TASKS[task_id] = {"status": "running", "progress": 10,
@@ -3703,11 +3734,13 @@ def deploy_reshade_addons(install_path, addon_ids, bitness, task_id=None) -> dic
 
     deployments[str(install_path)] = sorted(new_files)
     save_state(state)
+    detail = f"{len(new_files)} addon(s) deployed"
+    if skipped:
+        detail += f" - skipped: {', '.join(skipped)}"
     if task_id:
-        TASKS[task_id] = {"status": "done", "progress": 100,
-                          "detail": f"{len(new_files)} addon(s) deployed",
-                          "result": {"deployed": len(new_files)}}
-    return {"deployed": len(new_files)}
+        TASKS[task_id] = {"status": "done", "progress": 100, "detail": detail,
+                          "result": {"deployed": len(new_files), "skipped": skipped}}
+    return {"deployed": len(new_files), "skipped": skipped}
 
 
 def remove_reshade_addons(install_path) -> dict:

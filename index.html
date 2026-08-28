@@ -2227,7 +2227,12 @@ $("#rhiAddonsDeployBtn").addEventListener("click",async()=>{
     const {task}=await post("/api/rhi/addons/deploy",{appid:current.appid,addon_ids:addonIds});
     trackTask(task,"#rhiAddonsBar",(t)=>{
       btn.disabled=false;
-      if(t.result)toast(`Deployed ${t.result.deployed} addon(s)`);
+      if(t.result){
+        const skipped=t.result.skipped||[];
+        const msg=`Deployed ${t.result.deployed} addon(s)`
+          +(skipped.length?` — skipped: ${skipped.join(", ")}`:"");
+        toast(msg,skipped.length>0&&t.result.deployed===0);
+      }
       loadRhiAddons(current.appid);
     },"#rhiAddonsDetail");
   }catch(e){toast(e.message,true);btn.disabled=false}
