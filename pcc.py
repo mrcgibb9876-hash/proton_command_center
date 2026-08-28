@@ -2781,17 +2781,19 @@ def list_custom_reshade_files() -> list:
 
 
 def _identify_dxgi_file(path) -> str:
-    """Is an existing dxgi.dll ours (ReShade), OptiScaler's, or something
+    """Is an existing dxgi.dll ours (ReShade/OptiScaler/DXVK), or something
     foreign? Positive evidence only, never guessed from size alone - port
-    of RHI's IdentifyDxgiFile (minus the DXVK branch - DXVK variant
-    management isn't built in pcc.py yet)."""
+    of RHI's IdentifyDxgiFile. Signature scans run regardless of file size
+    (OptiScaler's real release is ~25MB - a size gate ahead of the scan
+    would wrongly call it "unknown" and let a later ReShade/DXVK install
+    clobber it as foreign); the 15MB cutoff only applies to the ReShade-
+    specific staged-size-comparison fallback below, which really is
+    ReShade-only and safe to skip for anything that large."""
     path = Path(path)
     try:
         size = path.stat().st_size
     except OSError:
         return "unknown"
-    if size > 15_000_000:
-        return "unknown"          # far too big to be ReShade
     try:
         data = path.read_bytes()
     except OSError:
@@ -2800,6 +2802,10 @@ def _identify_dxgi_file(path) -> str:
         return "reshade"
     if b"OptiScaler" in data:
         return "optiscaler"
+    if b"dxvk" in data or b"DXVK_" in data:
+        return "dxvk"
+    if size > 15_000_000:
+        return "unknown"          # far too big to be a staged ReShade build
     search_dirs = ([RESHADE_NIGHTLY_STAGING_DIR, RESHADE_CUSTOM_DIR]
                    + list(RESHADE_STAGING_DIR.glob("*"))
                    + list(RESHADE_NORMAL_STAGING_DIR.glob("*"))
@@ -3454,13 +3460,118 @@ def _deploy_shader_packs_task(task_id, install_path, pack_ids) -> None:
 # --------------------------------------------------------------------------
 # ReShade's own community addon directory (crosire/reshade-shaders' `list`
 # branch) - the same source RHI fetches from. Deliberately does NOT include
-# RHI's 2 hardcoded RenoDX-specific addon entries (renodx-devkit,
-# renodx-dlssfix): their exact download filenames weren't verified against
-# real source during this port's research, and fabricating a URL that might
-# 404 is worse than just not offering them - can be added later once
-# confirmed against the real clshortfuse/renodx releases page.
+# RHI's "renodx-devkit"/"renodx-dlssfix" hardcoded entries: their exact
+# download filenames weren't verified against real source during this
+# port's original research. "RenoDX DLSS5 Setup" (below) WAS verified
+# directly against RHI's real Renodx5AddonService.cs + a live GitHub
+# releases check, so it's included as a real catalog entry rather than
+# left out - the same standard, applied once the source was confirmed.
 RESHADE_ADDONS_INI_URL = "https://raw.githubusercontent.com/crosire/reshade-shaders/list/Addons.ini"
 RESHADE_ADDONS_CACHE_FILE = RHI_DATA_DIR / "addons_cache.ini"
+
+# RenoDX DLSS5 addon (RTX 50-series-only) - hosted on RankFTW/rhi-repo under
+# a renodx-dlss5-<version> release tag, confirmed live (v2.5 at research
+# time: asset "renodx-dlss5_2.5.zip", tag "renodx-dlss5-2.5"). Port of
+# Renodx5AddonService.cs. Ships 64-bit only - no .addon32 exists upstream.
+RENODX_DLSS5_RELEASES_API = "https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100"
+RENODX_DLSS5_TAG_PREFIX = "renodx-dlss5-"
+RENODX_DLSS5_ADDON_FILE = "renodx-dlss5.addon64"
+# RHI's own small curated DLSS manifest (distinct from the much larger
+# beeradmoore/dlss-swapper-manifest-builder one Part 2's OptiScaler DLSS
+# swap uses) - confirmed live to be the only source with a "dlssnr" entry
+# (NVIDIA's DLSS Neural Rendering component, required by RenoDX DLSS5,
+# 50-series GPUs only): version 310.8.0 at research time, a zip asset on
+# RankFTW/rhi-repo.
+RHI_DLSS_MANIFEST_URL = "https://raw.githubusercontent.com/RankFTW/RHI/main/dlss_manifest.json"
+DLSSNR_DLL_NAME = "nvngx_dlssnr.dll"
+DLSSNR_CACHE_DIR = RHI_DATA_DIR / "dlssnr"
+
+
+def renodx_dlss5_latest():
+    """Latest RenoDX DLSS5 addon release, 6h cached. Port of
+    Renodx5AddonService.FetchLatestReleaseInfoAsync - scans all releases
+    for the renodx-dlss5- tag prefix and picks the highest parsed version,
+    since (unlike every other RHI-port catalog here) this repo has no
+    single 'latest' release to rely on."""
+    state = load_state()
+    cache = state.get("renodx_dlss5_latest")
+    now = time.time()
+    if cache and now - cache.get("ts", 0) < 21600:
+        return cache["data"]
+    try:
+        releases = _gh_json(RENODX_DLSS5_RELEASES_API)
+    except Exception:
+        return None
+    best = None
+    for release in releases:
+        tag = release.get("tag_name") or ""
+        if not tag.startswith(RENODX_DLSS5_TAG_PREFIX):
+            continue
+        version = tag[len(RENODX_DLSS5_TAG_PREFIX):]
+        asset = next((a for a in release.get("assets", [])
+                     if a["name"].lower() == RENODX_DLSS5_ADDON_FILE
+                     or (a["name"].lower().endswith(".zip")
+                         and a["name"].lower().startswith("renodx-dlss5"))), None)
+        if not asset:
+            continue
+        parsed = tuple(int(x) if x.isdigit() else 0 for x in version.split("."))
+        if best is None or parsed > best[0]:
+            best = (parsed, {"version": version, "url": asset["browser_download_url"],
+                             "asset_name": asset["name"]})
+    if not best:
+        return None
+    data = best[1]
+    state["renodx_dlss5_latest"] = {"ts": now, "data": data}
+    save_state(state)
+    return data
+
+
+def _rhi_dlss_manifest() -> dict:
+    state = load_state()
+    cache = state.get("rhi_dlss_manifest")
+    now = time.time()
+    if cache and now - cache.get("ts", 0) < 21600:
+        return cache["data"]
+    req = urllib.request.Request(RHI_DLSS_MANIFEST_URL, headers={"User-Agent": "pcc"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read())
+    state["rhi_dlss_manifest"] = {"ts": now, "data": data}
+    save_state(state)
+    return data
+
+
+def ensure_dlssnr_cached() -> Path | None:
+    """Downloads+caches the latest nvngx_dlssnr.dll from RHI's own curated
+    manifest - the required companion for the RenoDX DLSS5 addon."""
+    import zipfile, io
+    entries = _rhi_dlss_manifest().get("dlssnr") or []
+    if not entries:
+        return None
+    entry = entries[0]
+    version_dir = DLSSNR_CACHE_DIR / entry["version"]
+    cached = version_dir / DLSSNR_DLL_NAME
+    if cached.is_file():
+        return cached
+    data = _gh_bytes(entry["url"])
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        names = [n for n in zf.namelist() if n.lower().endswith(DLSSNR_DLL_NAME)]
+        if not names:
+            return None
+        version_dir.mkdir(parents=True, exist_ok=True)
+        cached.write_bytes(zf.read(names[0]))
+    return cached
+
+
+def _deploy_dlssnr_if_absent(install_path) -> None:
+    """Copies nvngx_dlssnr.dll to the addon's install dir if not already
+    present - never overwrites an existing copy (matches
+    DeployNrDllIfAbsentAsync's own no-op-if-present behavior)."""
+    dest = Path(install_path) / DLSSNR_DLL_NAME
+    if dest.is_file():
+        return
+    src = ensure_dlssnr_cached()
+    if src:
+        shutil.copy2(src, dest)
 
 
 def _slugify_addon_name(name) -> str:
@@ -3521,6 +3632,19 @@ def reshade_addons_catalog() -> list:
             "download_url64": a.get("DownloadUrl64") or a.get("DownloadUrl"),
             "repository_url": a.get("RepositoryUrl", "")}
            for a in parsed]
+    try:
+        dlss5 = renodx_dlss5_latest()
+    except Exception:
+        dlss5 = None
+    if dlss5:
+        data.append({
+            "id": "renodx-dlss5", "name": "RenoDX DLSS5 Setup (RTX 50 Series only)",
+            "description": "Sets up RenoDX for DLSS5 and deploys the required "
+                           "nvngx_dlssnr.dll alongside it. RTX 50-series GPUs only.",
+            "download_url32": None, "download_url64": dlss5["url"],
+            "zip_member": RENODX_DLSS5_ADDON_FILE,
+            "repository_url": "https://github.com/RankFTW/rhi-repo",
+        })
     state["reshade_addons_catalog"] = {"ts": now, "data": data}
     save_state(state)
     return data
@@ -3552,12 +3676,30 @@ def deploy_reshade_addons(install_path, addon_ids, bitness, task_id=None) -> dic
             TASKS[task_id] = {"status": "running", "progress": 10,
                               "detail": f"Downloading {addon['name']}"}
         data = _gh_bytes(addon[url_key], task_id)
+        zip_member = addon.get("zip_member")
+        if zip_member:
+            import zipfile, io
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                names = [n for n in zf.namelist() if n.lower().endswith(zip_member.lower())]
+                if not names:
+                    continue
+                data = zf.read(names[0])
         fname = f"{aid}.{ext}"
         (install_path / fname).write_bytes(data)
         new_files.add(fname)
 
     for stale in prev - new_files:
         (install_path / stale).unlink(missing_ok=True)
+
+    # RenoDX DLSS5's required companion DLL - deployed once, never
+    # overwritten or removed alongside the addon (matches RHI's own
+    # DeployNrDllIfAbsentAsync/Uninstall behavior - a persistent asset,
+    # not tied 1:1 to the addon's own lifecycle).
+    if "renodx-dlss5" in addon_ids and f"renodx-dlss5.{ext}" in new_files:
+        try:
+            _deploy_dlssnr_if_absent(install_path)
+        except Exception:
+            pass
 
     deployments[str(install_path)] = sorted(new_files)
     save_state(state)
@@ -4185,6 +4327,30 @@ def install_optiscaler(appid, install_path, exe_override=None, gpu_type=None,
             rs_rec["path"] = str(rs_dest)
             save_state(state)
 
+    # DXVK coexistence - move a conflicting DXVK DLL into OptiScaler/plugins/
+    # BEFORE the deploy loop below, so the plain _backup_original_if_exists
+    # step never mistakes DXVK's own file for a game original (it doesn't
+    # do identity checks - it backs up whatever is already there). Port of
+    # the reverse direction of Part 3's _resolve_dxvk_dll_targets.
+    dxvk_rec = state.get("rhi_dxvk_installs", {}).get(str(appid))
+    if dxvk_rec and Path(dxvk_rec["install_path"]) == target_dir:
+        installed_dlls = list(dxvk_rec.get("installed_dlls", []))
+        conflicting = [d for d in installed_dlls if d.lower() == effective_dll_name.lower()]
+        if conflicting:
+            plugins_dir = target_dir / "OptiScaler" / "plugins"
+            plugins_dir.mkdir(parents=True, exist_ok=True)
+            for dll in conflicting:
+                src = target_dir / dll
+                if src.is_file():
+                    dest = plugins_dir / dll
+                    dest.unlink(missing_ok=True)
+                    src.rename(dest)
+                    installed_dlls.remove(dll)
+                    dxvk_rec.setdefault("plugin_dlls", []).append(dll)
+            dxvk_rec["installed_dlls"] = installed_dlls
+            state.setdefault("rhi_dxvk_installs", {})[str(appid)] = dxvk_rec
+            save_state(state)
+
     if task_id and task_id in TASKS:
         TASKS[task_id]["detail"] = "Deploying OptiScaler files"
         TASKS[task_id]["progress"] = 80
@@ -4369,6 +4535,24 @@ def remove_optiscaler(appid) -> dict:
         if plugins_dir.is_dir() and not any(plugins_dir.iterdir()):
             plugins_dir.rmdir()
 
+    # DXVK coexistence - move any DXVK DLL parked in OptiScaler/plugins/
+    # back to the game root before the OptiScaler/ subfolder gets removed
+    # below, so removing OptiScaler never takes DXVK's files down with it.
+    dxvk_rec = state.get("rhi_dxvk_installs", {}).get(str(appid))
+    if dxvk_rec and dxvk_rec.get("plugin_dlls"):
+        dxvk_plugins_dir = target_dir / "OptiScaler" / "plugins"
+        remaining = []
+        for dll in list(dxvk_rec["plugin_dlls"]):
+            src = dxvk_plugins_dir / dll
+            dest = target_dir / dll
+            if src.is_file() and not dest.exists():
+                src.rename(dest)
+                dxvk_rec.setdefault("installed_dlls", []).append(dll)
+            else:
+                remaining.append(dll)
+        dxvk_rec["plugin_dlls"] = remaining
+        state.setdefault("rhi_dxvk_installs", {})[str(appid)] = dxvk_rec
+
     optiscaler_subdir = target_dir / "OptiScaler"
     if optiscaler_subdir.is_dir():
         shutil.rmtree(optiscaler_subdir, ignore_errors=True)
@@ -4491,6 +4675,708 @@ def update_optiscaler(appid, task_id=None) -> dict:
 def _update_optiscaler_task(task_id, appid) -> None:
     try:
         update_optiscaler(appid, task_id=task_id)
+    except Exception as e:
+        TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
+
+
+# --------------------------------------------------------------------------
+# RHI port: DXVK variant management (Development/Stable/Lilium HDR)
+# --------------------------------------------------------------------------
+# RHI's own DXVK+ReShade coexistence relies on switching ReShade to a
+# global Vulkan implicit layer - the same Windows-only mechanism Part 1d
+# already confirmed dead under Wine/Proton. This port replaces it with the
+# rename-based coexistence pattern already shipped for OptiScaler+ReShade
+# (rename the conflicting file to ReShade64.dll, restore on removal)
+# instead of porting the broken mechanism.
+DXVK_DATA_DIR = RHI_DATA_DIR / "dxvk"
+DXVK_DEV_DIR = DXVK_DATA_DIR / "development"      # nightly.link master builds, .zip
+DXVK_STABLE_DIR = DXVK_DATA_DIR / "stable"        # doitsujin/dxvk tagged releases, .tar.gz
+DXVK_LILIUM_DIR = DXVK_DATA_DIR / "lilium"        # EndlesslyFlowering/dxvk HDR fork, .7z
+DXVK_VARIANTS = ("development", "stable", "lilium")
+
+DXVK_NIGHTLY_LINK_URL = "https://nightly.link/doitsujin/dxvk/workflows/artifacts/master"
+DXVK_STABLE_RELEASES_API = "https://api.github.com/repos/doitsujin/dxvk/releases/latest"
+DXVK_LILIUM_RELEASES_API = "https://api.github.com/repos/EndlesslyFlowering/dxvk/releases/latest"
+
+# DX9-11 only - ported from DetermineRequiredDlls, DX8 dropped (RHI's own
+# source is internally inconsistent about its DLL name, see plan notes).
+DXVK_REQUIRED_DLLS = {
+    "d3d9": ["d3d9.dll"],
+    "d3d10": ["d3d10core.dll", "dxgi.dll"],
+    "d3d11": ["d3d11.dll", "dxgi.dll"],
+}
+
+DXVK_DEFAULT_CONF = (
+    "dxgi.enableHDR = True\n"
+    "dxvk.allowFse = False\n"
+    "dxvk.latencySleep = Auto\n"
+    "d3d9.dpiAware = True\n"
+)
+
+# Ported verbatim from DxvkService.cs's LiliumD3d9Presets/LiliumD3d11Presets
+# (real authored data, not invented) - each is a COMPLETE dxvk.conf, no
+# base lines prepended. Async is always enabled (RHI is Windows-only there
+# too - not a Linux-specific addition).
+DXVK_LILIUM_D3D9_PRESETS = [
+    ("Safest", """dxvk.enableAsync = true
+dxvk.gplAsyncCache = true
+d3d9.enableSwapChainUpgrade = true
+d3d9.upgradeSwapChainFormatTo = rgba16_sfloat
+d3d9.upgradeSwapChainColorSpaceTo = scRGB
+d3d9.enforceWindowModeInternally = disabled
+"""),
+    ("2nd Safest", """dxvk.enableAsync = true
+dxvk.gplAsyncCache = true
+d3d9.enableBackBufferUpgrade = true
+d3d9.upgradeBackBufferTo = rgba16_unorm
+d3d9.enableSwapChainUpgrade = true
+d3d9.upgradeSwapChainFormatTo = rgba16_sfloat
+d3d9.upgradeSwapChainColorSpaceTo = scRGB
+d3d9.enforceWindowModeInternally = disabled
+"""),
+    ("Slightly Unsafe", """dxvk.enableAsync = true
+dxvk.gplAsyncCache = true
+d3d9.enableSwapChainUpgrade = true
+d3d9.upgradeSwapChainFormatTo = rgba16_sfloat
+d3d9.upgradeSwapChainColorSpaceTo = scRGB
+d3d9.enableBackBufferUpgrade = true
+d3d9.upgradeBackBufferTo = rgba16_sfloat
+d3d9.enforceWindowModeInternally = disabled
+"""),
+    ("Unsafer", """dxvk.enableAsync = true
+dxvk.gplAsyncCache = true
+d3d9.enableRenderTargetUpgrades = true
+d3d9.upgrade_B5G6R5_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_BGR5A1_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_BGR5X1_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_BGRA4_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_BGRX4_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_RGBA8_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_RGBX8_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_BGRA8_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_BGRX8_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_RGB10A2_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_BGR10A2_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_RGBA16_UNORM_renderTargetTo = rgba16_unorm
+d3d9.enableBackBufferUpgrade = true
+d3d9.upgradeBackBufferTo = rgba16_unorm
+d3d9.enableSwapChainUpgrade = true
+d3d9.upgradeSwapChainFormatTo = rgba16_sfloat
+d3d9.upgradeSwapChainColorSpaceTo = scRGB
+d3d9.enforceWindowModeInternally = disabled
+"""),
+    ("Even Unsafer", """dxvk.enableAsync = true
+dxvk.gplAsyncCache = true
+d3d9.enableRenderTargetUpgrades = true
+d3d9.upgrade_B5G6R5_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_BGR5A1_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_BGR5X1_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_BGRA4_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_BGRX4_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_RGBA8_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_RGBX8_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_BGRA8_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_BGRX8_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_RGB10A2_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_BGR10A2_UNORM_renderTargetTo = rgba16_unorm
+d3d9.upgrade_RGBA16_UNORM_renderTargetTo = rgba16_unorm
+d3d9.enableBackBufferUpgrade = true
+d3d9.upgradeBackBufferTo = rgba16_sfloat
+d3d9.enableSwapChainUpgrade = true
+d3d9.upgradeSwapChainFormatTo = rgba16_sfloat
+d3d9.upgradeSwapChainColorSpaceTo = scRGB
+d3d9.enforceWindowModeInternally = disabled
+"""),
+    ("Experimental", """dxvk.enableAsync = true
+dxvk.gplAsyncCache = true
+d3d9.enableRenderTargetUpgrades = true
+d3d9.upgrade_B5G6R5_UNORM_renderTargetTo = rgba16_sfloat
+d3d9.upgrade_BGR5A1_UNORM_renderTargetTo = rgba16_sfloat
+d3d9.upgrade_BGR5X1_UNORM_renderTargetTo = rgba16_sfloat
+d3d9.upgrade_BGRA4_UNORM_renderTargetTo = rgba16_sfloat
+d3d9.upgrade_BGRX4_UNORM_renderTargetTo = rgba16_sfloat
+d3d9.upgrade_RGBA8_UNORM_renderTargetTo = rgba16_sfloat
+d3d9.upgrade_RGBX8_UNORM_renderTargetTo = rgba16_sfloat
+d3d9.upgrade_BGRA8_UNORM_renderTargetTo = rgba16_sfloat
+d3d9.upgrade_BGRX8_UNORM_renderTargetTo = rgba16_sfloat
+d3d9.upgrade_RGB10A2_UNORM_renderTargetTo = rgba16_sfloat
+d3d9.upgrade_BGR10A2_UNORM_renderTargetTo = rgba16_sfloat
+d3d9.upgrade_RGBA16_UNORM_renderTargetTo = rgba16_sfloat
+d3d9.enableBackBufferUpgrade = true
+d3d9.upgradeBackBufferTo = rgba16_sfloat
+d3d9.enableSwapChainUpgrade = true
+d3d9.upgradeSwapChainFormatTo = rgba16_sfloat
+d3d9.upgradeSwapChainColorSpaceTo = scRGB
+d3d9.enforceWindowModeInternally = disabled
+"""),
+]
+
+DXVK_LILIUM_D3D11_PRESETS = [
+    ("Safest", """dxvk.enableAsync = true
+dxvk.gplAsyncCache = true
+d3d11.enableSwapChainUpgrade = true
+d3d11.upgradeSwapChainFormatTo = rgba16_sfloat
+d3d11.upgradeSwapChainColorSpaceTo = scRGB
+"""),
+    ("2nd Safest", """dxvk.enableAsync = true
+dxvk.gplAsyncCache = true
+d3d11.enableBackBufferUpgrade = true
+d3d11.upgradeBackBufferTo = rgba16_unorm
+d3d11.enableSwapChainUpgrade = true
+d3d11.upgradeSwapChainFormatTo = rgba16_sfloat
+d3d11.upgradeSwapChainColorSpaceTo = scRGB
+"""),
+    ("Slightly Unsafe", """dxvk.enableAsync = true
+dxvk.gplAsyncCache = true
+d3d11.enableBackBufferUpgrade = true
+d3d11.upgradeBackBufferTo = rgba16_sfloat
+d3d11.enableSwapChainUpgrade = true
+d3d11.upgradeSwapChainFormatTo = rgba16_sfloat
+d3d11.upgradeSwapChainColorSpaceTo = scRGB
+"""),
+    ("Unsafer", """dxvk.enableAsync = true
+dxvk.gplAsyncCache = true
+d3d11.enableRenderTargetUpgrades = true
+d3d11.upgrade_RGBA8_UNORM_renderTargetTo = rgba16_unorm
+d3d11.upgrade_BGRA8_UNORM_renderTargetTo = rgba16_unorm
+d3d11.upgrade_BGRX8_UNORM_renderTargetTo = rgba16_unorm
+d3d11.upgrade_RGBA8_UNORM_SRGB_renderTargetTo = rgba16_unorm
+d3d11.upgrade_BGRA8_UNORM_SRGB_renderTargetTo = rgba16_unorm
+d3d11.upgrade_BGRX8_UNORM_SRGB_renderTargetTo = rgba16_unorm
+d3d11.upgrade_RGBA8_TYPELESS_renderTargetTo = rgba16_typeless
+d3d11.upgrade_BGRA8_TYPELESS_renderTargetTo = rgba16_typeless
+d3d11.upgrade_BGRX8_TYPELESS_renderTargetTo = rgba16_typeless
+d3d11.upgrade_RGB10A2_UNORM_renderTargetTo = rgba16_unorm
+d3d11.upgrade_RGB10A2_TYPELESS_renderTargetTo = rgba16_typeless
+d3d11.enableBackBufferUpgrade = true
+d3d11.upgradeBackBufferTo = rgba16_unorm
+d3d11.enableSwapChainUpgrade = true
+d3d11.upgradeSwapChainFormatTo = rgba16_sfloat
+d3d11.upgradeSwapChainColorSpaceTo = scRGB
+"""),
+    ("Even Unsafer", """dxvk.enableAsync = true
+dxvk.gplAsyncCache = true
+d3d11.enableRenderTargetUpgrades = true
+d3d11.upgrade_RGBA8_UNORM_renderTargetTo = rgba16_unorm
+d3d11.upgrade_BGRA8_UNORM_renderTargetTo = rgba16_unorm
+d3d11.upgrade_BGRX8_UNORM_renderTargetTo = rgba16_unorm
+d3d11.upgrade_RGBA8_UNORM_SRGB_renderTargetTo = rgba16_unorm
+d3d11.upgrade_BGRA8_UNORM_SRGB_renderTargetTo = rgba16_unorm
+d3d11.upgrade_BGRX8_UNORM_SRGB_renderTargetTo = rgba16_unorm
+d3d11.upgrade_RGBA8_TYPELESS_renderTargetTo = rgba16_typeless
+d3d11.upgrade_BGRA8_TYPELESS_renderTargetTo = rgba16_typeless
+d3d11.upgrade_BGRX8_TYPELESS_renderTargetTo = rgba16_typeless
+d3d11.upgrade_RGB10A2_UNORM_renderTargetTo = rgba16_unorm
+d3d11.upgrade_RGB10A2_TYPELESS_renderTargetTo = rgba16_typeless
+d3d11.enableBackBufferUpgrade = true
+d3d11.upgradeBackBufferTo = rgba16_sfloat
+d3d11.enableSwapChainUpgrade = true
+d3d11.upgradeSwapChainFormatTo = rgba16_sfloat
+d3d11.upgradeSwapChainColorSpaceTo = scRGB
+"""),
+    ("Slightly Experimental", """dxvk.enableAsync = true
+dxvk.gplAsyncCache = true
+d3d11.enableRenderTargetUpgrades = true
+d3d11.upgrade_RGBA8_UNORM_renderTargetTo = rgba16_sfloat
+d3d11.upgrade_BGRA8_UNORM_renderTargetTo = rgba16_sfloat
+d3d11.upgrade_BGRX8_UNORM_renderTargetTo = rgba16_sfloat
+d3d11.upgrade_RGBA8_UNORM_SRGB_renderTargetTo = rgba16_sfloat
+d3d11.upgrade_BGRA8_UNORM_SRGB_renderTargetTo = rgba16_sfloat
+d3d11.upgrade_BGRX8_UNORM_SRGB_renderTargetTo = rgba16_sfloat
+d3d11.upgrade_RGBA8_TYPELESS_renderTargetTo = rgba16_typeless
+d3d11.upgrade_BGRA8_TYPELESS_renderTargetTo = rgba16_typeless
+d3d11.upgrade_BGRX8_TYPELESS_renderTargetTo = rgba16_typeless
+d3d11.upgrade_RGB10A2_UNORM_renderTargetTo = rgba16_sfloat
+d3d11.upgrade_RGB10A2_TYPELESS_renderTargetTo = rgba16_typeless
+d3d11.enableBackBufferUpgrade = true
+d3d11.upgradeBackBufferTo = rgba16_sfloat
+d3d11.enableSwapChainUpgrade = true
+d3d11.upgradeSwapChainFormatTo = rgba16_sfloat
+d3d11.upgradeSwapChainColorSpaceTo = scRGB
+"""),
+    ("Fully Experimental", """dxvk.enableAsync = true
+dxvk.gplAsyncCache = true
+d3d11.enableRenderTargetUpgrades = true
+d3d11.upgrade_RGBA8_UNORM_renderTargetTo = rgba16_sfloat
+d3d11.upgrade_BGRA8_UNORM_renderTargetTo = rgba16_sfloat
+d3d11.upgrade_BGRX8_UNORM_renderTargetTo = rgba16_sfloat
+d3d11.upgrade_RGBA8_UNORM_SRGB_renderTargetTo = rgba16_sfloat
+d3d11.upgrade_BGRA8_UNORM_SRGB_renderTargetTo = rgba16_sfloat
+d3d11.upgrade_BGRX8_UNORM_SRGB_renderTargetTo = rgba16_sfloat
+d3d11.upgrade_RGBA8_TYPELESS_renderTargetTo = rgba16_typeless
+d3d11.upgrade_BGRA8_TYPELESS_renderTargetTo = rgba16_typeless
+d3d11.upgrade_BGRX8_TYPELESS_renderTargetTo = rgba16_typeless
+d3d11.upgrade_RGB10A2_UNORM_renderTargetTo = rgba16_sfloat
+d3d11.upgrade_RGB10A2_TYPELESS_renderTargetTo = rgba16_typeless
+d3d11.upgrade_RG11B10_UFLOAT_renderTargetTo = rgba16_sfloat
+d3d11.upgrade_RGBA16_UNORM_renderTargetTo = rgba16_sfloat
+d3d11.enableBackBufferUpgrade = true
+d3d11.upgradeBackBufferTo = rgba16_sfloat
+d3d11.enableSwapChainUpgrade = true
+d3d11.upgradeSwapChainFormatTo = rgba16_sfloat
+d3d11.upgradeSwapChainColorSpaceTo = scRGB
+"""),
+]
+
+
+def _dxvk_required_dlls(api) -> list:
+    dlls = DXVK_REQUIRED_DLLS.get(api or "")
+    if not dlls:
+        raise RuntimeError(f"DXVK doesn't support this game's graphics API "
+                           f"({api or 'unknown'}) - only D3D9/D3D10/D3D11 are supported.")
+    return dlls
+
+
+def get_dxvk_lilium_conf(api, preset_index=0) -> str:
+    presets = DXVK_LILIUM_D3D9_PRESETS if api == "d3d9" else DXVK_LILIUM_D3D11_PRESETS
+    if preset_index < 0 or preset_index >= len(presets):
+        preset_index = 0
+    return presets[preset_index][1]
+
+
+def _dxvk_staging_dir(variant) -> Path:
+    if variant not in DXVK_VARIANTS:
+        raise RuntimeError(f"Unknown DXVK variant: {variant}")
+    return {"development": DXVK_DEV_DIR, "stable": DXVK_STABLE_DIR, "lilium": DXVK_LILIUM_DIR}[variant]
+
+
+def dxvk_staging_version(variant):
+    p = _dxvk_staging_dir(variant) / "version.txt"
+    return p.read_text().strip() if p.is_file() else None
+
+
+def dxvk_staging_ready(variant) -> bool:
+    d = _dxvk_staging_dir(variant)
+    return (d / "x64" / "d3d9.dll").is_file() and (d / "version.txt").is_file()
+
+
+def dxvk_latest(variant) -> dict:
+    """Latest DXVK release metadata for one variant, 6h cached. Port of
+    EnsureStagingNightlyAsync/EnsureStagingGitHubAsync/EnsureStagingLiliumAsync
+    (Staging.cs) - each variant's real source, not a unified API."""
+    state = load_state()
+    cache_key = f"dxvk_latest_{variant}"
+    cache = state.get(cache_key)
+    now = time.time()
+    if cache and now - cache.get("ts", 0) < 21600:
+        return cache["data"]
+
+    if variant == "development":
+        req = urllib.request.Request(DXVK_NIGHTLY_LINK_URL, headers={"User-Agent": "Mozilla/5.0 pcc"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            html = r.read().decode("utf-8", "replace")
+        m = re.search(r'href="(https://nightly\.link/doitsujin/dxvk/[^"]*\.zip)"', html)
+        if not m:
+            raise RuntimeError("Couldn't find a current DXVK Development build on nightly.link")
+        url = m.group(1)
+        hm = re.search(r"dxvk-master-([0-9a-f]+)\.zip", url)
+        version = hm.group(1) if hm else "nightly-unknown"
+        data = {"version": version, "url": url, "asset_name": f"dxvk-master-{version}.zip"}
+    elif variant == "stable":
+        release = _gh_json(DXVK_STABLE_RELEASES_API)
+        asset = next((a for a in release.get("assets", [])
+                     if a["name"].lower().endswith(".tar.gz")), None)
+        if not asset:
+            raise RuntimeError("No .tar.gz asset found in the latest DXVK release")
+        data = {"version": release["tag_name"], "url": asset["browser_download_url"],
+                "asset_name": asset["name"]}
+    elif variant == "lilium":
+        release = _gh_json(DXVK_LILIUM_RELEASES_API)
+        asset = next((a for a in release.get("assets", [])
+                     if a["name"].lower().endswith(".7z")
+                     and "gplasync" not in a["name"].lower()), None)
+        if not asset:
+            raise RuntimeError("No non-gplasync .7z asset found in the latest Lilium HDR release")
+        data = {"version": release["tag_name"], "url": asset["browser_download_url"],
+                "asset_name": asset["name"]}
+    else:
+        raise RuntimeError(f"Unknown DXVK variant: {variant}")
+
+    state[cache_key] = {"ts": now, "data": data}
+    save_state(state)
+    return data
+
+
+def check_dxvk_update(variant) -> bool:
+    try:
+        info = dxvk_latest(variant)
+    except Exception:
+        return False
+    return dxvk_staging_ready(variant) and dxvk_staging_version(variant) != info["version"]
+
+
+def _find_dxvk_content_root(extract_dir, prefer=None) -> Path:
+    """Locates the folder containing x64/(+x32/) inside an extracted DXVK
+    archive. `prefer` (Lilium's "normal" subfolder, sibling of a gplasync
+    variant sometimes present too) is tried first, matching RHI's own
+    two-step search (Staging.cs:447-465); falls back to the parent of
+    whichever x64/ folder is found anywhere in the tree."""
+    if prefer:
+        hit = next(iter(extract_dir.rglob(prefer)), None)
+        if hit and hit.is_dir():
+            return hit
+    hit = next(iter(extract_dir.rglob("x64")), None)
+    if not hit:
+        raise RuntimeError("x64/ folder not found in the extracted DXVK archive "
+                           "(its release format may have changed)")
+    return hit.parent
+
+
+def _extract_dxvk_lilium_7z(archive, extract_dir) -> None:
+    seven_zip = _find_7z_binary()
+    if not seven_zip:
+        raise RuntimeError(
+            "DXVK's Lilium HDR variant needs the 7-Zip CLI to extract its .7z release - "
+            "install it first (Arch: `sudo pacman -S 7zip`, other distros: "
+            "the `p7zip` package) then try again.")
+    proc = subprocess.run([seven_zip, "x", str(archive), f"-o{extract_dir}", "-y"],
+                          capture_output=True, text=True, timeout=180)
+    if proc.returncode != 0:
+        raise RuntimeError(f"7z extraction failed: {proc.stderr.strip()[:300]}")
+
+
+def ensure_dxvk_staging(variant, task_id=None) -> Path:
+    """Downloads+extracts the latest DXVK release for one variant. Plain
+    zip (Development) and gzip-compressed tar (Stable) use stdlib
+    zipfile/tarfile directly - a real simplification over RHI's own code,
+    which shells out to 7z for these too since its own environment has no
+    stdlib equivalent. Only Lilium HDR's .7z needs the system `7z` binary
+    (reused from Part 2's OptiScaler staging, same dependency, nothing
+    new)."""
+    info = dxvk_latest(variant)
+    staging_dir = _dxvk_staging_dir(variant)
+    if dxvk_staging_ready(variant) and dxvk_staging_version(variant) == info["version"]:
+        return staging_dir
+
+    if variant == "lilium" and not _find_7z_binary():
+        raise RuntimeError(
+            "DXVK's Lilium HDR variant needs the 7-Zip CLI to extract its .7z release - "
+            "install it first (Arch: `sudo pacman -S 7zip`, other distros: "
+            "the `p7zip` package) then try again.")
+
+    if task_id:
+        TASKS[task_id] = {"status": "running", "progress": 10,
+                          "detail": f"Downloading DXVK {variant} {info['version']}"}
+    data = _gh_bytes(info["url"], task_id)
+
+    with tempfile.TemporaryDirectory(prefix="pcc_dxvk_") as tmp:
+        tmp = Path(tmp)
+        archive = tmp / info["asset_name"]
+        archive.write_bytes(data)
+        extract_dir = tmp / "extracted"
+        extract_dir.mkdir()
+        if task_id:
+            TASKS[task_id]["detail"] = "Extracting"
+            TASKS[task_id]["progress"] = 75
+
+        if variant == "lilium":
+            _extract_dxvk_lilium_7z(archive, extract_dir)
+            source_root = _find_dxvk_content_root(extract_dir, prefer="normal")
+        elif info["asset_name"].lower().endswith(".tar.gz"):
+            import tarfile
+            with tarfile.open(archive, "r:gz") as tf:
+                tf.extractall(extract_dir, filter="data")
+            source_root = _find_dxvk_content_root(extract_dir)
+        else:
+            import zipfile
+            with zipfile.ZipFile(archive) as zf:
+                zf.extractall(extract_dir)
+            source_root = _find_dxvk_content_root(extract_dir)
+
+        if staging_dir.is_dir():
+            shutil.rmtree(staging_dir)
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        for arch in ("x64", "x32"):
+            src = source_root / arch
+            if src.is_dir():
+                shutil.copytree(src, staging_dir / arch)
+
+    (staging_dir / "version.txt").write_text(info["version"])
+    if task_id:
+        TASKS[task_id]["detail"] = f"DXVK {info['version']} staged"
+        TASKS[task_id]["progress"] = 90
+    return staging_dir
+
+
+def _is_dxvk_file(path) -> bool:
+    """Byte-scan for DXVK's signature strings in the first 2MB - port of
+    IsDxvkFileStatic (DxvkService.cs:601-629)."""
+    try:
+        with Path(path).open("rb") as f:
+            data = f.read(2 * 1024 * 1024)
+    except OSError:
+        return False
+    return b"dxvk" in data or b"DXVK_" in data
+
+
+def detect_dxvk_installation(install_path, api) -> str | None:
+    """Scans the DLL names required for one graphics API for DXVK's
+    signature, in both the game root and OptiScaler/plugins/ - port of
+    DetectInstallation (Install.cs:706-765)."""
+    base = Path(install_path)
+    if not base.is_dir():
+        return None
+    try:
+        candidates = _dxvk_required_dlls(api)
+    except RuntimeError:
+        candidates = ["d3d9.dll", "d3d10core.dll", "d3d11.dll", "dxgi.dll"]
+    for dll in candidates:
+        if _is_dxvk_file(base / dll):
+            return dll
+    plugins_dir = base / "OptiScaler" / "plugins"
+    if plugins_dir.is_dir():
+        for dll in candidates:
+            if _is_dxvk_file(plugins_dir / dll):
+                return dll
+    return None
+
+
+def _resolve_dxvk_dll_targets(required_dlls, install_path) -> tuple:
+    """Splits required DXVK DLLs into (root_dlls, plugin_dlls): any DLL
+    whose filename collides with OptiScaler's own installed filename is
+    routed to OptiScaler/plugins/ instead of the game root - port of
+    ResolveDeploymentPaths (DxvkService.cs:558-582)."""
+    os_installed = detect_optiscaler_installation(install_path)
+    root_dlls, plugin_dlls = [], []
+    for dll in required_dlls:
+        if os_installed and dll.lower() == os_installed.lower():
+            plugin_dlls.append(dll)
+        else:
+            root_dlls.append(dll)
+    return root_dlls, plugin_dlls
+
+
+def scan_game_dxvk(appid, install_path, exe_path=None) -> dict:
+    """DXVK status for one game - detected graphics API (reused from Part
+    1a), whatever PCC has on record, and whether a newer release is staged
+    than what's installed."""
+    state = load_state()
+    rec = state.get("rhi_dxvk_installs", {}).get(str(appid))
+    if not exe_path and rec and rec.get("exe"):
+        exe_path = rec["exe"]
+    exe = Path(exe_path) if exe_path else _find_game_exe(install_path)
+    detected = detect_game_graphics_api(exe) if exe else {"bitness": None, "api": None}
+    result = {"exe": str(exe) if exe else None, "detected_api": detected["api"],
+             "detected_bitness": detected["bitness"], "installed": False,
+             "update_available": False}
+    if rec:
+        p = Path(rec["install_path"])
+        installed = all((p / dll).is_file() or (p / "OptiScaler" / "plugins" / dll).is_file()
+                        for dll in rec.get("installed_dlls", []) + rec.get("plugin_dlls", []))
+        result.update({"installed": installed, "install_path": rec["install_path"],
+                       "variant": rec.get("variant"), "api": rec.get("api"),
+                       "lilium_preset": rec.get("lilium_preset"), "version": rec.get("version")})
+        if installed:
+            try:
+                result["update_available"] = check_dxvk_update(rec["variant"])
+            except Exception:
+                pass
+    return result
+
+
+def install_dxvk(appid, install_path, variant, exe_override=None, lilium_preset=0,
+                 task_id=None) -> dict:
+    """Installs DXVK for one game: resolves the required DLLs from the
+    detected graphics API, routes any DLL that collides with an installed
+    OptiScaler's filename to OptiScaler/plugins/, renames a same-directory
+    ReShade out of the way first if it would otherwise collide, deploys
+    the staged build + dxvk.conf."""
+    if variant not in DXVK_VARIANTS:
+        raise RuntimeError(f"Unknown DXVK variant: {variant}")
+    exe = Path(exe_override).expanduser() if exe_override else _find_game_exe(install_path)
+    if not exe or not exe.is_file():
+        raise RuntimeError("Couldn't find the game's .exe under its install folder — "
+                           "point Command Center at it manually.")
+    detected = detect_game_graphics_api(exe)
+    api = detected["api"]
+    required_dlls = _dxvk_required_dlls(api)
+    bitness = detected["bitness"] or 64
+    arch = "x32" if bitness == 32 else "x64"
+    target_dir = exe.parent
+
+    staging_dir = ensure_dxvk_staging(variant, task_id=task_id)
+    version = dxvk_staging_version(variant)
+    for dll in required_dlls:
+        if not (staging_dir / arch / dll).is_file():
+            raise RuntimeError(f"Staged DLL not found: {dll} ({arch}) - try removing and "
+                               "reinstalling DXVK.")
+
+    root_dlls, plugin_dlls = _resolve_dxvk_dll_targets(required_dlls, str(target_dir))
+
+    # ReShade coexistence - same directory-scoped rename pattern as
+    # Part 2's OptiScaler+ReShade fix, not RHI's Vulkan-layer switch.
+    state = load_state()
+    rs_rec = state.get("rhi_reshade_installs", {}).get(str(appid))
+    reshade_renamed = False
+    if rs_rec:
+        rs_path = Path(rs_rec["path"])
+        if (rs_path.is_file() and rs_path.parent == target_dir
+                and rs_path.name.lower() in {d.lower() for d in root_dlls}
+                and rs_path.name.lower() != "reshade64.dll"):
+            rs_dest = target_dir / "ReShade64.dll"
+            if rs_dest.exists():
+                rs_dest.unlink()
+            rs_path.rename(rs_dest)
+            rs_rec["path"] = str(rs_dest)
+            save_state(state)
+            reshade_renamed = True
+
+    if task_id and task_id in TASKS:
+        TASKS[task_id]["detail"] = "Deploying DXVK files"
+        TASKS[task_id]["progress"] = 80
+
+    backed_up_files = []
+    for dll in root_dlls:
+        src = staging_dir / arch / dll
+        dest = target_dir / dll
+        if dest.is_file() and dest.name.lower() not in {d.lower() for d in backed_up_files}:
+            ident = _identify_dxgi_file(dest)
+            if ident == "unknown":
+                _backup_original_if_exists(dest)
+                backed_up_files.append(dll)
+            elif ident not in ("reshade", "optiscaler", "dxvk"):
+                _backup_original_if_exists(dest)
+                backed_up_files.append(dll)
+        shutil.copy2(src, dest)
+
+    if plugin_dlls:
+        plugins_dir = target_dir / "OptiScaler" / "plugins"
+        plugins_dir.mkdir(parents=True, exist_ok=True)
+        for dll in plugin_dlls:
+            shutil.copy2(staging_dir / arch / dll, plugins_dir / dll)
+
+    conf_path = target_dir / "dxvk.conf"
+    conf_content = (get_dxvk_lilium_conf(api, lilium_preset) if variant == "lilium"
+                    else DXVK_DEFAULT_CONF)
+    conf_path.write_text(conf_content)
+
+    state = load_state()
+    installs = state.setdefault("rhi_dxvk_installs", {})
+    installs[str(appid)] = {
+        "install_path": str(target_dir), "variant": variant, "api": api, "bitness": bitness,
+        "installed_dlls": root_dlls, "plugin_dlls": plugin_dlls,
+        "backed_up_files": backed_up_files, "deployed_conf": True,
+        "lilium_preset": lilium_preset if variant == "lilium" else None,
+        "reshade_renamed": reshade_renamed, "version": version, "exe": str(exe),
+        "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    save_state(state)
+
+    if task_id:
+        TASKS[task_id] = {"status": "done", "progress": 100,
+                          "detail": f"Installed DXVK {variant} {version}",
+                          "result": {"version": version}}
+    return {"installed": True, "variant": variant, "version": version, "api": api,
+            "installed_dlls": root_dlls, "plugin_dlls": plugin_dlls}
+
+
+def _install_dxvk_task(task_id, appid, install_path, variant, exe, lilium_preset) -> None:
+    try:
+        install_dxvk(appid, install_path, variant, exe_override=exe,
+                    lilium_preset=lilium_preset, task_id=task_id)
+    except Exception as e:
+        TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
+
+
+def remove_dxvk(appid) -> dict:
+    """Uninstalls DXVK for one game: deletes the deployed DLLs (root +
+    OptiScaler/plugins/), restores any true game-original `.original`
+    backups, deletes dxvk.conf if PCC deployed it, restores ReShade's
+    filename if it was parked at ReShade64.dll for coexistence."""
+    state = load_state()
+    installs = state.get("rhi_dxvk_installs", {})
+    rec = installs.pop(str(appid), None)
+    if not rec:
+        raise RuntimeError("No DXVK install tracked for this game.")
+    target_dir = Path(rec["install_path"])
+
+    for dll in rec.get("installed_dlls", []):
+        p = target_dir / dll
+        if p.is_file():
+            p.unlink()
+            if dll in rec.get("backed_up_files", []):
+                _restore_original_if_exists(p)
+
+    plugin_dlls = rec.get("plugin_dlls", [])
+    if plugin_dlls:
+        plugins_dir = target_dir / "OptiScaler" / "plugins"
+        for dll in plugin_dlls:
+            p = plugins_dir / dll
+            p.unlink(missing_ok=True)
+        if plugins_dir.is_dir() and not any(plugins_dir.iterdir()):
+            plugins_dir.rmdir()
+
+    if rec.get("deployed_conf"):
+        (target_dir / "dxvk.conf").unlink(missing_ok=True)
+
+    if rec.get("reshade_renamed"):
+        rs_rec = state.get("rhi_reshade_installs", {}).get(str(appid))
+        rs_coexist_path = target_dir / "ReShade64.dll"
+        if rs_rec and rs_coexist_path.is_file():
+            reclaim_name = _resolve_reshade_reclaim_name(rs_rec, rec)
+            resolved_path = target_dir / reclaim_name
+            if reclaim_name.lower() != "reshade64.dll" and not resolved_path.is_file():
+                rs_coexist_path.rename(resolved_path)
+                rs_rec["path"] = str(resolved_path)
+                state.setdefault("rhi_reshade_installs", {})[str(appid)] = rs_rec
+
+    save_state(state)
+    return {"removed": True}
+
+
+def update_dxvk(appid, task_id=None) -> dict:
+    """Updates an installed DXVK to the latest staged build for the same
+    variant: re-stages if needed, redeploys the recorded DLL set (no
+    backups - these are all previously DXVK-owned), rewrites dxvk.conf."""
+    state = load_state()
+    rec = state.get("rhi_dxvk_installs", {}).get(str(appid))
+    if not rec:
+        raise RuntimeError("No DXVK install tracked for this game.")
+    variant = rec["variant"]
+    target_dir = Path(rec["install_path"])
+    arch = "x32" if rec.get("bitness") == 32 else "x64"
+
+    staging_dir = ensure_dxvk_staging(variant, task_id=task_id)
+    version = dxvk_staging_version(variant)
+
+    if task_id and task_id in TASKS:
+        TASKS[task_id]["detail"] = "Updating DXVK files"
+        TASKS[task_id]["progress"] = 60
+
+    for dll in rec.get("installed_dlls", []):
+        src = staging_dir / arch / dll
+        if src.is_file():
+            shutil.copy2(src, target_dir / dll)
+
+    plugin_dlls = rec.get("plugin_dlls", [])
+    if plugin_dlls:
+        plugins_dir = target_dir / "OptiScaler" / "plugins"
+        plugins_dir.mkdir(parents=True, exist_ok=True)
+        for dll in plugin_dlls:
+            src = staging_dir / arch / dll
+            if src.is_file():
+                shutil.copy2(src, plugins_dir / dll)
+
+    if rec.get("deployed_conf"):
+        conf_content = (get_dxvk_lilium_conf(rec.get("api"), rec.get("lilium_preset") or 0)
+                        if variant == "lilium" else DXVK_DEFAULT_CONF)
+        (target_dir / "dxvk.conf").write_text(conf_content)
+
+    rec["version"] = version
+    rec["installed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    state["rhi_dxvk_installs"][str(appid)] = rec
+    save_state(state)
+
+    if task_id:
+        TASKS[task_id] = {"status": "done", "progress": 100,
+                          "detail": f"Updated DXVK to {version}",
+                          "result": {"version": version}}
+    return {"updated": True, "version": version}
+
+
+def _update_dxvk_task(task_id, appid) -> None:
+    try:
+        update_dxvk(appid, task_id=task_id)
     except Exception as e:
         TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
 
@@ -5882,6 +6768,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not g:
                     self._json({"error": "unknown appid"}, 404); return
                 self._json(scan_game_optiscaler(m.group(1), g["install_path"]))
+            elif m := re.match(r"^/api/game/(\d+)/rhi/dxvk$", self.path):
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(m.group(1))
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                self._json(scan_game_dxvk(m.group(1), g["install_path"]))
             elif self.path == "/api/progress":
                 self._json({"games": install_progress(root)})
             elif self.path == "/api/owned_games":
@@ -6174,6 +7066,28 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(set_optiscaler_fg(body["appid"], body.get("fg_input", "auto"),
                                              body.get("fg_output", "auto"),
                                              body.get("fg_nvngx_replacement")))
+            elif self.path == "/api/rhi/dxvk/install":
+                appid = body["appid"]
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(appid)
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                tid = str(uuid.uuid4())
+                TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
+                threading.Thread(target=_install_dxvk_task,
+                                 args=(tid, appid, g["install_path"], body.get("variant", "stable"),
+                                       body.get("exe"), body.get("lilium_preset", 0)),
+                                 daemon=True).start()
+                self._json({"task": tid})
+            elif self.path == "/api/rhi/dxvk/remove":
+                self._json(remove_dxvk(body["appid"]))
+            elif self.path == "/api/rhi/dxvk/update":
+                appid = body["appid"]
+                tid = str(uuid.uuid4())
+                TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
+                threading.Thread(target=_update_dxvk_task,
+                                 args=(tid, appid), daemon=True).start()
+                self._json({"task": tid})
             elif self.path == "/api/proton/install":
                 tid = str(uuid.uuid4())
                 threading.Thread(target=install_ge_proton,

@@ -126,6 +126,11 @@ class PCCTests(unittest.TestCase):
         pcc.OPTISCALER_INIS_DIR = pcc.OPTISCALER_DATA_DIR / "inis"
         pcc.OPTIPATCHER_STAGING_DIR = pcc.OPTISCALER_DATA_DIR / "optipatcher"
         pcc.OPTISCALER_DLSS_DIR = pcc.OPTISCALER_DATA_DIR / "dlss"
+        pcc.DXVK_DATA_DIR = pcc.RHI_DATA_DIR / "dxvk"
+        pcc.DXVK_DEV_DIR = pcc.DXVK_DATA_DIR / "development"
+        pcc.DXVK_STABLE_DIR = pcc.DXVK_DATA_DIR / "stable"
+        pcc.DXVK_LILIUM_DIR = pcc.DXVK_DATA_DIR / "lilium"
+        pcc.DLSSNR_CACHE_DIR = pcc.RHI_DATA_DIR / "dlssnr"
         for d in (pcc.DLL_LIBRARY, pcc.BACKUP_DIR, pcc.ART_DIR):
             d.mkdir(parents=True, exist_ok=True)
         pcc.steam_running = lambda: False
@@ -1460,6 +1465,125 @@ class PCCTests(unittest.TestCase):
         self.assertFalse((d / "addon-a.addon64").exists())
         self.assertTrue((d / "addon-b.addon64").is_file())
 
+    def test_renodx_dlss5_latest_picks_highest_version(self):
+        releases = [
+            {"tag_name": "renodx-dlss5-2.5", "assets": [
+                {"name": "renodx-dlss5_2.5.zip", "browser_download_url": "http://x/2.5.zip"}]},
+            {"tag_name": "renodx-dlss5-2.4", "assets": [
+                {"name": "renodx-dlss5_2.4.zip", "browser_download_url": "http://x/2.4.zip"}]},
+            {"tag_name": "RHI-2.4.4", "assets": []},  # unrelated release, must be ignored
+        ]
+        real_gh_json = pcc._gh_json
+        pcc._gh_json = lambda url: releases
+        try:
+            info = pcc.renodx_dlss5_latest()
+        finally:
+            pcc._gh_json = real_gh_json
+        self.assertEqual(info["version"], "2.5")
+        self.assertEqual(info["url"], "http://x/2.5.zip")
+
+    def test_reshade_addons_catalog_includes_renodx_dlss5(self):
+        real_gh_json = pcc._gh_json
+        pcc._gh_json = lambda url: [{"tag_name": "renodx-dlss5-2.5", "assets": [
+            {"name": "renodx-dlss5_2.5.zip", "browser_download_url": "http://x/2.5.zip"}]}]
+        real_urlopen = pcc.urllib.request.urlopen
+
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b"[00]\nPackageName=Test\nDownloadUrl64=http://x/t.addon64\n"
+        pcc.urllib.request.urlopen = lambda req, timeout=30: FakeResp()
+        try:
+            catalog = pcc.reshade_addons_catalog()
+        finally:
+            pcc._gh_json = real_gh_json
+            pcc.urllib.request.urlopen = real_urlopen
+        ids = {a["id"] for a in catalog}
+        self.assertIn("renodx-dlss5", ids)
+        dlss5 = next(a for a in catalog if a["id"] == "renodx-dlss5")
+        self.assertEqual(dlss5["download_url64"], "http://x/2.5.zip")
+        self.assertIsNone(dlss5["download_url32"])
+        self.assertEqual(dlss5["zip_member"], "renodx-dlss5.addon64")
+
+    def test_deploy_renodx_dlss5_extracts_from_zip_and_deploys_nr_dll(self):
+        import zipfile, io
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        state = pcc.load_state()
+        state["reshade_addons_catalog"] = {"ts": pcc.time.time(), "data": [
+            {"id": "renodx-dlss5", "name": "RenoDX DLSS5 Setup (RTX 50 Series only)",
+             "description": "", "download_url32": None, "download_url64": "http://x/dlss5.zip",
+             "zip_member": "renodx-dlss5.addon64", "repository_url": ""}]}
+        pcc.save_state(state)
+
+        addon_zip_buf = io.BytesIO()
+        with zipfile.ZipFile(addon_zip_buf, "w") as zf:
+            zf.writestr("renodx-dlss5.addon64", b"fake renodx dlss5 addon binary")
+        nr_zip_buf = io.BytesIO()
+        with zipfile.ZipFile(nr_zip_buf, "w") as zf:
+            zf.writestr("nvngx_dlssnr.dll", b"fake dlssnr dll")
+
+        real_gh_bytes = pcc._gh_bytes
+        real_manifest = pcc._rhi_dlss_manifest
+        pcc._gh_bytes = (lambda url, task=None:
+                         addon_zip_buf.getvalue() if url == "http://x/dlss5.zip" else nr_zip_buf.getvalue())
+        pcc._rhi_dlss_manifest = lambda: {"dlssnr": [{"version": "310.8.0", "url": "http://x/nr.zip"}]}
+        try:
+            r = pcc.deploy_reshade_addons(str(d), ["renodx-dlss5"], 64)
+        finally:
+            pcc._gh_bytes = real_gh_bytes
+            pcc._rhi_dlss_manifest = real_manifest
+        self.assertEqual(r["deployed"], 1)
+        self.assertEqual((d / "renodx-dlss5.addon64").read_bytes(), b"fake renodx dlss5 addon binary")
+        self.assertEqual((d / "nvngx_dlssnr.dll").read_bytes(), b"fake dlssnr dll")
+
+    def test_deploy_renodx_dlss5_never_overwrites_existing_nr_dll(self):
+        import zipfile, io
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "nvngx_dlssnr.dll").write_bytes(b"user's own existing copy")
+        state = pcc.load_state()
+        state["reshade_addons_catalog"] = {"ts": pcc.time.time(), "data": [
+            {"id": "renodx-dlss5", "name": "RenoDX DLSS5 Setup (RTX 50 Series only)",
+             "description": "", "download_url32": None, "download_url64": "http://x/dlss5.zip",
+             "zip_member": "renodx-dlss5.addon64", "repository_url": ""}]}
+        pcc.save_state(state)
+        addon_zip_buf = io.BytesIO()
+        with zipfile.ZipFile(addon_zip_buf, "w") as zf:
+            zf.writestr("renodx-dlss5.addon64", b"fake addon")
+        real_gh_bytes = pcc._gh_bytes
+        pcc._gh_bytes = lambda url, task=None: addon_zip_buf.getvalue()
+        try:
+            pcc.deploy_reshade_addons(str(d), ["renodx-dlss5"], 64)
+        finally:
+            pcc._gh_bytes = real_gh_bytes
+        self.assertEqual((d / "nvngx_dlssnr.dll").read_bytes(), b"user's own existing copy")
+
+    def test_ensure_dlssnr_cached_downloads_from_rhi_manifest(self):
+        import zipfile, io
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("nvngx_dlssnr.dll", b"fake dlssnr dll")
+        real_manifest, real_bytes = pcc._rhi_dlss_manifest, pcc._gh_bytes
+        pcc._rhi_dlss_manifest = lambda: {"dlssnr": [{"version": "310.8.0", "url": "http://x/nr.zip"}]}
+        pcc._gh_bytes = lambda url, task=None: buf.getvalue()
+        try:
+            p = pcc.ensure_dlssnr_cached()
+        finally:
+            pcc._rhi_dlss_manifest = real_manifest
+            pcc._gh_bytes = real_bytes
+        self.assertTrue(p.is_file())
+        self.assertEqual(p.read_bytes(), b"fake dlssnr dll")
+        # second call is served from disk cache, no network needed
+        pcc._gh_bytes = lambda url, task=None: (_ for _ in ()).throw(RuntimeError("should not fetch again"))
+        pcc._rhi_dlss_manifest = lambda: {"dlssnr": [{"version": "310.8.0", "url": "http://x/nr.zip"}]}
+        try:
+            p2 = pcc.ensure_dlssnr_cached()
+        finally:
+            pcc._gh_bytes = real_bytes
+            pcc._rhi_dlss_manifest = real_manifest
+        self.assertEqual(p2, p)
+
     def test_game_addon_selection_get_set(self):
         self.assertEqual(pcc.get_game_addon_selection("12345"), [])
         pcc.set_game_addon_selection("12345", ["addon-a"])
@@ -1520,6 +1644,29 @@ class PCCTests(unittest.TestCase):
         self.assertEqual(pcc._identify_dxgi_file(p), "optiscaler")
         p.write_bytes(b"totally unrelated content")
         self.assertEqual(pcc._identify_dxgi_file(p), "unknown")
+
+    def test_identify_dxgi_file_optiscaler_signature_beats_size_gate(self):
+        """Regression: a real OptiScaler.dll is ~25MB, well over the 15MB
+        cutoff that (before this fix) short-circuited the whole function to
+        "unknown" before the signature scan ever ran - which would have let
+        a later ReShade/DXVK install silently clobber OptiScaler's file as
+        if it were foreign, instead of correctly identifying and backing it
+        up. The size cutoff must only gate the ReShade-specific staged-size
+        fallback, never the signature scans themselves."""
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / "dxgi.dll"
+        p.write_bytes(b"OptiScaler build marker" + b"\x00" * (20 * 1024 * 1024))
+        self.assertEqual(pcc._identify_dxgi_file(p), "optiscaler")
+
+    def test_identify_dxgi_file_recognizes_dxvk(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / "dxgi.dll"
+        p.write_bytes(b"header DXVK_ build marker" + b"\x00" * 1000)
+        self.assertEqual(pcc._identify_dxgi_file(p), "dxvk")
+        p.write_bytes(b"header dxvk lowercase marker" + b"\x00" * 1000)
+        self.assertEqual(pcc._identify_dxgi_file(p), "dxvk")
 
     def test_is_optiscaler_file_and_detect_installation(self):
         d = self.root / "steamapps/common/TestGame"
@@ -1832,6 +1979,273 @@ class PCCTests(unittest.TestCase):
         self.assertTrue(p.is_file())
         self.assertEqual(p.read_bytes(), b"fake dlss dll")
         self.assertEqual(pcc.get_staged_dlss_dll("dlss"), p)
+
+    # ---- RHI: DXVK ----
+    def _fake_dxvk_staging(self, variant="stable", version=None):
+        d = pcc._dxvk_staging_dir(variant)
+        (d / "x64").mkdir(parents=True, exist_ok=True)
+        for name in ("d3d9.dll", "d3d10core.dll", "d3d11.dll", "dxgi.dll"):
+            (d / "x64" / name).write_bytes(b"DXVK_ fake build" + b"\x00" * 200)
+        version = version or "v1.0.0"
+        (d / "version.txt").write_text(version)
+        real_latest = pcc.dxvk_latest
+        pcc.dxvk_latest = (lambda variant=variant, _v=version: {
+            "version": _v, "url": "http://x", "asset_name": "dxvk.zip"})
+        self.addCleanup(lambda: setattr(pcc, "dxvk_latest", real_latest))
+        return d
+
+    def test_dxvk_required_dlls_and_unsupported_api(self):
+        self.assertEqual(pcc._dxvk_required_dlls("d3d9"), ["d3d9.dll"])
+        self.assertEqual(pcc._dxvk_required_dlls("d3d10"), ["d3d10core.dll", "dxgi.dll"])
+        self.assertEqual(pcc._dxvk_required_dlls("d3d11"), ["d3d11.dll", "dxgi.dll"])
+        with self.assertRaises(RuntimeError):
+            pcc._dxvk_required_dlls("d3d12")
+        with self.assertRaises(RuntimeError):
+            pcc._dxvk_required_dlls("vulkan")
+        with self.assertRaises(RuntimeError):
+            pcc._dxvk_required_dlls(None)
+
+    def test_get_dxvk_lilium_conf_picks_preset_set_by_api(self):
+        self.assertEqual(pcc.get_dxvk_lilium_conf("d3d9", 0), pcc.DXVK_LILIUM_D3D9_PRESETS[0][1])
+        self.assertEqual(pcc.get_dxvk_lilium_conf("d3d11", 0), pcc.DXVK_LILIUM_D3D11_PRESETS[0][1])
+        self.assertEqual(len(pcc.DXVK_LILIUM_D3D9_PRESETS), 6)
+        self.assertEqual(len(pcc.DXVK_LILIUM_D3D11_PRESETS), 7)
+        self.assertEqual(pcc.get_dxvk_lilium_conf("d3d11", 99), pcc.DXVK_LILIUM_D3D11_PRESETS[0][1])
+
+    def test_check_dxvk_update(self):
+        self._fake_dxvk_staging(version="v1.0.0")
+        real_latest = pcc.dxvk_latest
+        try:
+            pcc.dxvk_latest = lambda variant: {"version": "v1.0.0", "url": "x", "asset_name": "x"}
+            self.assertFalse(pcc.check_dxvk_update("stable"))
+            pcc.dxvk_latest = lambda variant: {"version": "v9.9.9", "url": "x", "asset_name": "x"}
+            self.assertTrue(pcc.check_dxvk_update("stable"))
+        finally:
+            pcc.dxvk_latest = real_latest
+
+    def test_ensure_dxvk_staging_stable_tar_gz(self):
+        import tarfile
+        src = Path(self.tmp.name) / "dxvk_src"
+        (src / "x64").mkdir(parents=True)
+        (src / "x64" / "d3d9.dll").write_bytes(b"DXVK_ fake" + b"\x00" * 200)
+        archive = Path(self.tmp.name) / "dxvk-3.1.tar.gz"
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(src, arcname="dxvk-3.1")
+        data = archive.read_bytes()
+
+        real_latest, real_bytes = pcc.dxvk_latest, pcc._gh_bytes
+        pcc.dxvk_latest = lambda variant: {"version": "v3.1", "url": "http://x",
+                                           "asset_name": "dxvk-3.1.tar.gz"}
+        pcc._gh_bytes = lambda url, task=None: data
+        try:
+            staging_dir = pcc.ensure_dxvk_staging("stable")
+        finally:
+            pcc.dxvk_latest = real_latest
+            pcc._gh_bytes = real_bytes
+        self.assertTrue((staging_dir / "x64" / "d3d9.dll").is_file())
+        self.assertEqual(pcc.dxvk_staging_version("stable"), "v3.1")
+
+    def test_ensure_dxvk_staging_development_zip(self):
+        import zipfile, io
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("x64/d3d9.dll", b"DXVK_ fake" + b"\x00" * 200)
+        data = buf.getvalue()
+
+        real_latest, real_bytes = pcc.dxvk_latest, pcc._gh_bytes
+        pcc.dxvk_latest = lambda variant: {"version": "abc1234", "url": "http://x",
+                                           "asset_name": "dxvk-master-abc1234.zip"}
+        pcc._gh_bytes = lambda url, task=None: data
+        try:
+            staging_dir = pcc.ensure_dxvk_staging("development")
+        finally:
+            pcc.dxvk_latest = real_latest
+            pcc._gh_bytes = real_bytes
+        self.assertTrue((staging_dir / "x64" / "d3d9.dll").is_file())
+        self.assertEqual(pcc.dxvk_staging_version("development"), "abc1234")
+
+    def test_ensure_dxvk_staging_lilium_requires_7z(self):
+        real_find, real_latest = pcc._find_7z_binary, pcc.dxvk_latest
+        pcc._find_7z_binary = lambda: None
+        pcc.dxvk_latest = lambda variant: {"version": "v3.0.2-HDR-mod-v0.3.4", "url": "http://x",
+                                           "asset_name": "dxvk_lilium.7z"}
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                pcc.ensure_dxvk_staging("lilium")
+            self.assertIn("7-Zip", str(ctx.exception))
+        finally:
+            pcc._find_7z_binary = real_find
+            pcc.dxvk_latest = real_latest
+
+    def test_ensure_dxvk_staging_lilium_real_7z_normal_subfolder(self):
+        if not pcc._find_7z_binary():
+            self.skipTest("7z not installed on this machine")
+        import subprocess
+        src = Path(self.tmp.name) / "lilium_src" / "normal"
+        (src / "x64").mkdir(parents=True)
+        (src / "x64" / "d3d9.dll").write_bytes(b"DXVK_ fake lilium" + b"\x00" * 200)
+        archive = Path(self.tmp.name) / "dxvk_lilium.7z"
+        subprocess.run(["7z", "a", str(archive), str(src.parent) + "/."],
+                       check=True, capture_output=True)
+        data = archive.read_bytes()
+
+        real_latest, real_bytes = pcc.dxvk_latest, pcc._gh_bytes
+        pcc.dxvk_latest = lambda variant: {"version": "v3.0.2-HDR-mod-v0.3.4", "url": "http://x",
+                                           "asset_name": "dxvk_lilium.7z"}
+        pcc._gh_bytes = lambda url, task=None: data
+        try:
+            staging_dir = pcc.ensure_dxvk_staging("lilium")
+        finally:
+            pcc.dxvk_latest = real_latest
+            pcc._gh_bytes = real_bytes
+        self.assertTrue((staging_dir / "x64" / "d3d9.dll").is_file())
+
+    def test_detect_dxvk_installation(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "d3d11.dll").write_bytes(b"DXVK_ marker" + b"\x00" * 200)
+        self.assertEqual(pcc.detect_dxvk_installation(str(d), "d3d11"), "d3d11.dll")
+        self.assertIsNone(pcc.detect_dxvk_installation(str(d / "nope"), "d3d11"))
+
+    def test_install_dxvk_refuses_unsupported_api(self):
+        d, exe = self._fake_game_exe(dlls=["vulkan-1.dll"])
+        self._fake_dxvk_staging()
+        with self.assertRaises(RuntimeError):
+            pcc.install_dxvk("12345", str(d), "stable", exe_override=str(exe))
+
+    def test_install_dxvk_full_flow_and_remove(self):
+        d, exe = self._fake_game_exe()
+        self._fake_dxvk_staging()
+        r = pcc.install_dxvk("12345", str(d), "stable", exe_override=str(exe))
+        self.assertTrue(r["installed"])
+        self.assertEqual(sorted(r["installed_dlls"]), ["d3d11.dll", "dxgi.dll"])
+        self.assertTrue((d / "d3d11.dll").is_file())
+        self.assertTrue((d / "dxgi.dll").is_file())
+        self.assertTrue((d / "dxvk.conf").is_file())
+        self.assertIn("dxgi.enableHDR", (d / "dxvk.conf").read_text())
+
+        status = pcc.scan_game_dxvk("12345", str(d), exe_path=str(exe))
+        self.assertTrue(status["installed"])
+
+        rm = pcc.remove_dxvk("12345")
+        self.assertTrue(rm["removed"])
+        self.assertFalse((d / "d3d11.dll").exists())
+        self.assertFalse((d / "dxgi.dll").exists())
+        self.assertFalse((d / "dxvk.conf").exists())
+        with self.assertRaises(RuntimeError):
+            pcc.remove_dxvk("12345")
+
+    def test_install_dxvk_backs_up_game_original_dlls(self):
+        d, exe = self._fake_game_exe()
+        (d / "dxgi.dll").write_bytes(b"totally unrelated game-owned dxgi")
+        self._fake_dxvk_staging()
+        pcc.install_dxvk("12345", str(d), "stable", exe_override=str(exe))
+        backup = d / "dxgi.dll.original"
+        self.assertTrue(backup.is_file())
+        self.assertEqual(backup.read_bytes(), b"totally unrelated game-owned dxgi")
+        pcc.remove_dxvk("12345")
+        self.assertEqual((d / "dxgi.dll").read_bytes(), b"totally unrelated game-owned dxgi")
+
+    def test_install_dxvk_renames_conflicting_reshade(self):
+        d, exe = self._fake_game_exe()
+        (d / "dxgi.dll").write_bytes(b"R" * 100)
+        state = pcc.load_state()
+        state.setdefault("rhi_reshade_installs", {})["12345"] = {
+            "path": str(d / "dxgi.dll"), "channel": "stable", "version": "6.8.0",
+            "bitness": 64, "exe": str(exe),
+        }
+        pcc.save_state(state)
+        self._fake_dxvk_staging()
+        pcc.install_dxvk("12345", str(d), "stable", exe_override=str(exe))
+
+        self.assertTrue((d / "ReShade64.dll").is_file())
+        self.assertEqual((d / "ReShade64.dll").read_bytes(), b"R" * 100)
+        rs_rec = pcc.load_state()["rhi_reshade_installs"]["12345"]
+        self.assertEqual(rs_rec["path"], str(d / "ReShade64.dll"))
+        self.assertIn(b"DXVK_", (d / "dxgi.dll").read_bytes())
+
+        pcc.remove_dxvk("12345")
+        self.assertTrue((d / "dxgi.dll").is_file())
+        self.assertEqual((d / "dxgi.dll").read_bytes(), b"R" * 100)
+        self.assertFalse((d / "ReShade64.dll").exists())
+
+    def test_install_dxvk_ignores_reshade_in_a_different_directory(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "bin/x64").mkdir(parents=True)
+        real_exe = d / "bin/x64/Game.exe"
+        real_exe.write_bytes(_build_fake_pe64(regular_dlls=["d3d11.dll"]))
+        wrong_exe = d / "launcher.exe"
+        wrong_exe.write_bytes(_build_fake_pe64(regular_dlls=["d3d11.dll"]))
+        (d / "bin/x64/dxgi.dll").write_bytes(b"R" * 100)
+        state = pcc.load_state()
+        state.setdefault("rhi_reshade_installs", {})["12345"] = {
+            "path": str(d / "bin/x64/dxgi.dll"), "channel": "stable", "version": "6.8.0",
+            "bitness": 64, "exe": str(real_exe),
+        }
+        pcc.save_state(state)
+        self._fake_dxvk_staging()
+        pcc.install_dxvk("12345", str(d), "stable", exe_override=str(wrong_exe))
+
+        self.assertEqual((d / "bin/x64/dxgi.dll").read_bytes(), b"R" * 100)
+        self.assertFalse((d / "bin/x64/ReShade64.dll").exists())
+        self.assertFalse((d / "ReShade64.dll").exists())
+
+    def test_install_dxvk_lilium_writes_selected_preset(self):
+        d, exe = self._fake_game_exe()
+        self._fake_dxvk_staging(variant="lilium", version="v3.0.2-HDR-mod-v0.3.4")
+        r = pcc.install_dxvk("12345", str(d), "lilium", exe_override=str(exe), lilium_preset=2)
+        self.assertTrue(r["installed"])
+        conf = (d / "dxvk.conf").read_text()
+        self.assertEqual(conf, pcc.DXVK_LILIUM_D3D11_PRESETS[2][1])
+        self.assertIn("scRGB", conf)
+
+    def test_dxvk_routes_conflicting_dll_to_optiscaler_plugins(self):
+        d, exe = self._fake_game_exe()
+        state = pcc.load_state()
+        state.setdefault("rhi_optiscaler_installs", {})["12345"] = {
+            "install_path": str(d), "installed_as": "dxgi.dll", "variant": "stable",
+            "gpu_type": "NVIDIA", "dlss_inputs": True, "version": "v0.9.4", "exe": str(exe),
+            "deployed_files": [], "deployed_subdirs": [],
+        }
+        pcc.save_state(state)
+        (d / "dxgi.dll").write_bytes(b"OptiScaler fake build" + b"\x00" * 500)
+        self._fake_dxvk_staging()
+        r = pcc.install_dxvk("12345", str(d), "stable", exe_override=str(exe))
+        self.assertEqual(r["installed_dlls"], ["d3d11.dll"])
+        self.assertEqual(r["plugin_dlls"], ["dxgi.dll"])
+        self.assertTrue((d / "d3d11.dll").is_file())
+        self.assertTrue((d / "OptiScaler" / "plugins" / "dxgi.dll").is_file())
+        self.assertIn(b"OptiScaler", (d / "dxgi.dll").read_bytes())
+
+        pcc.remove_dxvk("12345")
+        self.assertFalse((d / "d3d11.dll").exists())
+        self.assertFalse((d / "OptiScaler" / "plugins" / "dxgi.dll").exists())
+
+    def test_optiscaler_moves_conflicting_dxvk_dll_to_plugins(self):
+        d, exe = self._fake_game_exe()
+        self._fake_dxvk_staging()
+        pcc.install_dxvk("12345", str(d), "stable", exe_override=str(exe))
+        self.assertTrue((d / "dxgi.dll").is_file())
+        self.assertIn(b"DXVK_", (d / "dxgi.dll").read_bytes())
+
+        self._fake_optiscaler_staging()
+        pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="NVIDIA")
+        self.assertIn(b"OptiScaler", (d / "dxgi.dll").read_bytes())
+        self.assertTrue((d / "OptiScaler" / "plugins" / "dxgi.dll").is_file())
+        self.assertIn(b"DXVK_", (d / "OptiScaler" / "plugins" / "dxgi.dll").read_bytes())
+        dxvk_rec = pcc.load_state()["rhi_dxvk_installs"]["12345"]
+        self.assertNotIn("dxgi.dll", dxvk_rec["installed_dlls"])
+        self.assertIn("dxgi.dll", dxvk_rec["plugin_dlls"])
+        self.assertIn("d3d11.dll", dxvk_rec["installed_dlls"])
+
+        pcc.remove_optiscaler("12345")
+        self.assertTrue((d / "dxgi.dll").is_file())
+        self.assertIn(b"DXVK_", (d / "dxgi.dll").read_bytes())
+        self.assertFalse((d / "OptiScaler").exists())
+        dxvk_rec = pcc.load_state()["rhi_dxvk_installs"]["12345"]
+        self.assertIn("dxgi.dll", dxvk_rec["installed_dlls"])
+        self.assertEqual(dxvk_rec["plugin_dlls"], [])
 
     # ---- compile state ----
     def test_sgdb_fetch_and_cache(self):

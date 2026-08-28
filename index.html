@@ -765,6 +765,29 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
         <button class="btn" id="rhiOsFgApplyBtn">Apply</button>
       </div>
     </div>
+    <div class="section">
+      <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:0 0 10px">DXVK</h3>
+      <p class="note" style="margin:0 0 10px">Overrides the D3D9/10/11-to-Vulkan translation build for this game -
+        async/gplasync fixes, a different pinned version, or Lilium's HDR-upgrade fork. Coexists with
+        ReShade/OptiScaler by routing conflicting DLLs to <code>OptiScaler/plugins/</code> or renaming ReShade aside.</p>
+      <div id="rhiDxvkStatus"><p class="note">Checking…</p></div>
+      <div class="row" style="margin-top:10px;align-items:center;gap:10px;flex-wrap:wrap">
+        <label class="note" for="rhiDxvkVariant" style="margin:0">Variant</label>
+        <select id="rhiDxvkVariant">
+          <option value="development">Development (nightly)</option>
+          <option value="stable">Stable</option>
+          <option value="lilium">Lilium HDR</option>
+        </select>
+        <select id="rhiDxvkPreset" hidden></select>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn green" id="rhiDxvkInstallBtn">Install DXVK</button>
+        <button class="btn" id="rhiDxvkUpdateBtn" hidden>Update</button>
+        <button class="btn danger" id="rhiDxvkRemoveBtn" hidden>Remove</button>
+      </div>
+      <div class="bar" id="rhiDxvkBar"><i></i></div>
+      <p class="note" id="rhiDxvkDetail"></p>
+    </div>
     <p class="note" style="margin-top:10px">Ported from <a href="https://github.com/RankFTW/RHI"
       target="_blank" rel="noopener noreferrer" style="color:var(--compiled)">RHI</a>.</p>
   </div>
@@ -1744,7 +1767,7 @@ async function openGame(appid){
   }catch(e){loadStringIntoUI("")}
   loadUltraPlus(appid);
   refreshCapabilities();
-  loadLibrary().then(()=>loadDLSS(appid));loadCompat(appid);loadCachedPdb(appid);loadMods(appid);loadRhiReshade(appid).then(()=>loadRhiAddons(appid));loadRhiShaderPacks(appid);loadRhiOptiscaler(appid);
+  loadLibrary().then(()=>loadDLSS(appid));loadCompat(appid);loadCachedPdb(appid);loadMods(appid);loadRhiReshade(appid).then(()=>loadRhiAddons(appid));loadRhiShaderPacks(appid);loadRhiOptiscaler(appid);loadRhiDxvk(appid);
 }
 
 async function loadDLSS(appid){
@@ -2311,6 +2334,86 @@ $("#rhiOsFgApplyBtn").addEventListener("click",async()=>{
     await post("/api/rhi/optiscaler/fg",{appid:current.appid,
       fg_input:$("#rhiOsFgInput").value,fg_output:$("#rhiOsFgOutput").value});
     toast("Frame gen settings applied");
+  }catch(e){toast(e.message,true)}
+});
+
+/* ---------- RHI: DXVK ---------- */
+const RHI_DXVK_LILIUM_D3D9_NAMES=["Safest","2nd Safest","Slightly Unsafe","Unsafer","Even Unsafer","Experimental"];
+const RHI_DXVK_LILIUM_D3D11_NAMES=["Safest","2nd Safest","Slightly Unsafe","Unsafer","Even Unsafer","Slightly Experimental","Fully Experimental"];
+function rhiDxvkUpdatePresetVisibility(){
+  const isLilium=$("#rhiDxvkVariant").value==="lilium";
+  const api=(window._rhiDxvkState&&window._rhiDxvkState.detected_api)||"d3d11";
+  const names=api==="d3d9"?RHI_DXVK_LILIUM_D3D9_NAMES:RHI_DXVK_LILIUM_D3D11_NAMES;
+  $("#rhiDxvkPreset").hidden=!isLilium;
+  if(isLilium){
+    $("#rhiDxvkPreset").innerHTML=names.map((n,i)=>`<option value="${i}">${esc(n)}</option>`).join("");
+  }
+}
+$("#rhiDxvkVariant").addEventListener("change",rhiDxvkUpdatePresetVisibility);
+async function loadRhiDxvk(appid){
+  const box=$("#rhiDxvkStatus");
+  box.innerHTML='<p class="note">Scanning game folder…</p>';
+  $("#rhiDxvkRemoveBtn").hidden=true;$("#rhiDxvkUpdateBtn").hidden=true;
+  try{
+    const d=await api(`/api/game/${appid}/rhi/dxvk`);
+    window._rhiDxvkState=d;
+    rhiDxvkUpdatePresetVisibility();
+    if(d.installed){
+      $("#rhiDxvkVariant").value=d.variant||"stable";
+      rhiDxvkUpdatePresetVisibility();
+      if(d.lilium_preset!=null)$("#rhiDxvkPreset").value=d.lilium_preset;
+      box.innerHTML=`
+        <div class="item">
+          <div class="top"><b>${esc(d.api||"?")}</b>
+            <span class="chip g">${esc(d.version||"?")}</span>
+            <span class="chip m">${esc(d.variant||"stable")}</span>
+            ${d.update_available?'<span class="chip a">update available</span>':""}</div>
+          <div class="path mono">${esc(d.install_path)}</div>
+        </div>`;
+      $("#rhiDxvkInstallBtn").textContent="Reinstall";
+      $("#rhiDxvkRemoveBtn").hidden=false;
+      $("#rhiDxvkUpdateBtn").hidden=!d.update_available;
+    }else{
+      $("#rhiDxvkInstallBtn").textContent="Install DXVK";
+      box.innerHTML=d.exe
+        ? `<p class="note">Detected <b class="mono">${esc(d.exe.split("/").pop())}</b>${d.detected_api?` — looks like <b>${esc(d.detected_api.toUpperCase())}</b>`:" — couldn't tell the graphics API"}.</p>`
+        : `<p class="note">No .exe found automatically — point Command Center at it manually.</p>`;
+    }
+  }catch(e){box.innerHTML=`<p class="note">${esc(e.message)}</p>`}
+}
+$("#rhiDxvkInstallBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  const btn=$("#rhiDxvkInstallBtn");btn.disabled=true;
+  try{
+    const body={appid:current.appid,variant:$("#rhiDxvkVariant").value};
+    if($("#rhiDxvkVariant").value==="lilium")body.lilium_preset=parseInt($("#rhiDxvkPreset").value||"0",10);
+    if($("#rhiExePath").value.trim())body.exe=$("#rhiExePath").value.trim();
+    const {task}=await post("/api/rhi/dxvk/install",body);
+    trackTask(task,"#rhiDxvkBar",(t)=>{
+      btn.disabled=false;
+      if(t.result)toast(`Installed DXVK ${t.result.version}`);
+      loadRhiDxvk(current.appid);
+    },"#rhiDxvkDetail");
+  }catch(e){toast(e.message,true);btn.disabled=false}
+});
+$("#rhiDxvkUpdateBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  const btn=$("#rhiDxvkUpdateBtn");btn.disabled=true;
+  try{
+    const {task}=await post("/api/rhi/dxvk/update",{appid:current.appid});
+    trackTask(task,"#rhiDxvkBar",(t)=>{
+      btn.disabled=false;
+      if(t.result)toast(`Updated DXVK to ${t.result.version}`);
+      loadRhiDxvk(current.appid);
+    },"#rhiDxvkDetail");
+  }catch(e){toast(e.message,true);btn.disabled=false}
+});
+$("#rhiDxvkRemoveBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  if(!await pccConfirm(`Remove DXVK from ${current.name}?`,{yes:"Remove",danger:true}))return;
+  try{
+    await post("/api/rhi/dxvk/remove",{appid:current.appid});
+    toast("Removed");loadRhiDxvk(current.appid);
   }catch(e){toast(e.message,true)}
 });
 
