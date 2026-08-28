@@ -841,6 +841,7 @@ const TOGGLES=[
  {id:"ngxupdater",vendor:"NVIDIA",needs:"PROTON_ENABLE_NGX_UPDATER",label:"DLSS auto-updater (NGX)",hint:"PROTON_ENABLE_NGX_UPDATER=1 — the DLSS render-preset overrides below (DXVK_NVAPI_DRS_*) only pick which preset the game's own DLSS DLL should use; they don't fetch newer DLSS libraries. This lets Proton's own updater install newer DLSS DLLs so a picked preset (e.g. a recent transformer model) actually exists in the game to select. Turn this on alongside any render-preset override.",env:"PROTON_ENABLE_NGX_UPDATER=1"},
  {id:"fsr4upgrade",vendor:"AMD",needs:"PROTON_FSR4_UPGRADE",label:"FSR4 upgrade",hint:"PROTON_FSR4_UPGRADE=1 — auto-downloads and installs AMD's FSR4 upscaler, replacing the game's bundled FSR 3.1 DLLs. Works on RDNA4 out of the box; RDNA3 is supported too as of FSR 4.1 (no longer needs the old DXIL_SPIRV_CONFIG=wmma_rdna3_workaround companion variable, except to enable Multi Frame Generation specifically). Community-reported behavior — not verified against real AMD hardware by this app's author, please report if something's off.",env:"PROTON_FSR4_UPGRADE=1"},
  {id:"ultraplus",label:"Ultra+ mod loader",hint:"WINEDLLOVERRIDES=dwmapi=n,b;version=n,b — two separate hijacks for two separate things. dwmapi.dll is the UE4SS build Ultra+ Manager drops in, loading UE4SS itself and UltraPlusExtensions. version.dll is a generic ASI loader (Ultimate ASI Loader) some games additionally need to run standalone .asi companion fixes (e.g. NaniteRayTracingFix.asi) that aren't part of UE4SS at all - harmless to leave on for games that don't have any. The status note below only appears once a game is open, and only means something if the files are already in the game folder — installed separately via Ultra+ Manager or, for the .asi fixes, wherever that fix is distributed.",env:"WINEDLLOVERRIDES=dwmapi=n,b;version=n,b"},
+ {id:"optiscalervk",label:"OptiScaler Vulkan-game loader",hint:"WINEDLLOVERRIDES=winmm=n,b — required for OptiScaler on Vulkan games specifically. Proton already forces native (dropped-in-file) loading for dxgi.dll/d3d9.dll/d3d11.dll every launch (it does this for its own bundled DXVK), which is why ReShade/DXVK/OptiScaler's normal dxgi.dll install just works with no launch options at all. winmm.dll isn't one of those - it stays Wine-builtin-first by default - so OptiScaler's automatic winmm.dll build for Vulkan games (dxgi.dll won't load there) needs this override to actually take effect in-game. Harmless to leave on for games where OptiScaler isn't installed as winmm.dll.",env:"WINEDLLOVERRIDES=winmm=n,b"},
 ];
 // Trimmed from the default list (Aug 2026 declutter pass): GameMode
 // (wrap:"gamemoderun" — Feral GameMode; still fully supported, just type
@@ -2276,7 +2277,10 @@ async function loadRhiOptiscaler(appid){
             ${d.detected_api?`<span class="chip a">${esc(d.detected_api.toUpperCase())}</span>`:""}
             ${d.update_available?'<span class="chip a">update available</span>':""}</div>
           <div class="path mono">${esc(d.path)}</div>
-        </div>`;
+        </div>
+        ${d.installed_as&&d.installed_as.toLowerCase()==="winmm.dll"?
+          '<p class="note">winmm.dll needs a launch option to actually load under Proton — '
+          +'enable "OptiScaler Vulkan-game loader" in the Launch tab toggles.</p>':""}`;
       $("#rhiOsInstallBtn").textContent="Reinstall";
       $("#rhiOsRemoveBtn").hidden=false;
       $("#rhiOsUpdateBtn").hidden=!d.update_available;
