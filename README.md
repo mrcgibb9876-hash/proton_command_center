@@ -104,14 +104,26 @@ server-side. Skip them and everything else still works.
 ![Launch options built from toggles, with unsupported ones greyed out](assets/screenshots/launch.png)
 
 Compatibility tools are read from disk, so only builds you actually have are
-offered, and new releases show up on their own. Toggles cover DXVK, HDR,
-native Wayland, Reflex, esync, GE-only extras like D7VK and OptiScaler,
-and an Ultra+ mod loader toggle (`WINEDLLOVERRIDES=dwmapi=n,b`) for UE4SS-based
-mods from [theultraplace.com](https://theultraplace.com) - it forces Proton to
-load dwmapi.dll from disk instead of its own stub. Opening a game whose folder
-has a `ue4ss/` directory shows what Ultra+ found there (the loader DLL, any
+offered, and new releases show up on their own. The main toggle list sticks to
+what most people actually reach for - DXVK, HDR, native Wayland, MangoHud,
+Reflex, the NGX/DLSS auto-updater and auto-upgrade, VKD3D's experimental
+descriptor-heap path - plus an Ultra+ mod loader toggle
+(`WINEDLLOVERRIDES=dwmapi=n,b`) for UE4SS-based mods from
+[theultraplace.com](https://theultraplace.com) - it forces Proton to load
+dwmapi.dll from disk instead of its own stub. Opening a game whose folder has
+a `ue4ss/` directory shows what Ultra+ found there (the loader DLL, any
 companion `.asi` fixes); as of 1.22.0 those files are installed by Command
 Center itself, from the Mods tab.
+
+Niche, hardware-specific, or troubleshooting-only options - GameMode
+(`gamemoderun`), the 8GB-VRAM memory cap, D7VK, OptiScaler, the FSR4 upgrade
+(AMD-only), and disabling esync - aren't in that list; type them straight
+into "Extra env vars" if you need one (wrappers like `gamemoderun` belong
+there too, not in "Extra arguments" - that box runs after `%command%`, this
+one runs before it). Nothing already saved gets touched: a variable or
+wrapper word in a game's existing launch options that the toggle list no
+longer recognises round-trips through that same box instead of being
+silently dropped.
 
 A game with Ultra+ set up gets an **ULTRA+** badge on its library card - click
 the logo to jump to its Mods tab.
@@ -133,6 +145,20 @@ one-click restart.
 
 Every DLSS DLL in the game with its version. Swap in a newer one from your
 library, back up the original, roll back whenever. Requires an NVIDIA driver.
+
+The Launch tab's DLSS section covers the rest: Super Resolution mode and
+render preset, Frame Generation (2x-6x - 5x/6x are DLSS 4.5's Dynamic Multi
+Frame Generation, RTX 50-series only, and need a Proton/GE build with a
+recent-enough dxvk-nvapi), and Ray Reconstruction, all via the
+`DXVK_NVAPI_DRS_*` layer. Preset letters are read straight from the selected
+Proton build's own compiled dxvk-nvapi, so anything it doesn't actually
+support shows greyed out instead of silently doing nothing. "In-game overlay"
+is NVIDIA's own on-screen indicator - it overlays the live DLSS SDK version,
+resolution, and active mode right in the game (not something PCC draws
+itself), a one-checkbox way to confirm what's actually running without
+alt-tabbing out. Compact-vs-per-variable output and the save/apply-default
+template live under "Advanced preset options" so a first-time user isn't
+staring at raw NGX/DRS variable names before they've touched anything else.
 
 ### ReShade tab
 
