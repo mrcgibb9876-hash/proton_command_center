@@ -200,7 +200,7 @@ def load_state():
     try:
         return json.loads(STATE_FILE.read_text())
     except Exception:
-        return {"compiled": {}}
+        return {}
 
 
 def save_state(state) -> None:
@@ -2422,6 +2422,496 @@ def _find_game_exe(install_path):
 
 
 # --------------------------------------------------------------------------
+# RHI port: graphics API detection
+# --------------------------------------------------------------------------
+# (dll import name, api id, priority) - higher priority wins when a game
+# imports more than one. Port of RHI's GraphicsApiDetector.
+_GRAPHICS_DLL_PRIORITY = [
+    ("d3d12.dll", "d3d12", 7),
+    ("vulkan-1.dll", "vulkan", 6),
+    ("d3d11.dll", "d3d11", 5),
+    ("d3d10.dll", "d3d10", 4),
+    ("d3d10_1.dll", "d3d10", 4),
+    ("opengl32.dll", "opengl", 3),
+    ("d3d9.dll", "d3d9", 2),
+    ("d3d8.dll", "d3d8", 1),
+]
+_UNITY_GFX_DEVICE_MAP = {2: "d3d9", 17: "d3d11", 18: "d3d12", 21: "vulkan", 4: "opengl"}
+
+
+def pe_imports(path):
+    """Read a PE exe's machine type (32/64-bit) and imported DLL names, both
+    regular and delay-loaded, with no dependency beyond stdlib: parse the
+    DOS/PE/section headers by hand and walk both import directory tables.
+    Returns (bitness, {regular names}, {delay-load names}), or
+    (None, set(), set()) if it doesn't look like a PE file."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return None, set(), set()
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        return None, set(), set()
+    pe_off = struct.unpack_from("<i", data, 0x3C)[0]
+    if pe_off < 0 or pe_off + 24 > len(data) or data[pe_off:pe_off + 4] != b"PE\x00\x00":
+        return None, set(), set()
+    coff = pe_off + 4
+    machine = struct.unpack_from("<H", data, coff)[0]
+    bitness = {0x8664: 64, 0x14c: 32}.get(machine)
+    n_sections = struct.unpack_from("<H", data, coff + 2)[0]
+    size_opt = struct.unpack_from("<H", data, coff + 16)[0]
+    opt_off = coff + 20
+    if size_opt < 2 or opt_off + size_opt > len(data):
+        return bitness, set(), set()
+    magic = struct.unpack_from("<H", data, opt_off)[0]
+    if magic == 0x10B:      # PE32
+        dir_array_off = opt_off + 96
+    elif magic == 0x20B:    # PE32+
+        dir_array_off = opt_off + 112
+    else:
+        return bitness, set(), set()
+    imp_dir_off = dir_array_off + 1 * 8          # IMAGE_DIRECTORY_ENTRY_IMPORT
+    delay_dir_off = dir_array_off + 13 * 8       # IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT
+    if delay_dir_off + 8 > len(data):
+        return bitness, set(), set()
+    sections = []
+    for i in range(n_sections):
+        off = opt_off + size_opt + i * 40
+        if off + 40 > len(data):
+            break
+        vsize, va = struct.unpack_from("<II", data, off + 8)
+        raw_ptr = struct.unpack_from("<I", data, off + 20)[0]
+        sections.append((va, vsize, raw_ptr))
+
+    def rva2off(rva):
+        for va, vsize, raw_ptr in sections:
+            if va <= rva < va + vsize:
+                return raw_ptr + (rva - va)
+        return None
+
+    def read_cstr(off, cap=256):
+        end = data.find(b"\x00", off, off + cap)
+        if end < 0:
+            end = off + cap
+        return data[off:end].decode("ascii", "ignore").lower()
+
+    def walk_import_table(dir_off, name_rva_offset, entry_size):
+        import_rva = struct.unpack_from("<I", data, dir_off)[0]
+        if not import_rva:
+            return set()
+        imp_off = rva2off(import_rva)
+        if imp_off is None:
+            return set()
+        names = set()
+        i = 0
+        while True:
+            entry_off = imp_off + i * entry_size
+            if entry_off + entry_size > len(data):
+                break
+            name_rva = struct.unpack_from("<I", data, entry_off + name_rva_offset)[0]
+            if not name_rva:
+                break
+            noff = rva2off(name_rva)
+            if noff is not None:
+                names.add(read_cstr(noff))
+            i += 1
+        return names
+
+    regular = walk_import_table(imp_dir_off, 12, 20)
+    delay = walk_import_table(delay_dir_off, 4, 32)
+    return bitness, regular, delay
+
+
+def detect_graphics_api(dll_names, delay_names=None) -> str | None:
+    """Highest-priority graphics API among a PE's imported DLLs. Checks the
+    regular import table first; only falls back to the delay-load import
+    table (data-directory index 13) if nothing >= DX11 priority was found
+    there, since engines like UE4/5 often delay-load d3d12.dll as an
+    optional path while explicitly importing their real default API
+    (typically d3d11.dll) in the regular table - promoting on delay-load
+    alone would misdetect those as DX12. A DX12 game that creates its
+    device through dxgi.dll alone (no d3d12.dll import at all, common in
+    modern engines) is inferred as DX12 when nothing higher-priority was
+    found either way - port of RHI's GraphicsApiDetector."""
+    best, best_pri = None, 0
+    for dll, api, pri in _GRAPHICS_DLL_PRIORITY:
+        if dll in dll_names and pri > best_pri:
+            best, best_pri = api, pri
+    if best_pri < 5 and delay_names:
+        for dll, api, pri in _GRAPHICS_DLL_PRIORITY:
+            if dll in delay_names and pri > best_pri:
+                best, best_pri = api, pri
+    if "dxgi.dll" in dll_names and best_pri < 5:
+        return "d3d12"
+    return best
+
+
+def _detect_unity_api(exe_path):
+    """Unity-specific fallback for when import-table scanning finds nothing:
+    Unity's player binary imports very little directly and picks its API at
+    runtime, so read boot.config's gfx-device-type override instead. Returns
+    None if this doesn't look like a Unity game at all (no <name>_Data dir);
+    "d3d11" (Unity's Windows default) if it is one but boot.config is
+    missing or has no override (pre-boot.config Unity 5-and-earlier builds,
+    or a build that never set this key)."""
+    exe_path = Path(exe_path)
+    data_dir = exe_path.parent / (exe_path.stem + "_Data")
+    if not data_dir.is_dir():
+        return None
+    boot_cfg = data_dir / "boot.config"
+    if boot_cfg.is_file():
+        try:
+            for line in boot_cfg.read_text(errors="replace").splitlines():
+                line = line.strip()
+                if line.startswith("gfx-device-type="):
+                    val = int(line.split("=", 1)[1].strip())
+                    return _UNITY_GFX_DEVICE_MAP.get(val, "d3d11")
+        except (OSError, ValueError):
+            pass
+    return "d3d11"
+
+
+def detect_game_graphics_api(exe_path) -> dict:
+    """Full detection pipeline for one exe: PE import scan (regular + delay-
+    load), falling back to the Unity boot.config heuristic if the PE scan
+    found nothing. Cached in state.json keyed by (path, mtime) so repeated
+    panel opens don't re-parse the exe every time."""
+    exe_path = str(exe_path)
+    try:
+        mtime = Path(exe_path).stat().st_mtime
+    except OSError:
+        return {"bitness": None, "api": None}
+    state = load_state()
+    cache = state.setdefault("rhi_api_cache", {})
+    entry = cache.get(exe_path)
+    if entry and entry.get("mtime") == mtime:
+        return {"bitness": entry.get("bitness"), "api": entry.get("api")}
+
+    bitness, regular, delay = pe_imports(exe_path)
+    api = detect_graphics_api(regular, delay)
+    if api is None:
+        api = _detect_unity_api(exe_path)
+    cache[exe_path] = {"mtime": mtime, "bitness": bitness, "api": api}
+    save_state(state)
+    return {"bitness": bitness, "api": api}
+
+
+# --------------------------------------------------------------------------
+# RHI port: ReShade install (Stable channel) + RE Framework companion
+# --------------------------------------------------------------------------
+RHI_DATA_DIR = DATA_DIR / "rhi"
+RESHADE_STAGING_DIR = RHI_DATA_DIR / "reshade"
+RESHADE_DOWNLOADS_PAGE = "https://reshade.me/"
+RE_FRAMEWORK_ZIP_URL = ("https://github.com/praydog/REFramework-nightly/"
+                        "releases/latest/download/REFramework.zip")
+RE_FRAMEWORK_RELEASES_API = "https://api.github.com/repos/praydog/REFramework-nightly/releases"
+_RESHADE_MIN_SIZE = 1_000_000   # below this, treat a staged/installed DLL as corrupt
+
+
+def reshade_latest() -> dict:
+    """Scrapes reshade.me for the current Stable (Addon-capable) build.
+    Cached 6h, same pattern as list_ge_proton(). Port of RHI's
+    ReShadeUpdateService."""
+    state = load_state()
+    cache = state.get("reshade_latest")
+    now = time.time()
+    if cache and now - cache.get("ts", 0) < 21600:
+        return cache["data"]
+    req = urllib.request.Request(RESHADE_DOWNLOADS_PAGE,
+                                 headers={"User-Agent": "Mozilla/5.0 pcc"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        html = r.read().decode("utf-8", "replace")
+    m = re.search(r"downloads/ReShade_Setup_([\d.]+)_Addon\.exe", html)
+    if not m:
+        raise RuntimeError("Couldn't find a current ReShade build on reshade.me")
+    version = m.group(1)
+    data = {"version": version,
+            "url": f"https://reshade.me/downloads/ReShade_Setup_{version}_Addon.exe"}
+    state["reshade_latest"] = {"ts": now, "data": data}
+    save_state(state)
+    return data
+
+
+def ensure_reshade_engine(version, url=None, task_id=None) -> Path:
+    """Downloads the ReShade Stable setup .exe and pulls ReShade32.dll/
+    ReShade64.dll straight out of it. The installer is a plain zip with a
+    stub exe prepended - stdlib zipfile finds the end-of-central-directory
+    record by scanning back from EOF, no extra tooling needed (matches
+    RHI's own approach - it uses SharpCompress/7z for the same trick, but
+    Python's zipfile already does this natively). Cached per version so
+    repeat installs across games don't re-download."""
+    import zipfile, io
+    engine_dir = RESHADE_STAGING_DIR / version
+    dll64, dll32 = engine_dir / "ReShade64.dll", engine_dir / "ReShade32.dll"
+    if (dll64.is_file() and dll64.stat().st_size >= _RESHADE_MIN_SIZE
+            and dll32.is_file() and dll32.stat().st_size >= _RESHADE_MIN_SIZE):
+        return engine_dir
+    if not url:
+        url = reshade_latest()["url"]
+    if task_id:
+        TASKS[task_id] = {"status": "running", "progress": 10,
+                          "detail": f"Downloading ReShade {version}"}
+    data = _gh_bytes(url, task_id)
+    if len(data) < 500_000 or data[:2] != b"MZ":
+        raise RuntimeError("Download from reshade.me didn't look like a real "
+                           "installer (got an error page?) - try again.")
+    if task_id:
+        TASKS[task_id]["detail"] = "Extracting"
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        names = set(zf.namelist())
+        for dll in ("ReShade32.dll", "ReShade64.dll"):
+            if dll not in names:
+                raise RuntimeError(f"ReShade installer didn't contain {dll} "
+                                   "(its format may have changed)")
+        engine_dir.mkdir(parents=True, exist_ok=True)
+        for dll in ("ReShade32.dll", "ReShade64.dll"):
+            (engine_dir / dll).write_bytes(zf.read(dll))
+    return engine_dir
+
+
+def _identify_dxgi_file(path) -> str:
+    """Is an existing dxgi.dll ours (ReShade), or something foreign? Positive
+    evidence only, never guessed from size alone - port of RHI's
+    IdentifyDxgiFile (minus the OptiScaler/DXVK branches, out of scope for
+    this phase)."""
+    path = Path(path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return "unknown"
+    if size > 15_000_000:
+        return "unknown"          # far too big to be ReShade
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return "unknown"
+    if b"ReShade" in data and (b"reshade.me" in data or b"crosire" in data):
+        return "reshade"
+    for engine_dir in RESHADE_STAGING_DIR.glob("*"):
+        for dll in ("ReShade64.dll", "ReShade32.dll"):
+            staged = engine_dir / dll
+            if staged.is_file() and staged.stat().st_size == size:
+                return "reshade"
+    return "unknown"
+
+
+def _backup_foreign_dll(path) -> None:
+    """If an existing dxgi.dll isn't ours, rename it aside instead of
+    overwriting it - port of RHI's BackupForeignDll."""
+    path = Path(path)
+    if not path.is_file():
+        return
+    if _identify_dxgi_file(path) == "reshade":
+        return
+    backup = path.with_name(path.name + ".original")
+    if not backup.exists():
+        path.rename(backup)
+    else:
+        path.unlink()
+
+
+def _restore_foreign_dll(path) -> None:
+    """Reverse of _backup_foreign_dll, called on removal."""
+    path = Path(path)
+    backup = path.with_name(path.name + ".original")
+    if backup.is_file() and not path.exists():
+        backup.rename(path)
+
+
+def scan_game_reshade(appid, install_path, exe_path=None) -> dict:
+    """ReShade status for one game: detected graphics API/bitness (from the
+    best-guess exe, or the exe an existing install actually used - so the
+    status display doesn't keep pointing at the wrong exe forever after a
+    manual exe-override install corrected it), whatever PCC has on record,
+    and whether an update is available (installed file's size no longer
+    matches what's staged)."""
+    state = load_state()
+    rec = state.get("rhi_reshade_installs", {}).get(str(appid))
+    if not exe_path and rec and rec.get("exe"):
+        exe_path = rec["exe"]
+    exe = Path(exe_path) if exe_path else _find_game_exe(install_path)
+    detected = detect_game_graphics_api(exe) if exe else {"bitness": None, "api": None}
+    result = {"exe": str(exe) if exe else None, "detected_api": detected["api"],
+             "detected_bitness": detected["bitness"], "installed": False,
+             "update_available": False}
+    if rec:
+        p = Path(rec["path"])
+        result.update({"installed": p.is_file(), "path": rec["path"],
+                       "channel": rec.get("channel", "stable"),
+                       "version": rec.get("version")})
+        if p.is_file() and rec.get("channel", "stable") == "stable":
+            try:
+                latest = reshade_latest()
+                engine_dir = RESHADE_STAGING_DIR / latest["version"]
+                staged64 = engine_dir / "ReShade64.dll"
+                staged32 = engine_dir / "ReShade32.dll"
+                sz = p.stat().st_size
+                known_sizes = {f.stat().st_size for f in (staged64, staged32) if f.is_file()}
+                result["update_available"] = bool(known_sizes) and sz not in known_sizes
+            except Exception:
+                pass
+    return result
+
+
+def install_reshade(appid, install_path, exe_override=None, task_id=None) -> dict:
+    """Installs ReShade (Stable channel) for one game: detects the exe/
+    graphics API/bitness, always installs as dxgi.dll (matches RHI's actual
+    behavior - ReShade's own runtime auto-hooks the right D3D/GL interface
+    once loaded there; no per-API proxy-name mapping needed), refuses to
+    overwrite a foreign dxgi.dll (backs it up as .original instead)."""
+    exe = Path(exe_override).expanduser() if exe_override else _find_game_exe(install_path)
+    if not exe or not exe.is_file():
+        raise RuntimeError("Couldn't find the game's .exe under its install folder — "
+                           "point Command Center at it manually.")
+    detected = detect_game_graphics_api(exe)
+    if detected["api"] in ("vulkan",):
+        raise RuntimeError("Vulkan ReShade install isn't supported yet on Linux - "
+                           "this needs Proton-prefix-specific work, not just a "
+                           "file copy. DX9-12 games work normally.")
+    bitness = detected["bitness"] or 64
+    target = exe.parent / "dxgi.dll"
+
+    info = reshade_latest()
+    engine_dir = ensure_reshade_engine(info["version"], info["url"], task_id=task_id)
+    src_dll = engine_dir / ("ReShade64.dll" if bitness == 64 else "ReShade32.dll")
+
+    _backup_foreign_dll(target)
+    shutil.copy2(src_dll, target)
+
+    state = load_state()
+    installs = state.setdefault("rhi_reshade_installs", {})
+    installs[str(appid)] = {"path": str(target), "channel": "stable",
+                            "version": info["version"], "bitness": bitness,
+                            "exe": str(exe),
+                            "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    save_state(state)
+    if task_id:
+        TASKS[task_id] = {"status": "done", "progress": 100,
+                          "detail": f"Installed ReShade {info['version']}",
+                          "result": {"version": info["version"]}}
+    return {"installed": True, "path": str(target), "version": info["version"],
+            "api": detected["api"], "bitness": bitness}
+
+
+def _install_reshade_task(task_id, appid, install_path, exe) -> None:
+    try:
+        install_reshade(appid, install_path, exe_override=exe, task_id=task_id)
+    except Exception as e:
+        TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
+
+
+def remove_reshade(appid) -> dict:
+    """Deletes the dxgi.dll ReShade install tracked for this game and
+    restores whatever foreign dxgi.dll it backed up, if any."""
+    state = load_state()
+    installs = state.get("rhi_reshade_installs", {})
+    rec = installs.pop(str(appid), None)
+    if not rec:
+        raise RuntimeError("No ReShade install tracked for this game.")
+    target = Path(rec["path"])
+    target.unlink(missing_ok=True)
+    save_state(state)
+    _restore_foreign_dll(target)
+    return {"removed": True}
+
+
+def is_re_engine_game(install_path) -> bool:
+    """RE Engine's signature file - present in every RE Engine game's root
+    (Resident Evil, Monster Hunter Wilds, DMC5, SF6, and similar). Shallow
+    scan (top 2 levels) since it's always near the game's install root."""
+    base = Path(install_path)
+    if not base.is_dir():
+        return False
+    for depth, (dirpath, dirnames, filenames) in enumerate(os.walk(base)):
+        if "re_chunk_000.pak" in filenames:
+            return True
+        if depth >= 1:
+            dirnames[:] = []   # don't recurse past depth 2
+    return False
+
+
+def re_framework_latest() -> dict:
+    """Latest REFramework-nightly release tag, 6h cached."""
+    state = load_state()
+    cache = state.get("re_framework_latest")
+    now = time.time()
+    if cache and now - cache.get("ts", 0) < 21600:
+        return cache["data"]
+    releases = _gh_json(RE_FRAMEWORK_RELEASES_API)
+    if not releases:
+        raise RuntimeError("Couldn't reach REFramework-nightly's releases")
+    tag = releases[0]["tag_name"]
+    data = {"version": tag, "url": RE_FRAMEWORK_ZIP_URL}
+    state["re_framework_latest"] = {"ts": now, "data": data}
+    save_state(state)
+    return data
+
+
+def install_re_framework(appid, install_path, task_id=None) -> dict:
+    """Downloads REFramework.zip and drops dinput8.dll directly in the game's
+    install root - a different hook slot than ReShade's dxgi.dll, so the two
+    coexist without wrapping each other."""
+    import zipfile, io
+    install_path = Path(install_path)
+    if not install_path.is_dir():
+        raise RuntimeError("Install path not found.")
+    info = re_framework_latest()
+    if task_id:
+        TASKS[task_id] = {"status": "running", "progress": 10,
+                          "detail": f"Downloading REFramework {info['version']}"}
+    data = _gh_bytes(info["url"], task_id)
+    if task_id:
+        TASKS[task_id]["detail"] = "Extracting"
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        names = [n for n in zf.namelist() if n.lower().endswith("dinput8.dll")]
+        if not names:
+            raise RuntimeError("REFramework.zip didn't contain dinput8.dll "
+                               "(its format may have changed)")
+        target = install_path / "dinput8.dll"
+        target.write_bytes(zf.read(names[0]))
+
+    state = load_state()
+    installs = state.setdefault("rhi_reframework_installs", {})
+    installs[str(appid)] = {"path": str(target), "version": info["version"],
+                            "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    save_state(state)
+    if task_id:
+        TASKS[task_id] = {"status": "done", "progress": 100,
+                          "detail": f"Installed REFramework {info['version']}",
+                          "result": {"version": info["version"]}}
+    return {"installed": True, "path": str(target), "version": info["version"]}
+
+
+def _install_re_framework_task(task_id, appid, install_path) -> None:
+    try:
+        install_re_framework(appid, install_path, task_id=task_id)
+    except Exception as e:
+        TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
+
+
+def remove_re_framework(appid) -> dict:
+    state = load_state()
+    installs = state.get("rhi_reframework_installs", {})
+    rec = installs.pop(str(appid), None)
+    if not rec:
+        raise RuntimeError("No RE Framework install tracked for this game.")
+    Path(rec["path"]).unlink(missing_ok=True)
+    save_state(state)
+    return {"removed": True}
+
+
+def scan_re_framework(appid, install_path) -> dict:
+    is_re_engine = is_re_engine_game(install_path)
+    state = load_state()
+    rec = state.get("rhi_reframework_installs", {}).get(str(appid))
+    result = {"is_re_engine": is_re_engine, "installed": False}
+    if rec:
+        p = Path(rec["path"])
+        result.update({"installed": p.is_file(), "path": rec["path"],
+                       "version": rec.get("version")})
+    return result
+
+
+# --------------------------------------------------------------------------
 # Owned library (community profile XML - no API key needed)
 # --------------------------------------------------------------------------
 
@@ -3183,170 +3673,6 @@ def install_game(appid: str):
 
 
 # --------------------------------------------------------------------------
-# MangoHud benchmarks (ported from Stutterless)
-# --------------------------------------------------------------------------
-BENCH_DIR = DATA_DIR / "benchmarks"
-BENCH_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def benchmark_launch_string(appid: str):
-    folder = BENCH_DIR / str(appid)
-    folder.mkdir(parents=True, exist_ok=True)  # MangoHud won't create it
-    cfg = (f"output_folder={folder},autostart_log=1,log_duration=300,"
-           f"benchmark_percentiles=AVG+1+0.1")
-    return f"MANGOHUD=1 MANGOHUD_CONFIG={cfg} %command%"
-
-
-def _parse_mangohud_csv(path):
-    """MangoHud CSVs have two header sections: a system header (line 1-2)
-    then the data-column header containing 'frametime'. Frametime is in
-    microseconds; normalise to ms. Falls back to fps-only logs."""
-    try:
-        with open(path, "r", errors="ignore") as f:
-            lines = [ln.rstrip("\n") for ln in f if ln.strip()]
-    except OSError:
-        return None
-    if len(lines) < 4:
-        return None
-    ft_col, data_start = None, 0
-    for i, ln in enumerate(lines):
-        if "frametime" in ln.lower():
-            cols = [c.strip().lower() for c in ln.split(",")]
-            for idx, c in enumerate(cols):
-                if c.startswith("frametime"):
-                    ft_col = idx
-            data_start = i + 1
-            break
-    frametimes = []
-
-    def push(val):
-        if val <= 0:
-            return
-        if val > 1e5:     # nanoseconds
-            ms = val / 1e6
-        elif val > 200:   # microseconds
-            ms = val / 1e3
-        else:             # already ms
-            ms = val
-        if 0.1 <= ms <= 1000:
-            frametimes.append(ms)
-
-    if ft_col is not None:
-        for ln in lines[data_start:]:
-            parts = ln.split(",")
-            if len(parts) > ft_col:
-                try:
-                    push(float(parts[ft_col]))
-                except ValueError:
-                    pass
-    else:  # very old MangoHud: fps in column 0
-        for ln in lines:
-            try:
-                fps = float(ln.split(",")[0])
-            except (ValueError, IndexError):
-                continue
-            if fps > 0:
-                push(1000.0 / fps)
-    if len(frametimes) < 20:
-        return None
-    return frametimes
-
-
-def _analyse_frametimes(ft) -> dict | None:
-    n = len(ft)
-    if n == 0:
-        return None
-    s = sorted(ft)
-    avg_ft = sum(ft) / n
-    k1 = max(1, n // 100)
-    k01 = max(1, n // 1000)
-    median = s[n // 2]
-    stutters = sum(1 for x in ft if x > 2.0 * median)
-    return {
-        "frames": n,
-        "avg_fps": round(1000.0 / avg_ft, 1),
-        "low1_fps": round(1000.0 / (sum(s[-k1:]) / k1), 1),
-        "low01_fps": round(1000.0 / (sum(s[-k01:]) / k01), 1),
-        "stutter_count": stutters,
-        "stutter_pct": round(100.0 * stutters / n, 2),
-    }
-
-
-def _downsample(series, target=200):
-    """Bucket to ~target points using max() so stutter spikes survive."""
-    n = len(series)
-    if n <= target:
-        return [round(x, 2) for x in series]
-    bucket, out, i = n / target, [], 0.0
-    while i < n:
-        chunk = series[int(i):int(i + bucket) or int(i) + 1]
-        if chunk:
-            out.append(round(max(chunk), 2))
-        i += bucket
-    return out
-
-
-def get_benchmark_data(root: Path, appid: str):
-    folder = BENCH_DIR / str(appid)
-    result = {
-        "has_mangohud": shutil.which("mangohud") is not None,
-        "launch_string": benchmark_launch_string(appid),
-        "folder": str(folder),
-        "before": None, "after": None,
-        "before_graph": None, "after_graph": None,
-        "improvement_pct": None, "log_count": 0, "diag": [],
-    }
-    diag = result["diag"]
-    logs = sorted(
-        ((p, p.stat().st_mtime) for p in folder.rglob("*.csv")),
-        key=lambda x: x[1]) if folder.is_dir() else []
-    result["log_count"] = len(logs)
-    if not logs:
-        diag.append("No MangoHud logs yet — save the benchmark launch options, "
-                    "play for a few minutes, and check back.")
-        return result
-    usable = []
-    for p, mt in logs:
-        ft = _parse_mangohud_csv(p)
-        if ft:
-            usable.append((p, mt, ft))
-        else:
-            diag.append(f"Couldn't parse {p.name} (too short — play longer).")
-    if not usable:
-        diag.append("Logs found but none had enough frametime data "
-                    "(play at least ~30 seconds).")
-        return result
-    split = load_state().get("compiled", {}).get(str(appid), {}).get("compiled_at", 0)
-    before = [u for u in usable if u[1] < split] if split else []
-    after = [u for u in usable if u[1] >= split] if split else []
-    if (not before or not after) and len(usable) >= 2:
-        before, after = [usable[0]], [usable[-1]]
-        diag.append("Using oldest log as 'before' and newest as 'after'.")
-    elif len(usable) == 1:
-        if split and usable[0][1] >= split:
-            after = [usable[0]]
-            diag.append("Only an 'after' run so far — nothing to compare against.")
-        else:
-            before = [usable[0]]
-            diag.append("Only a 'before' run — compile, play again, then compare.")
-
-    def analyse(u):
-        if not u:
-            return None, None
-        ft = u[-1][2]
-        return _analyse_frametimes(ft), _downsample(ft)
-
-    result["before"], result["before_graph"] = analyse(before)
-    result["after"], result["after_graph"] = analyse(after)
-    if result["before"] and result["after"] and result["before"]["low1_fps"] > 0:
-        result["improvement_pct"] = round(
-            100.0 * (result["after"]["low1_fps"] - result["before"]["low1_fps"])
-            / result["before"]["low1_fps"], 1)
-        diag.append("Comparison ready.")
-    return result
-
-
-# --------------------------------------------------------------------------
 # Hardware detection + MangoHud configuration
 # --------------------------------------------------------------------------
 MANGOHUD_DIR = Path(os.environ.get("XDG_CONFIG_HOME",
@@ -3594,7 +3920,7 @@ MANGOHUD_PRESETS = {
 
 
 def mangohud_config(preset="reference", hw=None, pin_gpu=None,
-                    log_dir=None, toggle_key="Shift_R+F12"):
+                    toggle_key="Shift_R+F12"):
     hw = hw or detect_hardware()
     lines = [
         "### Generated by Proton Command Center",
@@ -3640,20 +3966,17 @@ def mangohud_config(preset="reference", hw=None, pin_gpu=None,
 
     lines += [""] + MANGOHUD_PRESETS.get(preset, MANGOHUD_PRESETS["reference"])
     lines += ["", f"toggle_hud={toggle_key}", "toggle_logging=Shift_L+F2"]
-    if log_dir:
-        lines += [f"output_folder={log_dir}", "log_duration=300",
-                  "autostart_log=0", "benchmark_percentiles=AVG,1,0.1"]
     return "\n".join(lines) + "\n"
 
 
-def apply_mangohud_config(preset="reference", pin_gpu=None, log_dir=None) -> dict:
+def apply_mangohud_config(preset="reference", pin_gpu=None) -> dict:
     MANGOHUD_DIR.mkdir(parents=True, exist_ok=True)
     dest = MANGOHUD_DIR / "MangoHud.conf"
     backup = None
     if dest.is_file():
         backup = dest.with_suffix(f".conf.pcc-{int(time.time())}.bak")
         shutil.copy2(dest, backup)
-    text = mangohud_config(preset, pin_gpu=pin_gpu, log_dir=log_dir)
+    text = mangohud_config(preset, pin_gpu=pin_gpu)
     tmp = dest.with_suffix(".conf.pcc-tmp")
     tmp.write_text(text)
     tmp.replace(dest)
@@ -3949,6 +4272,18 @@ class Handler(BaseHTTPRequestHandler):
                 catalog = ultraplus_catalog()
                 matched = match_ultraplus_catalog(g["name"], catalog)
                 self._json({"addons": list_addons(matched[0], catalog, m.group(1)) if matched else []})
+            elif m := re.match(r"^/api/game/(\d+)/rhi/reshade$", self.path):
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(m.group(1))
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                self._json(scan_game_reshade(m.group(1), g["install_path"]))
+            elif m := re.match(r"^/api/game/(\d+)/rhi/refwork$", self.path):
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(m.group(1))
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                self._json(scan_re_framework(m.group(1), g["install_path"]))
             elif self.path == "/api/progress":
                 self._json({"games": install_progress(root)})
             elif self.path == "/api/owned_games":
@@ -3981,8 +4316,6 @@ class Handler(BaseHTTPRequestHandler):
                                                                "cached": True})
                 else:
                     self._json(protondb_summary(m.group(1)) or {"tier": None})
-            elif m := re.match(r"^/api/game/(\d+)/benchmark$", self.path):
-                self._json(get_benchmark_data(root, m.group(1)))
             elif m := re.match(r"^/api/owned(?:\?(.*))?$", self.path):
                 qs = urllib.parse.parse_qs(m.group(1) or "")
                 force = (qs.get("refresh") or ["0"])[0] == "1"
@@ -4133,6 +4466,34 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"task": tid})
             elif self.path == "/api/mods/addons/remove":
                 self._json(remove_addon(body["appid"], body["file_name"]))
+            elif self.path == "/api/rhi/reshade/install":
+                appid = body["appid"]
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(appid)
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                tid = str(uuid.uuid4())
+                TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
+                threading.Thread(target=_install_reshade_task,
+                                 args=(tid, appid, g["install_path"], body.get("exe")),
+                                 daemon=True).start()
+                self._json({"task": tid})
+            elif self.path == "/api/rhi/reshade/remove":
+                self._json(remove_reshade(body["appid"]))
+            elif self.path == "/api/rhi/refwork/install":
+                appid = body["appid"]
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(appid)
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                tid = str(uuid.uuid4())
+                TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
+                threading.Thread(target=_install_re_framework_task,
+                                 args=(tid, appid, g["install_path"]),
+                                 daemon=True).start()
+                self._json({"task": tid})
+            elif self.path == "/api/rhi/refwork/remove":
+                self._json(remove_re_framework(body["appid"]))
             elif self.path == "/api/proton/install":
                 tid = str(uuid.uuid4())
                 threading.Thread(target=install_ge_proton,
@@ -4179,8 +4540,7 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/mangohud/apply":
                 self._json(apply_mangohud_config(
                     body.get("preset", "standard"),
-                    pin_gpu=body.get("pin_gpu"),
-                    log_dir=str(BENCH_DIR) if body.get("enable_logging") else None))
+                    pin_gpu=body.get("pin_gpu")))
             elif self.path == "/api/steam/launch":
                 self._json({"launched": launch_steam()})
             elif self.path == "/api/dlss/swap":

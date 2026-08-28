@@ -42,6 +42,57 @@ def make_mock_steam(base: Path) -> Path:
     return root
 
 
+def _build_fake_pe64(regular_dlls=(), delay_dlls=()):
+    """Minimal but structurally real PE32+ exe: DOS stub, PE/COFF/optional
+    headers, one section whose VirtualAddress == PointerToRawData (so
+    RVA-to-file-offset is the identity function within it), containing a
+    regular import descriptor table and/or a delay-load import descriptor
+    table, each pointing at real null-terminated DLL name strings. Enough
+    for pe_imports()/detect_graphics_api() to parse exactly like a real exe."""
+    HEADER_SIZE = 64 + 4 + 20 + 240 + 40  # dos stub + PE sig + COFF + opt hdr + 1 section hdr
+    section_start = HEADER_SIZE
+    body = bytearray()
+
+    def add_cstr(s):
+        off = section_start + len(body)
+        body.extend(s.encode("ascii") + b"\x00")
+        return off
+
+    def add_descriptors(dlls, entry_size, name_field_off):
+        if not dlls:
+            return 0
+        name_offs = [add_cstr(d) for d in dlls]
+        arr_off = section_start + len(body)
+        for noff in name_offs:
+            entry = bytearray(entry_size)
+            struct.pack_into("<I", entry, name_field_off, noff)
+            body.extend(entry)
+        body.extend(bytearray(entry_size))  # null terminator entry
+        return arr_off
+
+    import_rva = add_descriptors(regular_dlls, 20, 12)
+    delay_rva = add_descriptors(delay_dlls, 32, 4)
+
+    dos = bytearray(64)
+    dos[0:2] = b"MZ"
+    struct.pack_into("<i", dos, 0x3C, 64)
+
+    coff = struct.pack("<HHIIIHH", 0x8664, 1, 0, 0, 0, 240, 0x0022)
+
+    opt = bytearray(240)
+    struct.pack_into("<H", opt, 0, 0x20B)   # PE32+ magic
+    dir_array_off = 112
+    struct.pack_into("<I", opt, dir_array_off + 1 * 8, import_rva)
+    struct.pack_into("<I", opt, dir_array_off + 13 * 8, delay_rva)
+
+    section = bytearray(40)
+    section[0:8] = b".rdata\x00\x00"
+    struct.pack_into("<II", section, 8, len(body), section_start)   # VirtualSize, VirtualAddress
+    struct.pack_into("<I", section, 20, section_start)               # PointerToRawData
+
+    return bytes(dos) + b"PE\x00\x00" + coff + bytes(opt) + bytes(section) + bytes(body)
+
+
 class PCCTests(unittest.TestCase):
     _ORIGINALS = ("steam_running", "driver_version", "_nvidia_gpus", "_drm_gpus",
                   "cpu_name", "find_font", "shutdown_steam", "subprocess",
@@ -60,6 +111,8 @@ class PCCTests(unittest.TestCase):
         pcc.STATE_FILE = pcc.DATA_DIR / "state.json"
         pcc.CONFIG_FILE = pcc.DATA_DIR / "config.json"
         pcc.ART_DIR = pcc.DATA_DIR / "art"
+        pcc.RHI_DATA_DIR = pcc.DATA_DIR / "rhi"
+        pcc.RESHADE_STAGING_DIR = pcc.RHI_DATA_DIR / "reshade"
         for d in (pcc.DLL_LIBRARY, pcc.BACKUP_DIR, pcc.ART_DIR):
             d.mkdir(parents=True, exist_ok=True)
         pcc.steam_running = lambda: False
@@ -828,6 +881,228 @@ class PCCTests(unittest.TestCase):
         found = pcc._find_game_exe(d)
         self.assertEqual(found, real)
 
+    # ---- RHI: graphics API detection ----
+    def test_pe_imports_parses_regular_and_delay_load(self):
+        exe = Path(self.tmp.name) / "game.exe"
+        exe.write_bytes(_build_fake_pe64(
+            regular_dlls=["d3d11.dll", "kernel32.dll"],
+            delay_dlls=["d3d12.dll"]))
+        bitness, regular, delay = pcc.pe_imports(exe)
+        self.assertEqual(bitness, 64)
+        self.assertEqual(regular, {"d3d11.dll", "kernel32.dll"})
+        self.assertEqual(delay, {"d3d12.dll"})
+
+    def test_pe_imports_rejects_non_pe(self):
+        exe = Path(self.tmp.name) / "notreally.exe"
+        exe.write_bytes(b"not a pe file")
+        bitness, regular, delay = pcc.pe_imports(exe)
+        self.assertIsNone(bitness)
+        self.assertEqual(regular, set())
+        self.assertEqual(delay, set())
+
+    def test_detect_graphics_api_priority_and_dxgi_inference(self):
+        self.assertEqual(pcc.detect_graphics_api({"d3d11.dll", "d3d9.dll"}), "d3d11")
+        self.assertEqual(pcc.detect_graphics_api({"opengl32.dll"}), "opengl")
+        self.assertEqual(pcc.detect_graphics_api({"dxgi.dll"}), "d3d12")
+        self.assertEqual(pcc.detect_graphics_api({"dxgi.dll", "d3d11.dll"}), "d3d11")
+        self.assertIsNone(pcc.detect_graphics_api(set()))
+
+    def test_detect_graphics_api_delay_load_fallback(self):
+        # regular import has nothing >= DX11 -> delay-loaded d3d12 promotes
+        self.assertEqual(
+            pcc.detect_graphics_api({"opengl32.dll"}, {"d3d12.dll"}), "d3d12")
+        # regular import already has d3d11 (>= DX11 priority) -> delay-load
+        # d3d12 must NOT override it (UE4/5 often delay-loads d3d12 as an
+        # optional path while d3d11 is the real default API)
+        self.assertEqual(
+            pcc.detect_graphics_api({"d3d11.dll"}, {"d3d12.dll"}), "d3d11")
+
+    def test_detect_unity_api_boot_config_and_fallback(self):
+        d = Path(self.tmp.name) / "unity_game"
+        d.mkdir()
+        exe = d / "Game.exe"
+        exe.write_bytes(b"MZ")
+        data_dir = d / "Game_Data"
+        data_dir.mkdir()
+        # no boot.config at all -> Unity default DX11
+        self.assertEqual(pcc._detect_unity_api(exe), "d3d11")
+        (data_dir / "boot.config").write_text("gfx-device-type=21\n")
+        self.assertEqual(pcc._detect_unity_api(exe), "vulkan")
+        # not a Unity game at all (no _Data dir) -> None
+        exe2 = Path(self.tmp.name) / "NotUnity.exe"
+        exe2.write_bytes(b"MZ")
+        self.assertIsNone(pcc._detect_unity_api(exe2))
+
+    def test_detect_game_graphics_api_caches_by_mtime(self):
+        exe = Path(self.tmp.name) / "game2.exe"
+        exe.write_bytes(_build_fake_pe64(regular_dlls=["d3d11.dll"]))
+        r1 = pcc.detect_game_graphics_api(exe)
+        self.assertEqual(r1["api"], "d3d11")
+        self.assertEqual(r1["bitness"], 64)
+        state = pcc.load_state()
+        self.assertIn(str(exe), state["rhi_api_cache"])
+        # mutate on disk without touching mtime - cached result must stick
+        real_stat = exe.stat()
+        exe.write_bytes(_build_fake_pe64(regular_dlls=["opengl32.dll"]))
+        os.utime(exe, (real_stat.st_atime, real_stat.st_mtime))
+        r2 = pcc.detect_game_graphics_api(exe)
+        self.assertEqual(r2["api"], "d3d11")
+
+    # ---- RHI: ReShade install ----
+    def _fake_game_exe(self, dlls=("d3d11.dll",)):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        exe = d / "Game.exe"
+        exe.write_bytes(_build_fake_pe64(regular_dlls=list(dlls)))
+        return d, exe
+
+    def test_install_reshade_full_flow_and_remove(self):
+        d, exe = self._fake_game_exe()
+        engine_dir = pcc.RESHADE_STAGING_DIR / "9.9.9"
+        engine_dir.mkdir(parents=True)
+        (engine_dir / "ReShade64.dll").write_bytes(b"R" * 1_100_000)
+        (engine_dir / "ReShade32.dll").write_bytes(b"r" * 1_100_000)
+        real_latest, real_engine = pcc.reshade_latest, pcc.ensure_reshade_engine
+        pcc.reshade_latest = lambda: {"version": "9.9.9", "url": "http://x"}
+        pcc.ensure_reshade_engine = lambda version, url=None, task_id=None: engine_dir
+        try:
+            r = pcc.install_reshade("12345", str(d), exe_override=str(exe))
+        finally:
+            pcc.reshade_latest = real_latest
+            pcc.ensure_reshade_engine = real_engine
+
+        self.assertTrue(r["installed"])
+        self.assertEqual(r["api"], "d3d11")
+        self.assertEqual(r["bitness"], 64)
+        target = d / "dxgi.dll"
+        self.assertEqual(target.read_bytes(), b"R" * 1_100_000)
+
+        status = pcc.scan_game_reshade("12345", str(d), exe_path=str(exe))
+        self.assertTrue(status["installed"])
+        self.assertEqual(status["channel"], "stable")
+
+        rm = pcc.remove_reshade("12345")
+        self.assertTrue(rm["removed"])
+        self.assertFalse(target.exists())
+        with self.assertRaises(RuntimeError):
+            pcc.remove_reshade("12345")
+
+    def test_scan_game_reshade_remembers_override_exe(self):
+        """Regression: after installing against a manually-overridden exe
+        (because _find_game_exe's largest-.exe heuristic picked the wrong
+        one - a real launcher/setup binary bigger than the actual game exe,
+        confirmed live against The Witcher 3), status must keep reporting
+        the exe that was actually used, not re-run the same wrong guess."""
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        decoy = d / "setup_launcher.exe"
+        decoy.write_bytes(b"x" * 50_000)  # bigger than the real fake PE below
+        (d / "bin/x64").mkdir(parents=True)
+        real_exe = d / "bin/x64/Game.exe"
+        real_exe.write_bytes(_build_fake_pe64(regular_dlls=["d3d11.dll"]))
+        # sanity: the auto-detect heuristic really would pick the wrong one
+        self.assertEqual(pcc._find_game_exe(d), decoy)
+
+        engine_dir = pcc.RESHADE_STAGING_DIR / "9.9.9"
+        engine_dir.mkdir(parents=True)
+        (engine_dir / "ReShade64.dll").write_bytes(b"R" * 1_100_000)
+        (engine_dir / "ReShade32.dll").write_bytes(b"r" * 1_100_000)
+        real_latest, real_engine = pcc.reshade_latest, pcc.ensure_reshade_engine
+        pcc.reshade_latest = lambda: {"version": "9.9.9", "url": "http://x"}
+        pcc.ensure_reshade_engine = lambda version, url=None, task_id=None: engine_dir
+        try:
+            pcc.install_reshade("12345", str(d), exe_override=str(real_exe))
+        finally:
+            pcc.reshade_latest = real_latest
+            pcc.ensure_reshade_engine = real_engine
+
+        status = pcc.scan_game_reshade("12345", str(d))   # no exe_path override this time
+        self.assertEqual(status["exe"], str(real_exe))
+        self.assertEqual(status["detected_api"], "d3d11")
+        self.assertEqual(status["path"], str(d / "bin/x64/dxgi.dll"))
+
+    def test_install_reshade_backs_up_foreign_dxgi_not_deletes(self):
+        d, exe = self._fake_game_exe()
+        (d / "dxgi.dll").write_bytes(b"totally unrelated vendor DLL content")
+        engine_dir = pcc.RESHADE_STAGING_DIR / "9.9.9"
+        engine_dir.mkdir(parents=True)
+        (engine_dir / "ReShade64.dll").write_bytes(b"R" * 1_100_000)
+        (engine_dir / "ReShade32.dll").write_bytes(b"r" * 1_100_000)
+        real_latest, real_engine = pcc.reshade_latest, pcc.ensure_reshade_engine
+        pcc.reshade_latest = lambda: {"version": "9.9.9", "url": "http://x"}
+        pcc.ensure_reshade_engine = lambda version, url=None, task_id=None: engine_dir
+        try:
+            pcc.install_reshade("12345", str(d), exe_override=str(exe))
+        finally:
+            pcc.reshade_latest = real_latest
+            pcc.ensure_reshade_engine = real_engine
+
+        backup = d / "dxgi.dll.original"
+        self.assertTrue(backup.is_file())
+        self.assertEqual(backup.read_bytes(), b"totally unrelated vendor DLL content")
+        self.assertEqual((d / "dxgi.dll").read_bytes(), b"R" * 1_100_000)
+
+        pcc.remove_reshade("12345")
+        self.assertFalse(backup.exists())
+        self.assertEqual((d / "dxgi.dll").read_bytes(),
+                         b"totally unrelated vendor DLL content")
+
+    def test_install_reshade_refuses_vulkan(self):
+        d, exe = self._fake_game_exe(dlls=["vulkan-1.dll"])
+        with self.assertRaises(RuntimeError):
+            pcc.install_reshade("12345", str(d), exe_override=str(exe))
+
+    def test_identify_dxgi_file_by_string_scan(self):
+        d, _ = self._fake_game_exe()
+        p = d / "dxgi.dll"
+        p.write_bytes(b"junk before " + b"ReShade" + b" junk " + b"reshade.me" + b" junk")
+        self.assertEqual(pcc._identify_dxgi_file(p), "reshade")
+        p.write_bytes(b"not a reshade dll at all, just some other vendor's file")
+        self.assertEqual(pcc._identify_dxgi_file(p), "unknown")
+        p.write_bytes(b"x" * 20_000_000)  # too big to ever be ReShade
+        self.assertEqual(pcc._identify_dxgi_file(p), "unknown")
+
+    # ---- RHI: RE Framework ----
+    def test_is_re_engine_game_detects_signature_file(self):
+        d = self.root / "steamapps/common/REGame"
+        d.mkdir(parents=True)
+        self.assertFalse(pcc.is_re_engine_game(d))
+        (d / "re_chunk_000.pak").write_bytes(b"x")
+        self.assertTrue(pcc.is_re_engine_game(d))
+
+    def test_install_re_framework_full_flow_and_remove(self):
+        import zipfile, io as _io
+        d = self.root / "steamapps/common/REGame"
+        d.mkdir(parents=True)
+        (d / "re_chunk_000.pak").write_bytes(b"x")
+        buf = _io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("dinput8.dll", b"fake refw dll")
+        zip_bytes = buf.getvalue()
+
+        real_latest, real_bytes = pcc.re_framework_latest, pcc._gh_bytes
+        pcc.re_framework_latest = lambda: {"version": "nightly-99999-abc", "url": "http://x"}
+        pcc._gh_bytes = lambda url, task=None: zip_bytes
+        try:
+            r = pcc.install_re_framework("12345", str(d))
+        finally:
+            pcc.re_framework_latest = real_latest
+            pcc._gh_bytes = real_bytes
+
+        self.assertTrue(r["installed"])
+        target = d / "dinput8.dll"
+        self.assertEqual(target.read_bytes(), b"fake refw dll")
+
+        status = pcc.scan_re_framework("12345", str(d))
+        self.assertTrue(status["is_re_engine"])
+        self.assertTrue(status["installed"])
+
+        rm = pcc.remove_re_framework("12345")
+        self.assertTrue(rm["removed"])
+        self.assertFalse(target.exists())
+        with self.assertRaises(RuntimeError):
+            pcc.remove_re_framework("12345")
+
     # ---- compile state ----
     def test_sgdb_fetch_and_cache(self):
         pcc.save_config({"sgdb_api_key": "k3y"})
@@ -862,22 +1137,6 @@ class PCCTests(unittest.TestCase):
             raise OSError("404")
         pcc.urllib.request.urlopen = cdn_down
         self.assertIsNone(pcc.sgdb_art("888"))
-
-    # ---- benchmarks (ported from Stutterless) ----
-    def test_mangohud_csv_and_analysis(self):
-        p = Path(self.tmp.name) / "log.csv"
-        rows = ["os,cpu,gpu,ram,kernel,driver", "x,x,x,x,x,x",
-                "fps,frametime,cpu_load"]
-        rows += [f"120,{8300 if i % 50 else 45000},50" for i in range(200)]
-        p.write_text("\n".join(rows))
-        ft = pcc._parse_mangohud_csv(p)
-        self.assertGreaterEqual(len(ft), 190)
-        an = pcc._analyse_frametimes(ft)
-        self.assertGreater(an["avg_fps"], 90)
-        self.assertGreaterEqual(an["stutter_count"], 3)
-        ds = pcc._downsample(ft, target=40)
-        self.assertLessEqual(len(ds), 45)
-        self.assertGreater(max(ds), 40)  # spikes preserved
 
     def test_skip_list(self):
         self.assertIn("1493710", pcc.SKIP_APPIDS)

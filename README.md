@@ -32,9 +32,6 @@ build and greys out what won't work, so you can't ship dead options.
 **Manages DLSS DLLs.** Every DLL in the game with its version, one-click
 upgrade, backups you can roll back.
 
-**Benchmarks before and after.** MangoHud logs split at the change, compared on
-avg FPS, 1% and 0.1% lows, and stutter count.
-
 **Works from the sofa.** Full controller navigation, fullscreen, and a hint bar
 with the mapping.
 
@@ -48,7 +45,7 @@ with an Install button and live progress.
 | | |
 |---|---|
 | **Required** | Python 3, Steam (logged in once) |
-| **Optional** | `mangohud` for the overlay and benchmarks |
+| **Optional** | `mangohud` for the overlay |
 | **Optional** | An NVIDIA driver for DLSS features |
 
 Built and tested on Arch-based distros with an NVIDIA slant. Nothing is
@@ -147,7 +144,7 @@ alt-tabbing out. Compact-vs-per-variable output and the save/apply-default
 template live under "Advanced preset options" so a first-time user isn't
 staring at raw NGX/DRS variable names before they've touched anything else.
 
-### Mods tab
+### Ultra+ tab
 
 Installs, updates, and removes [Ultra+](https://theultraplace.com) mods
 directly - no separate Ultra+ Manager app needed. If the game has a published
@@ -161,11 +158,12 @@ Skip "I manage my own UE4SS" if you run UE4SS yourself already - it installs
 only the mod's own files and Content `.pak`/`.ucas`/`.utoc` packages, not the
 UE4SS runtime or loader DLL.
 
-### Benchmark tab
+### RHI tab
 
-Save the benchmark launch options, play, change something, play again. Logs are
-split at the marked point and compared on avg FPS, 1% and 0.1% lows, and stutter
-count, with frametime graphs.
+A native port (in progress) of [RHI](https://github.com/RankFTW/RHI)'s
+ReShade and shader/addon management - installs ReShade under its own
+graphics-API detection, with an RE Framework companion for RE Engine games.
+Shader packs and addons land in a follow-up pass.
 
 ### ProtonDB check
 
