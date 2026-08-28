@@ -2393,6 +2393,34 @@ def restore_dll(game_dll_path) -> dict:
     return {"restored": True, "version": pe_version(game_dll)}
 
 
+_EXE_SKIP_DIRS = {"_commonredist", "redist", "directx", "vcredist", "crashreporter", "crashpad"}
+_EXE_SKIP_NAME_HINTS = ("unins", "redist", "vcredist", "directx", "dxsetup",
+                        "crashreporter", "crashpad", "easyanticheat",
+                        "battleye", "vc_redist", "7za", "7z.exe")
+
+
+def _walk_exe_candidates(base):
+    """Every plausible game .exe under an install root, biggest first,
+    skipping obvious installers/redistributables/anti-cheat launchers by
+    name. Shared by `_find_game_exe` (single best guess) and
+    `find_game_exe_candidates` (full list, for dual-build games)."""
+    candidates = []
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if d.lower() not in _EXE_SKIP_DIRS]
+        for fn in filenames:
+            low = fn.lower()
+            if not low.endswith(".exe") or any(h in low for h in _EXE_SKIP_NAME_HINTS):
+                continue
+            p = Path(dirpath) / fn
+            try:
+                size = p.stat().st_size
+            except OSError:
+                continue
+            candidates.append((size, p))
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    return candidates
+
+
 def _find_game_exe(install_path):
     """Best-effort: prefers the largest .exe that actually imports a known
     graphics API DLL (d3d9/d3d11/d3d12/dxgi/opengl32/vulkan-1) over one that
@@ -2413,26 +2441,9 @@ def _find_game_exe(install_path):
     base = Path(install_path)
     if not base.is_dir():
         return None
-    SKIP_DIRS = {"_commonredist", "redist", "directx", "vcredist"}
-    SKIP_NAME_HINTS = ("unins", "redist", "vcredist", "directx", "dxsetup",
-                       "crashreporter", "crashpad", "easyanticheat",
-                       "battleye", "vc_redist")
-    candidates = []
-    for dirpath, dirnames, filenames in os.walk(base):
-        dirnames[:] = [d for d in dirnames if d.lower() not in SKIP_DIRS]
-        for fn in filenames:
-            low = fn.lower()
-            if not low.endswith(".exe") or any(h in low for h in SKIP_NAME_HINTS):
-                continue
-            p = Path(dirpath) / fn
-            try:
-                size = p.stat().st_size
-            except OSError:
-                continue
-            candidates.append((size, p))
+    candidates = _walk_exe_candidates(base)
     if not candidates:
         return None
-    candidates.sort(key=lambda t: t[0], reverse=True)
 
     best_with_api, best_with_api_size = None, -1
     for size, p in candidates[:10]:
@@ -2446,6 +2457,114 @@ def _find_game_exe(install_path):
     if best_with_api:
         return best_with_api
     return candidates[0][1]
+
+
+_PATH_API_HINTS = [
+    ("dx12", "d3d12"), ("d3d12", "d3d12"), ("directx12", "d3d12"),
+    ("dx11", "d3d11"), ("d3d11", "d3d11"), ("directx11", "d3d11"),
+    ("dx10", "d3d10"), ("d3d10", "d3d10"),
+    ("dx9", "d3d9"), ("d3d9", "d3d9"), ("directx9", "d3d9"),
+    ("dx8", "d3d8"), ("d3d8", "d3d8"),
+    ("vulkan", "vulkan"),
+    ("opengl", "opengl"),
+]
+
+
+def _infer_api_from_path(exe_path) -> str | None:
+    """Fallback label for exes a static PE import scan can't read anything
+    from - e.g. The Witcher 3's `bin/x64_dx12/witcher3.exe`, which loads
+    dxgi.dll/d3d12.dll dynamically at runtime via LoadLibrary rather than
+    importing them, so the import table is genuinely empty of any graphics
+    DLL. Folder/file names like `x64_dx12` are a real (if weaker) signal a
+    developer chose deliberately, worth surfacing as "looks like DX12
+    (from folder name)" instead of a flat "couldn't tell" - never used for
+    any install-time behavioral decision (Vulkan refusal etc still relies
+    only on the real PE scan), display purposes only."""
+    parts = [p.lower() for p in Path(exe_path).parts]
+    haystack = "/".join(parts)
+    for token, api in _PATH_API_HINTS:
+        if token in haystack:
+            return api
+    return None
+
+
+_API_DISPLAY_NAMES = {
+    "d3d12": "DirectX 12", "d3d11": "DirectX 11", "d3d10": "DirectX 10",
+    "d3d9": "DirectX 9", "d3d8": "DirectX 8", "vulkan": "Vulkan",
+    "opengl": "OpenGL",
+}
+
+
+def describe_graphics_api(api, exe_path=None) -> dict:
+    """Friendly display label for a detected (or undetected) graphics API,
+    falling back to a folder-name-based guess so the UI can say "looks like
+    DirectX 12 (from folder name)" instead of just "couldn't tell" - this
+    is the dual DX11/DX12-build case (games that ship separate exes per
+    renderer in separate folders, e.g. bin/x64/ vs bin/x64_dx12/) that a
+    static import scan alone can't always resolve."""
+    if api:
+        return {"label": _API_DISPLAY_NAMES.get(api, api.upper()), "inferred": False}
+    if exe_path:
+        guess = _infer_api_from_path(exe_path)
+        if guess:
+            return {"label": f"{_API_DISPLAY_NAMES.get(guess, guess.upper())} (from folder name)",
+                    "inferred": True}
+    return {"label": None, "inferred": False}
+
+
+def find_game_exe_candidates(install_path, limit=8) -> list[dict]:
+    """Every distinct game build under an install root, not just the single
+    best guess `_find_game_exe` returns - built for games that ship more
+    than one renderer as separate exes in separate folders (confirmed live:
+    The Witcher 3 ships both `bin/x64/witcher3.exe` [DX11, statically
+    detectable] and `bin/x64_dx12/witcher3.exe` [DX12, loads its API
+    dynamically - undetectable via import-table scanning]). One candidate
+    per unique parent directory (the largest .exe in each folder - a
+    launcher stub and the real game binary rarely share a directory),
+    ranked real-API-detected first, then folder-name-inferred, then
+    unknown; by size within each tier. Powers the RHI tab's "Detected
+    builds" picker so the user can see every build PCC found and explicitly
+    choose which one ReShade/OptiScaler/DXVK/shader packs should target,
+    instead of silently guessing wrong the way the shader-pack path-
+    resolution bug did."""
+    base = Path(install_path)
+    if not base.is_dir():
+        return []
+    candidates = _walk_exe_candidates(base)
+    by_dir = {}
+    for size, p in candidates:
+        d = str(p.parent)
+        if d not in by_dir or size > by_dir[d][0]:
+            by_dir[d] = (size, p)
+
+    out = []
+    for size, p in by_dir.values():
+        try:
+            _, regular, delay = pe_imports(p)
+            api = detect_graphics_api(regular, delay)
+        except Exception:
+            api = None
+        display = describe_graphics_api(api, p)
+        rank = 0 if api else (1 if display["inferred"] else 2)
+        out.append({"path": str(p), "size": size, "api": api,
+                    "label": display["label"] or "Unknown engine",
+                    "inferred": display["inferred"], "_rank": rank})
+    out.sort(key=lambda c: (c["_rank"], -c["size"]))
+    for c in out:
+        del c["_rank"]
+    return out[:limit]
+
+
+def detect_game_builds(install_path) -> dict:
+    """Groups `find_game_exe_candidates` output for the RHI tab: the ranked
+    candidate list, plus whether this game actually has more than one
+    distinct build (different detected/inferred APIs in different folders)
+    - the case that caused ReShade to silently install into the wrong
+    folder for a dual-renderer game until this was added."""
+    candidates = find_game_exe_candidates(install_path)
+    apis = {c["api"] for c in candidates if c["api"]} | \
+           {c["label"] for c in candidates if c["api"] is None and c["inferred"]}
+    return {"candidates": candidates, "has_multiple_builds": len(apis) > 1}
 
 
 # --------------------------------------------------------------------------
@@ -2921,9 +3040,12 @@ def scan_game_reshade(appid, install_path, exe_path=None) -> dict:
         exe_path = rec["exe"]
     exe = Path(exe_path) if exe_path else _find_game_exe(install_path)
     detected = detect_game_graphics_api(exe) if exe else {"bitness": None, "api": None}
+    display = describe_graphics_api(detected["api"], exe) if exe else {"label": None, "inferred": False}
     result = {"exe": str(exe) if exe else None, "detected_api": detected["api"],
+             "detected_api_display": display["label"], "detected_api_inferred": display["inferred"],
              "detected_bitness": detected["bitness"], "installed": False,
              "update_available": False,
+             "builds": detect_game_builds(install_path),
              "custom_files": list_custom_reshade_files()}
     if rec:
         p = Path(rec["path"])
@@ -3390,6 +3512,37 @@ def get_shader_pack_catalog() -> list:
             "description": p["description"], "requires": p.get("requires") or [],
             "cached": p["id"] in cache}
            for p in RESHADE_SHADER_PACKS]
+
+
+def resolve_rhi_target_dir(appid, install_path) -> Path:
+    """Resolves the directory RHI shader packs should land in for one
+    game: whichever RHI mod is already installed there is authoritative
+    (ReShade, then OptiScaler, then DXVK - checked in that order, matching
+    exactly what that mod itself resolved, including any manual exe
+    override the user gave it), otherwise the same graphics-API-aware exe
+    detection ReShade itself would use to auto-install. Never the raw
+    Steam install root on its own - that's wrong for any game whose real
+    exe lives in a subdirectory (bin/x64/, bin/x64_dx12/, etc), which
+    live-testing confirmed is common. Addons already resolved this
+    correctly (Part 1f) by reading straight from the ReShade record; this
+    generalizes that same fix for shader packs, which had been deploying
+    to the Steam root the whole time. Checking OptiScaler/DXVK too (not
+    just ReShade) matters for a game that has one of those installed but
+    not ReShade - it would otherwise fall through to a fresh exe-detection
+    guess instead of reusing the build the user already confirmed by
+    installing something else onto it."""
+    state = load_state()
+    rec = state.get("rhi_reshade_installs", {}).get(str(appid))
+    if rec:
+        return Path(rec["path"]).parent
+    rec = state.get("rhi_optiscaler_installs", {}).get(str(appid))
+    if rec:
+        return Path(rec["install_path"])
+    rec = state.get("rhi_dxvk_installs", {}).get(str(appid))
+    if rec:
+        return Path(rec["install_path"])
+    exe = _find_game_exe(install_path)
+    return exe.parent if exe else Path(install_path)
 
 
 def deploy_shader_packs(install_path, pack_ids, task_id=None) -> dict:
@@ -4298,7 +4451,9 @@ def scan_game_optiscaler(appid, install_path, exe_path=None) -> dict:
         exe_path = rec["exe"]
     exe = Path(exe_path) if exe_path else _find_game_exe(install_path)
     detected = detect_game_graphics_api(exe) if exe else {"bitness": None, "api": None}
+    display = describe_graphics_api(detected["api"], exe) if exe else {"label": None, "inferred": False}
     result = {"exe": str(exe) if exe else None, "detected_api": detected["api"],
+             "detected_api_display": display["label"], "detected_api_inferred": display["inferred"],
              "detected_bitness": detected["bitness"], "installed": False,
              "update_available": False}
     if rec:
@@ -5189,7 +5344,9 @@ def scan_game_dxvk(appid, install_path, exe_path=None) -> dict:
         exe_path = rec["exe"]
     exe = Path(exe_path) if exe_path else _find_game_exe(install_path)
     detected = detect_game_graphics_api(exe) if exe else {"bitness": None, "api": None}
+    display = describe_graphics_api(detected["api"], exe) if exe else {"label": None, "inferred": False}
     result = {"exe": str(exe) if exe else None, "detected_api": detected["api"],
+             "detected_api_display": display["label"], "detected_api_inferred": display["inferred"],
              "detected_bitness": detected["bitness"], "installed": False,
              "update_available": False}
     if rec:
@@ -6781,6 +6938,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not g:
                     self._json({"error": "unknown appid"}, 404); return
                 self._json(scan_game_reshade(m.group(1), g["install_path"]))
+            elif m := re.match(r"^/api/game/(\d+)/rhi/builds$", self.path):
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(m.group(1))
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                self._json(detect_game_builds(g["install_path"]))
             elif m := re.match(r"^/api/game/(\d+)/rhi/refwork$", self.path):
                 games = {g["appid"]: g for g in all_games(root)}
                 g = games.get(m.group(1))
@@ -7027,10 +7190,11 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({"error": "unknown appid"}, 404); return
                 pack_ids = body.get("pack_ids") or []
                 set_game_shader_selection(appid, pack_ids)
+                target_dir = str(resolve_rhi_target_dir(appid, g["install_path"]))
                 tid = str(uuid.uuid4())
                 TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
                 threading.Thread(target=_deploy_shader_packs_task,
-                                 args=(tid, g["install_path"], pack_ids),
+                                 args=(tid, target_dir, pack_ids),
                                  daemon=True).start()
                 self._json({"task": tid})
             elif self.path == "/api/rhi/shaders/remove":
@@ -7040,7 +7204,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not g:
                     self._json({"error": "unknown appid"}, 404); return
                 set_game_shader_selection(appid, [])
-                self._json(remove_reshade_shaders(g["install_path"]))
+                target_dir = str(resolve_rhi_target_dir(appid, g["install_path"]))
+                self._json(remove_reshade_shaders(target_dir))
             elif self.path == "/api/rhi/addons/deploy":
                 appid = body["appid"]
                 games = {g["appid"]: g for g in all_games(root)}

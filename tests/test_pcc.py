@@ -1253,6 +1253,133 @@ class PCCTests(unittest.TestCase):
         expanded = pcc._expand_pack_dependencies(["Azen", "bogus-pack-id"])
         self.assertNotIn("bogus-pack-id", expanded)
 
+    def test_resolve_rhi_target_dir_prefers_reshade_install_path(self):
+        """Regression: shader pack deploy/remove routes were passing the
+        raw Steam install root instead of the exe's actual directory -
+        live-testing surfaced this on The Witcher 3, whose real exe (and
+        ReShade's own install) sits in bin/x64_dx12/, several levels below
+        the Steam root. resolve_rhi_target_dir must return the ReShade
+        record's own directory when one exists, matching what addons
+        already did correctly (Part 1f)."""
+        d = self.root / "steamapps/common/TestGame"
+        (d / "bin/x64_dx12").mkdir(parents=True)
+        state = pcc.load_state()
+        state.setdefault("rhi_reshade_installs", {})["12345"] = {
+            "path": str(d / "bin/x64_dx12/dxgi.dll"), "channel": "stable",
+            "version": "6.8.0", "bitness": 64, "exe": str(d / "bin/x64_dx12/Game.exe"),
+        }
+        pcc.save_state(state)
+        self.assertEqual(pcc.resolve_rhi_target_dir("12345", str(d)), d / "bin/x64_dx12")
+
+    def test_resolve_rhi_target_dir_falls_back_to_exe_detection(self):
+        d, exe = self._fake_game_exe()  # bin: TestGame/Game.exe (no subdir)
+        self.assertEqual(pcc.resolve_rhi_target_dir("12345", str(d)), d)
+
+        d2 = self.root / "steamapps/common/NestedGame"
+        (d2 / "bin/x64").mkdir(parents=True)
+        real_exe = d2 / "bin/x64/Game.exe"
+        real_exe.write_bytes(_build_fake_pe64(regular_dlls=["d3d11.dll"]))
+        self.assertEqual(pcc.resolve_rhi_target_dir("99999", str(d2)), d2 / "bin/x64")
+
+    def test_deploy_shader_packs_route_uses_reshade_directory(self):
+        """End-to-end: deploying shader packs via the HTTP route for a game
+        whose ReShade install lives in a subdirectory must land the files
+        there, not at the raw Steam install root."""
+        d, exe = self._fake_game_exe()
+        (d / "bin/x64").mkdir(parents=True)
+        nested_exe = d / "bin/x64/Game.exe"
+        nested_exe.write_bytes(_build_fake_pe64(regular_dlls=["d3d11.dll"]))
+        state = pcc.load_state()
+        state.setdefault("rhi_reshade_installs", {})["12345"] = {
+            "path": str(d / "bin/x64/dxgi.dll"), "channel": "stable",
+            "version": "6.8.0", "bitness": 64, "exe": str(nested_exe),
+        }
+        pcc.save_state(state)
+        target = pcc.resolve_rhi_target_dir("12345", str(d))
+        self.assertEqual(target, d / "bin/x64")
+
+    def test_resolve_rhi_target_dir_falls_back_to_optiscaler_then_dxvk(self):
+        """A game with OptiScaler or DXVK installed but no ReShade must
+        still reuse that mod's own resolved directory, not re-guess via
+        fresh exe detection - otherwise a second mod installed after the
+        first could land in a different folder than the one already
+        confirmed working."""
+        d = self.root / "steamapps/common/OptiOnly"
+        (d / "bin/x64_dx12").mkdir(parents=True)
+        state = pcc.load_state()
+        state.setdefault("rhi_optiscaler_installs", {})["111"] = {
+            "install_path": str(d / "bin/x64_dx12"), "installed_as": "dxgi.dll",
+        }
+        pcc.save_state(state)
+        self.assertEqual(pcc.resolve_rhi_target_dir("111", str(d)), d / "bin/x64_dx12")
+
+        d2 = self.root / "steamapps/common/DxvkOnly"
+        (d2 / "bin/x64").mkdir(parents=True)
+        state = pcc.load_state()
+        state.setdefault("rhi_dxvk_installs", {})["222"] = {
+            "install_path": str(d2 / "bin/x64"),
+        }
+        pcc.save_state(state)
+        self.assertEqual(pcc.resolve_rhi_target_dir("222", str(d2)), d2 / "bin/x64")
+
+    def test_infer_api_from_path_detects_dx12_folder_name(self):
+        """The Witcher 3's real bin/x64_dx12/witcher3.exe imports neither
+        dxgi.dll nor d3d12.dll (loaded dynamically at runtime), so the
+        static PE scan alone gives up - the folder name itself is the only
+        remaining signal, and it's worth surfacing rather than silently
+        saying nothing."""
+        self.assertEqual(pcc._infer_api_from_path("/g/bin/x64_dx12/witcher3.exe"), "d3d12")
+        self.assertEqual(pcc._infer_api_from_path("/g/bin/x64/witcher3.exe"), None)
+        self.assertEqual(pcc._infer_api_from_path("/g/bin/DX11/game.exe"), "d3d11")
+
+    def test_describe_graphics_api_labels_known_and_inferred(self):
+        known = pcc.describe_graphics_api("d3d11", "/g/bin/x64/game.exe")
+        self.assertEqual(known, {"label": "DirectX 11", "inferred": False})
+        inferred = pcc.describe_graphics_api(None, "/g/bin/x64_dx12/game.exe")
+        self.assertEqual(inferred["label"], "DirectX 12 (from folder name)")
+        self.assertTrue(inferred["inferred"])
+        unknown = pcc.describe_graphics_api(None, "/g/bin/x64/game.exe")
+        self.assertEqual(unknown, {"label": None, "inferred": False})
+
+    def test_find_game_exe_candidates_detects_dual_dx11_dx12_builds(self):
+        """Regression for the exact case that caused ReShade to silently
+        install into the wrong folder: a game shipping BOTH a statically-
+        detectable DX11 build and a DX12 build whose exe imports nothing
+        (dynamic LoadLibrary), distinguishable only by its folder name."""
+        d = self.root / "steamapps/common/DualBuild"
+        (d / "bin/x64").mkdir(parents=True)
+        (d / "bin/x64_dx12").mkdir(parents=True)
+        dx11_exe = d / "bin/x64/witcher3.exe"
+        dx11_exe.write_bytes(_build_fake_pe64(regular_dlls=["d3d11.dll"]))
+        dx12_exe = d / "bin/x64_dx12/witcher3.exe"
+        dx12_exe.write_bytes(_build_fake_pe64())  # no graphics imports at all
+
+        candidates = pcc.find_game_exe_candidates(str(d))
+        paths = {c["path"]: c for c in candidates}
+        self.assertIn(str(dx11_exe), paths)
+        self.assertIn(str(dx12_exe), paths)
+        self.assertEqual(paths[str(dx11_exe)]["label"], "DirectX 11")
+        self.assertFalse(paths[str(dx11_exe)]["inferred"])
+        self.assertEqual(paths[str(dx12_exe)]["label"], "DirectX 12 (from folder name)")
+        self.assertTrue(paths[str(dx12_exe)]["inferred"])
+        # real detections rank ahead of folder-name inference
+        self.assertLess(candidates.index(paths[str(dx11_exe)]),
+                        candidates.index(paths[str(dx12_exe)]))
+
+    def test_detect_game_builds_flags_multiple_builds(self):
+        d = self.root / "steamapps/common/DualBuild2"
+        (d / "bin/x64").mkdir(parents=True)
+        (d / "bin/x64_dx12").mkdir(parents=True)
+        (d / "bin/x64/game.exe").write_bytes(_build_fake_pe64(regular_dlls=["d3d11.dll"]))
+        (d / "bin/x64_dx12/game.exe").write_bytes(_build_fake_pe64())
+        result = pcc.detect_game_builds(str(d))
+        self.assertTrue(result["has_multiple_builds"])
+
+        single = self.root / "steamapps/common/SingleBuild"
+        single.mkdir(parents=True)
+        (single / "game.exe").write_bytes(_build_fake_pe64(regular_dlls=["d3d11.dll"]))
+        self.assertFalse(pcc.detect_game_builds(str(single))["has_multiple_builds"])
+
     def test_shader_pack_catalog_matches_ported_data(self):
         catalog = pcc.get_shader_pack_catalog()
         self.assertGreaterEqual(len(catalog), 40)   # ~46 packs per RHI's README

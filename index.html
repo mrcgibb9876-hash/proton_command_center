@@ -674,6 +674,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
         <select id="rhiCustomFile" hidden style="flex:1"></select>
       </div>
       <p class="note" id="rhiChannelNote" style="margin-top:6px"></p>
+      <div id="rhiBuildsBox"></div>
       <div class="row" style="margin-top:10px">
         <input type="text" id="rhiExePath" placeholder="Auto-detected .exe — override only if it picked the wrong one" style="flex:1">
       </div>
@@ -2049,6 +2050,27 @@ function applyRhiChannelUI(){
   $("#rhiChannelNote").textContent=RHI_CHANNEL_NOTES[ch]||"";
 }
 $("#rhiChannel").addEventListener("change",applyRhiChannelUI);
+function useRhiBuild(path){
+  $("#rhiExePath").value=path;
+  toast("Set as the exe to target — Install/Update in each section below will use it");
+}
+function renderRhiBuilds(builds){
+  const box=$("#rhiBuildsBox");
+  if(!builds||!builds.candidates||builds.candidates.length<2){box.innerHTML="";return}
+  const current=$("#rhiExePath").value.trim()||(window._rhiReshadeState&&window._rhiReshadeState.exe)||"";
+  const rows=builds.candidates.map(c=>{
+    const isCurrent=c.path===current;
+    return `<div class="item" style="padding:6px 10px">
+      <div class="top">
+        <span class="mono" style="font-size:12px">${esc(c.path)}</span>
+        <span class="chip ${c.inferred?"m":"a"}">${esc(c.label)}</span>
+        ${isCurrent?'<span class="chip g">selected</span>':`<button class="btn small" data-use="${esc(c.path)}">Use this build</button>`}
+      </div>
+    </div>`;
+  }).join("");
+  box.innerHTML=`<p class="note" style="margin-top:10px">This game ships more than one build (e.g. separate DX11/DX12 folders) — pick which one ReShade/OptiScaler/DXVK/shader packs should target:</p>${rows}`;
+  box.querySelectorAll("[data-use]").forEach(b=>b.addEventListener("click",()=>useRhiBuild(b.dataset.use)));
+}
 async function loadRhiReshade(appid){
   const box=$("#rhiReshadeStatus");
   box.innerHTML='<p class="note">Scanning game folder…</p>';
@@ -2059,6 +2081,7 @@ async function loadRhiReshade(appid){
     window._rhiReshadeState=d;
     $("#rhiExePath").value="";
     $("#rhiExePath").placeholder=d.exe?`Auto-detected: ${d.exe}`:"No .exe auto-detected — point PCC at it manually";
+    renderRhiBuilds(d.builds);
     $("#rhiChannel").value=d.channel||"stable";
     $("#rhiCustomFile").innerHTML=(d.custom_files||[]).length
       ?d.custom_files.map(f=>`<option value="${esc(f)}">${esc(f)}</option>`).join("")
@@ -2074,7 +2097,7 @@ async function loadRhiReshade(appid){
           <div class="top"><b>dxgi.dll</b>
             <span class="chip g">v${esc(d.version||"?")}</span>
             <span class="chip m">${esc(d.channel||"stable")}</span>
-            ${d.detected_api?`<span class="chip a">${esc(d.detected_api.toUpperCase())}</span>`:""}
+            ${d.detected_api_display?`<span class="chip a">${esc(d.detected_api_display)}</span>`:""}
             ${d.update_available?'<span class="chip a">update available</span>':""}</div>
           <div class="path mono">${esc(d.path)}</div>
         </div>
@@ -2082,7 +2105,7 @@ async function loadRhiReshade(appid){
       $("#rhiRemoveBtn").hidden=false;
     }else{
       box.innerHTML=d.exe
-        ? `<p class="note">Detected <b class="mono">${esc(d.exe.split("/").pop())}</b>${d.detected_api?` — looks like <b>${esc(d.detected_api.toUpperCase())}</b>`:" — couldn't tell the graphics API"}.</p>`
+        ? `<p class="note">Detected <b class="mono">${esc(d.exe.split("/").pop())}</b>${d.detected_api_display?` — looks like <b>${esc(d.detected_api_display)}</b>`:" — couldn't tell the graphics API"}.</p>`
         : `<p class="note">No .exe found automatically — point Command Center at it manually.</p>`;
     }
   }catch(e){box.innerHTML=`<p class="note">${esc(e.message)}</p>`}
@@ -2274,7 +2297,7 @@ async function loadRhiOptiscaler(appid){
           <div class="top"><b>${esc(d.installed_as)}</b>
             <span class="chip g">${esc(d.version||"?")}</span>
             <span class="chip m">${esc(d.variant||"stable")}</span>
-            ${d.detected_api?`<span class="chip a">${esc(d.detected_api.toUpperCase())}</span>`:""}
+            ${d.detected_api_display?`<span class="chip a">${esc(d.detected_api_display)}</span>`:""}
             ${d.update_available?'<span class="chip a">update available</span>':""}</div>
           <div class="path mono">${esc(d.path)}</div>
         </div>
@@ -2289,7 +2312,7 @@ async function loadRhiOptiscaler(appid){
       $("#rhiOsGpuType").value=effectiveVendor()==="AMD"?"AMD":"NVIDIA";
       $("#rhiOsInstallBtn").textContent="Install OptiScaler";
       box.innerHTML=d.exe
-        ? `<p class="note">Detected <b class="mono">${esc(d.exe.split("/").pop())}</b>${d.detected_api?` — looks like <b>${esc(d.detected_api.toUpperCase())}</b>`:" — couldn't tell the graphics API"}.</p>`
+        ? `<p class="note">Detected <b class="mono">${esc(d.exe.split("/").pop())}</b>${d.detected_api_display?` — looks like <b>${esc(d.detected_api_display)}</b>`:" — couldn't tell the graphics API"}.</p>`
         : `<p class="note">No .exe found automatically — install ReShade first (it shares the exe-override field) or point Command Center at it manually.</p>`;
     }
   }catch(e){box.innerHTML=`<p class="note">${esc(e.message)}</p>`}
@@ -2385,7 +2408,7 @@ async function loadRhiDxvk(appid){
     }else{
       $("#rhiDxvkInstallBtn").textContent="Install DXVK";
       box.innerHTML=d.exe
-        ? `<p class="note">Detected <b class="mono">${esc(d.exe.split("/").pop())}</b>${d.detected_api?` — looks like <b>${esc(d.detected_api.toUpperCase())}</b>`:" — couldn't tell the graphics API"}.</p>`
+        ? `<p class="note">Detected <b class="mono">${esc(d.exe.split("/").pop())}</b>${d.detected_api_display?` — looks like <b>${esc(d.detected_api_display)}</b>`:" — couldn't tell the graphics API"}.</p>`
         : `<p class="note">No .exe found automatically — point Command Center at it manually.</p>`;
     }
   }catch(e){box.innerHTML=`<p class="note">${esc(e.message)}</p>`}
