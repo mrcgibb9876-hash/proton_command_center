@@ -15,7 +15,7 @@ optdepends=(
     '7zip: OptiScaler, DXVK Lilium HDR, and some shader packs (e.g. Lilium HDR Shaders) - all ship as .7z'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('8a8831a87090f064e38ae0df58d0b3fe270acceb82bb43216871d166fb4441cd')
+sha256sums=('6dc545152dc86a9dd8ec7e68863f0b4598fe325965225ae29eed7af9f9738e78')
 
 package() {
     cd "$srcdir/$_repo-$pkgver"
