@@ -41,7 +41,7 @@ Python standard library only. No dependencies, no telemetry, no account.
 |---|---|
 | **Required** | Python 3, Steam (logged in once) |
 | **Optional** | `mangohud` for the overlay, an NVIDIA driver for DLSS features |
-| **Optional** | `7zip` (or `p7zip`) - only needed for OptiScaler and DXVK's Lilium HDR variant, which ship as `.7z` |
+| **Optional** | `7zip` (or `p7zip`) - needed for OptiScaler, DXVK's Lilium HDR variant, and some shader packs (e.g. Lilium HDR Shaders) - all ship as `.7z` |
 
 Built and tested on Arch-based distros with an NVIDIA slant. Nothing is
 Arch-specific beyond the install script.

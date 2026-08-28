@@ -68,6 +68,12 @@ fi
 command -v mangohud  >/dev/null && c_ok "mangohud"  || c_warn "mangohud not installed (optional): sudo pacman -S mangohud"
 command -v gamescope >/dev/null && c_ok "gamescope" || c_warn "gamescope not installed (optional): sudo pacman -S gamescope"
 
+if command -v 7z >/dev/null || command -v 7za >/dev/null || command -v 7zr >/dev/null; then
+    c_ok "7-Zip CLI"
+else
+    c_warn "7z not installed (optional): sudo pacman -S 7zip — needed for OptiScaler, DXVK's Lilium HDR variant, and some shader packs (e.g. Lilium HDR Shaders), which all ship as .7z"
+fi
+
 [ "$MISSING" -eq 1 ] && { echo; c_err "Fix the required dependencies above, then re-run."; exit 1; }
 echo
 

@@ -26,7 +26,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.26.1"
+VERSION = "1.26.2"
 PORT = int(os.environ.get("PCC_PORT", "8686"))
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path.home() / ".local/share/proton-command-center"
@@ -3460,38 +3460,81 @@ def ensure_shader_pack(pack_id, task_id=None) -> list:
     if task_id:
         TASKS[task_id]["detail"] = f"Extracting {pack['name']}"
 
+    def classify(rel) -> str | None:
+        """Maps one archive-relative path to its staging destination (or
+        None to skip it) - shared between the zip and 7z extraction
+        branches below so both follow the exact same layout rules."""
+        fn = rel.rsplit("/", 1)[-1]
+        if fn in SHADER_EXCLUDED_FILES:
+            return None
+        low = rel.lower()
+        if "/shaders/" in f"/{low}":
+            idx = low.find("shaders/")
+            return f"Shaders/{pack_id}/{rel[idx + len('shaders/'):]}"
+        elif "/textures/" in f"/{low}":
+            idx = low.find("textures/")
+            return f"Textures/{pack_id}/{rel[idx + len('textures/'):]}"
+        elif fn.endswith((".fx", ".fxh")) and "/" not in rel:
+            return f"Shaders/{pack_id}/{fn}"
+        return None
+
     files = []
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        names = zf.namelist()
-        roots = {n.split("/", 1)[0] for n in names if "/" in n}
-        prefix = f"{next(iter(roots))}/" if len(roots) == 1 else ""
-        for n in names:
-            if n.endswith("/"):
-                continue
-            rel = n[len(prefix):] if prefix and n.startswith(prefix) else n
-            fn = rel.rsplit("/", 1)[-1]
-            if fn in SHADER_EXCLUDED_FILES:
-                continue
-            low = rel.lower()
-            if "/shaders/" in f"/{low}":
-                # keep only the part after the archive's own Shaders/ segment
-                idx = low.find("shaders/")
-                out_rel = f"Shaders/{pack_id}/{rel[idx + len('shaders/'):]}"
-            elif "/textures/" in f"/{low}":
-                idx = low.find("textures/")
-                out_rel = f"Textures/{pack_id}/{rel[idx + len('textures/'):]}"
-            elif fn.endswith((".fx", ".fxh")) and "/" not in rel:
-                # root-level single-file packs (no Shaders/ folder at all)
-                out_rel = f"Shaders/{pack_id}/{fn}"
-            else:
-                continue
-            dest = RHI_DATA_DIR / "shaders" / out_rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(zf.read(n))
-            files.append(out_rel)
-            # shared framework headers also get a copy at the staging root
-            if fn in ("ReShade.fxh", "ReShadeUI.fxh"):
-                (RESHADE_SHADERS_STAGE_DIR / fn).write_bytes(zf.read(n))
+    is_7z = data[:6] == b"7z\xbc\xaf\x27\x1c"
+    if is_7z:
+        # Some packs (e.g. Lilium HDR's real GitHub release) ship as .7z,
+        # not .zip, despite most of this catalog being plain zips - sniff
+        # the real magic bytes rather than trusting the catalog's asset_ext
+        # metadata alone, so a wrong/missing extension hint can't silently
+        # feed a .7z into zipfile and blow up with "File is not a zip file"
+        # (the exact bug this replaced, confirmed live against Lilium).
+        seven_zip = _find_7z_binary()
+        if not seven_zip:
+            raise RuntimeError(
+                f"{pack['name']} ships as a .7z archive - install the 7-Zip CLI first "
+                "(Arch: `sudo pacman -S 7zip`, other distros: the `p7zip` package) "
+                "then try again.")
+        with tempfile.TemporaryDirectory(prefix="pcc_shaderpack_") as tmp:
+            tmp = Path(tmp)
+            archive = tmp / "pack.7z"
+            archive.write_bytes(data)
+            extract_dir = tmp / "extracted"
+            extract_dir.mkdir()
+            proc = subprocess.run([seven_zip, "x", str(archive), f"-o{extract_dir}", "-y"],
+                                  capture_output=True, text=True, timeout=180)
+            if proc.returncode != 0:
+                raise RuntimeError(f"7z extraction failed: {proc.stderr.strip()[:300]}")
+            for p in extract_dir.rglob("*"):
+                if not p.is_file():
+                    continue
+                rel = str(p.relative_to(extract_dir))
+                out_rel = classify(rel)
+                if not out_rel:
+                    continue
+                dest = RHI_DATA_DIR / "shaders" / out_rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(p.read_bytes())
+                files.append(out_rel)
+                if p.name in ("ReShade.fxh", "ReShadeUI.fxh"):
+                    (RESHADE_SHADERS_STAGE_DIR / p.name).write_bytes(p.read_bytes())
+    else:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = zf.namelist()
+            roots = {n.split("/", 1)[0] for n in names if "/" in n}
+            prefix = f"{next(iter(roots))}/" if len(roots) == 1 else ""
+            for n in names:
+                if n.endswith("/"):
+                    continue
+                rel = n[len(prefix):] if prefix and n.startswith(prefix) else n
+                out_rel = classify(rel)
+                if not out_rel:
+                    continue
+                dest = RHI_DATA_DIR / "shaders" / out_rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(zf.read(n))
+                files.append(out_rel)
+                fn = rel.rsplit("/", 1)[-1]
+                if fn in ("ReShade.fxh", "ReShadeUI.fxh"):
+                    (RESHADE_SHADERS_STAGE_DIR / fn).write_bytes(zf.read(n))
 
     if not files:
         raise RuntimeError(f"{pack['name']}'s archive didn't contain any usable "

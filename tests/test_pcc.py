@@ -5,6 +5,7 @@ builds a mock Steam install in a temp dir. Run:  python3 tests/test_pcc.py"""
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -1439,6 +1440,36 @@ class PCCTests(unittest.TestCase):
             pcc._gh_bytes = real
         self.assertTrue(any("Good.fx" in f for f in files))
         self.assertFalse(any("NTSCCustom.fx" in f for f in files))
+
+    def test_ensure_shader_pack_extracts_7z_archives(self):
+        """Regression: Lilium HDR Shaders' real GitHub release ships as a
+        .7z (its catalog entry even says asset_ext=".7z"), but
+        ensure_shader_pack always fed the download straight into
+        zipfile.ZipFile regardless of format - live-testing confirmed this
+        crashes with "File is not a zip file" for any pack that isn't
+        actually a zip. Must now sniff the real magic bytes and extract via
+        the system 7z binary instead."""
+        if not pcc._find_7z_binary():
+            self.skipTest("no system 7z binary available")
+        src = self.root / "_7z_src"
+        (src / "Shaders").mkdir(parents=True)
+        (src / "Shaders" / "HDR.fx").write_bytes(b"hdr fx content")
+        archive = self.root / "pack.7z"
+        subprocess.run([pcc._find_7z_binary(), "a", str(archive), str(src / "Shaders")],
+                       check=True, capture_output=True)
+        seven_zip_bytes = archive.read_bytes()
+        self.assertEqual(seven_zip_bytes[:6], b"7z\xbc\xaf\x27\x1c")
+
+        real_bytes, real_json = pcc._gh_bytes, pcc._gh_json
+        pcc._gh_bytes = lambda url, task=None: seven_zip_bytes
+        pcc._gh_json = lambda url: {"assets": [
+            {"name": "Lilium.7z", "browser_download_url": "https://example/Lilium.7z"}]}
+        try:
+            files = pcc.ensure_shader_pack("Lilium")
+        finally:
+            pcc._gh_bytes, pcc._gh_json = real_bytes, real_json
+        self.assertIn("Shaders/Lilium/HDR.fx", files)
+        self.assertTrue((pcc.RHI_DATA_DIR / "shaders" / "Shaders/Lilium/HDR.fx").is_file())
 
     def test_ensure_shader_pack_unknown_id_raises(self):
         with self.assertRaises(RuntimeError):
