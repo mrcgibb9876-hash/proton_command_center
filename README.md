@@ -32,19 +32,6 @@ build and greys out what won't work, so you can't ship dead options.
 **Manages DLSS DLLs.** Every DLL in the game with its version, one-click
 upgrade, backups you can roll back.
 
-**Installs ReShade.** Detects the game's graphics API from its own exe and
-bitness, drops the matching build next to it under the right proxy name, and
-seeds a shared shader library. Refuses to overwrite a proxy DLL it didn't
-install itself.
-
-**Fixes Steam's shader processing.** Steam defaults to a fraction of your cores
-for the "Processing Vulkan shaders" pass. The setting isn't in Steam's UI at
-all - it lives in a file Steam doesn't even create. One click sets it to every
-core but two.
-
-**Shows where your disk went.** NVIDIA's shader cache and Steam's own, with
-per-game breakdowns and clear-out buttons.
-
 **Benchmarks before and after.** MangoHud logs split at the change, compared on
 avg FPS, 1% and 0.1% lows, and stutter count.
 
@@ -62,7 +49,7 @@ with an Install button and live progress.
 |---|---|
 | **Required** | Python 3, Steam (logged in once) |
 | **Optional** | `mangohud` for the overlay and benchmarks |
-| **Optional** | An NVIDIA driver for DLSS and shader cache features |
+| **Optional** | An NVIDIA driver for DLSS features |
 
 Built and tested on Arch-based distros with an NVIDIA slant. Nothing is
 Arch-specific beyond the install script.
@@ -160,32 +147,6 @@ alt-tabbing out. Compact-vs-per-variable output and the save/apply-default
 template live under "Advanced preset options" so a first-time user isn't
 staring at raw NGX/DRS variable names before they've touched anything else.
 
-### ReShade tab
-
-Scans the game's own exe for its graphics API (reading the PE import table -
-same technique as [RankFTW/RHI](https://github.com/RankFTW/RHI)'s detector)
-and bitness, then offers to install ReShade under the matching proxy DLL name:
-`d3d9.dll` for D3D9, `dxgi.dll` for D3D10/11/12, `opengl32.dll` for OpenGL.
-Native Vulkan and D3D8 aren't supported yet. Both the API and the exe it
-scanned can be overridden manually if it guesses wrong.
-
-The engine comes straight from reshade.me's own installer - it's a zip with a
-stub exe prepended, so no extra tooling is needed to pull `ReShade64.dll` /
-`ReShade32.dll` out of it. First install also seeds a shared shader folder
-(`~/.local/share/proton-command-center/reshade/shaders`) with ReShade's own
-default selection (Standard effects + SweetFX), pointed at from every game's
-`ReShade.ini` so effects work immediately.
-
-Installing never overwrites a proxy-named DLL Command Center didn't put there
-itself - a `dxgi.dll` already in the game folder could belong to OptiScaler or
-another mod, and clobbering it silently would break that instead. Move it
-aside first if you're sure it's safe to replace.
-
-ReShade only loads once the game process actually reads its proxy DLL from
-disk instead of Proton's own - add `WINEDLLOVERRIDES=dxgi=n,b` (or whichever
-DLL was installed) to the game's launch options; the ReShade tab has a button
-that adds this for you once it's installed.
-
 ### Mods tab
 
 Installs, updates, and removes [Ultra+](https://theultraplace.com) mods
@@ -199,31 +160,6 @@ else.
 Skip "I manage my own UE4SS" if you run UE4SS yourself already - it installs
 only the mod's own files and Content `.pak`/`.ucas`/`.utoc` packages, not the
 UE4SS runtime or loader DLL.
-
-### Shader cache tab
-
-![Shader cache sizes, thread count, and Steam's own background processing](assets/screenshots/shaders.png)
-
-The headline number is what NVIDIA's shader cache is using against its ceiling,
-plus what Steam is holding separately - usually far more.
-
-
-**Thread count.** Steam uses only a fraction of your cores for its shader pass,
-which is why that screen can crawl on an idle machine. The override lives in
-`steam_dev.cfg`, a file Steam never creates and exposes nowhere in its UI. One
-click sets it to every core but two. Needs a full Steam restart.
-
-**Disk cache.** A global toggle writes NVIDIA's shader-disk-cache variables to
-`/etc/environment`, consolidating compiled shaders somewhere that survives
-cleanup, with a 10/30/50/100 GB ceiling. The ceiling is a limit, not a
-reservation - nothing is allocated until shaders accumulate. Needs a re-login:
-environment variables only reach processes started afterwards.
-
-Command Center does **not** try to pre-empt Steam's "Processing Vulkan shaders"
-pass. Steam replays its own pipeline caches and gates on its own ledger, so
-nothing outside Steam can make it skip that work. If it bothers you, the real
-switch is Steam → Settings → Downloads → Shader Pre-Caching, at the cost of
-shaders compiling during play instead.
 
 ### Benchmark tab
 

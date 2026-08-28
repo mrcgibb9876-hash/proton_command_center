@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
 Proton Command Center (PCC)
-Per-game launch options, DLSS DLL management, and shader cache control
-for Steam on Linux. Stdlib only. Run: python3 pcc.py  ->  http://localhost:8686
+Per-game launch options and DLSS DLL management for Steam on Linux.
+Stdlib only. Run: python3 pcc.py  ->  http://localhost:8686
 """
 
 import hashlib
 import json
 import os
-import tempfile
 import re
 import shutil
 import struct
@@ -26,19 +25,16 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.24.0"
+VERSION = "1.25.0"
 PORT = int(os.environ.get("PCC_PORT", "8686"))
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path.home() / ".local/share/proton-command-center"
 DLL_LIBRARY = DATA_DIR / "dlls"        # dlls/<kind>/<version>/<name>.dll
 BACKUP_DIR = DATA_DIR / "backups"      # backups/<appid>/<relpath>.pccbak
-RESHADE_DIR = DATA_DIR / "reshade"     # reshade/<version>/ReShade{32,64}.dll
-RESHADE_SHADERS_DIR = RESHADE_DIR / "shaders"  # shared Shaders/ + Textures/
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DLL_LIBRARY.mkdir(parents=True, exist_ok=True)
 _DEDUPE_ON_IMPORT = True  # dedupe runs lazily via dll_library()
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-RESHADE_DIR.mkdir(parents=True, exist_ok=True)
 
 DLSS_KINDS = {
     "nvngx_dlss.dll":  {"kind": "sr",  "label": "DLSS Super Resolution"},
@@ -228,21 +224,6 @@ def driver_version():
     except Exception:
         pass
     return "unknown"
-
-
-# Fossilize file taxonomy inside steamapps/shadercache/<appid>/fozpipelinesv6/
-#   steam_pipeline_cache.foz                        -> input (downloaded/captured)
-#   steamapprun_pipeline_cache.<hash>.<n>.foz       -> input (runtime capture)
-#   steamapp_pipeline_cache.foz                     -> input
-#   steam_pipeline_cache_whitelist.foz              -> NOT input
-#   replay_cache.<hash>.foz                         -> the replayer ledger (output)
-# Pipelines live BOTH at the top level and inside steamapprun_pipeline_cache.<hash>/
-# directories (one per GPU+driver), so classify by filename, never by path.
-FOZ_INPUT_RE = re.compile(
-    r"^(steam_pipeline_cache"
-    r"|steamapp_pipeline_cache"
-    r"|steamapprun_pipeline_cache\.[0-9a-f]+\.\d+)\.foz$", re.I)
-FOZ_LEDGER_RE = re.compile(r"^replay_cache\.[0-9a-f]+\.foz$", re.I)
 
 
 def steam_root() -> Path | None:
@@ -697,133 +678,6 @@ def set_game_config(root: Path, appid: str, launch_value=None, compat_tool=None,
     return {"saved": True, **result}
 
 
-SHADER_ENV_VARS = {
-    # Only vars that still do something on modern stock Proton (DXVK >= 2.7) are
-    # included. DXVK_ASYNC and DXVK_STATE_CACHE were both removed upstream once
-    # Vulkan GPL (graphics_pipeline_library) made them obsolete, so they are
-    # deliberately omitted - setting them achieves nothing. What remains is the
-    # NVIDIA driver-level shader disk cache, which is independent of DXVK and
-    # genuinely persists compiled shaders across runs.
-    "__GL_SHADER_DISK_CACHE": "1",
-    "__GL_SHADER_DISK_CACHE_PATH": str(Path.home() / ".cache" / "nvidia-shaders"),
-    "__GL_SHADER_DISK_CACHE_SKIP_CLEANUP": "1",   # keep cache instead of purging on size
-    "__GL_SHADER_DISK_CACHE_SIZE": "10737418240",  # 10 GiB ceiling
-}
-
-
-def read_environment():
-    path = Path("/etc/environment")
-    try:
-        return path.read_text()
-    except OSError:
-        return ""
-
-
-def _dir_size(p: Path) -> int:
-    total = 0
-    try:
-        for dirpath, _, filenames in os.walk(p):
-            for fn in filenames:
-                try:
-                    total += (Path(dirpath) / fn).stat().st_size
-                except OSError:
-                    pass
-    except OSError:
-        pass
-    return total
-
-
-def nvidia_cache_info() -> dict:
-    """Size of the driver's shader cache, redirected and default locations.
-
-    Both can hold data at once: the env vars only reach processes started after
-    a re-login, so anything already running (compositor, browser, Steam) keeps
-    writing to the default path until you log out. Bytes in the default dir
-    after enabling the redirect are stale, not a fault.
-    """
-    redirected = Path(SHADER_ENV_VARS["__GL_SHADER_DISK_CACHE_PATH"])
-    default = Path.home() / ".cache" / "nvidia"
-    return {
-        "path": str(redirected),
-        "size_bytes": _dir_size(redirected),
-        "exists": redirected.is_dir(),
-        "default_path": str(default),
-        "default_size_bytes": _dir_size(default) if default.is_dir() else 0,
-        "limit_bytes": int(SHADER_ENV_VARS["__GL_SHADER_DISK_CACHE_SIZE"]),
-    }
-
-
-def environment_shader_status() -> dict:
-    txt = read_environment()
-    present = {}
-    for k in SHADER_ENV_VARS:
-        m = re.search(rf"^{re.escape(k)}=(.*)$", txt, re.M)
-        present[k] = m.group(1).strip().strip('"') if m else None
-    out = {"enabled": all(present[k] is not None for k in SHADER_ENV_VARS),
-           "vars": present}
-    out["cache"] = nvidia_cache_info()
-    out["sizes"] = [{"gb": gb, "bytes": b} for gb, b in SHADER_CACHE_SIZES]
-    out["steam_cache"] = None      # filled by the route, which knows the root
-    # the live ceiling is whatever /etc/environment says, not our default
-    cur = present.get("__GL_SHADER_DISK_CACHE_SIZE")
-    if cur and cur.isdigit():
-        out["cache"]["limit_bytes"] = int(cur)
-    return out
-
-
-# Ceilings offered in the UI. NVIDIA's own default is 12 GB on recent drivers;
-# these are a cap, not a reservation - nothing is allocated up front.
-SHADER_CACHE_SIZES = [
-    (10, 10 * 1024**3),
-    (30, 30 * 1024**3),
-    (50, 50 * 1024**3),
-    (100, 100 * 1024**3),
-]
-
-
-def set_environment_shaders(enable, size_bytes=None) -> dict:
-    """Add or remove the shader-cache env vars in /etc/environment via pkexec.
-    Preserves every other line; only touches our keys.
-
-    size_bytes overrides the cache ceiling (__GL_SHADER_DISK_CACHE_SIZE). It's
-    a limit rather than an allocation, so a bigger number costs nothing until
-    the shaders actually accumulate.
-    """
-    vars_out = dict(SHADER_ENV_VARS)
-    if size_bytes is not None:
-        n = int(size_bytes)
-        allowed = [b for _, b in SHADER_CACHE_SIZES]
-        if n not in allowed:
-            raise RuntimeError(f"cache size must be one of {allowed}")
-        vars_out["__GL_SHADER_DISK_CACHE_SIZE"] = str(n)
-    Path(vars_out["__GL_SHADER_DISK_CACHE_PATH"]).mkdir(
-        parents=True, exist_ok=True)
-    txt = read_environment()
-    lines = [l for l in txt.splitlines()
-             if not any(l.strip().startswith(f"{k}=") for k in SHADER_ENV_VARS)]
-    if enable:
-        lines.append("# Proton Command Center - shader cache")
-        for k, v in vars_out.items():
-            lines.append(f'{k}="{v}"' if " " in v or "/" in v else f"{k}={v}")
-    else:
-        lines = [l for l in lines
-                 if l.strip() != "# Proton Command Center - shader cache"]
-    new = "\n".join(lines).rstrip() + "\n"
-
-    # write via a temp file + pkexec cp (root-owned target)
-    tmp = Path(tempfile.gettempdir()) / f"pcc-environment-{os.getpid()}"
-    tmp.write_text(new)
-    try:
-        r = subprocess.run(["pkexec", "cp", str(tmp), "/etc/environment"],
-                           capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.strip() or
-                               "pkexec was cancelled or failed")
-    finally:
-        tmp.unlink(missing_ok=True)
-    return {"enabled": enable, "note": "Log out and back in for changes to apply."}
-
-
 def set_launch_options(root: Path, appid: str, value, close_steam=False) -> dict:
     if steam_running():
         if close_steam:
@@ -1044,7 +898,7 @@ def ultraplus_catalog() -> dict:
     lists every UE game it *could* support, including ones with no mod yet -
     mods_manifest.json is the ground truth for "released"), and the Steam
     display-name variants to match each one against. Cached 6h, same pattern
-    as reshade_latest()."""
+    as list_ge_proton()."""
     state = load_state()
     cache = state.get("ultraplus_catalog")
     now = time.time()
@@ -1188,7 +1042,7 @@ def _resolve_case_insensitive_path(root, relative_path):
 
 def resolve_executable_path(game_key, install_path, catalog):
     """Trusts the catalog's exe_path first (exact, then case-insensitive),
-    falls back to the largest-.exe heuristic PCC already uses for ReShade.
+    falls back to the largest-.exe heuristic (_find_game_exe).
     Port of GamePathResolver.ResolveExecutablePath."""
     info = catalog.get("games", {}).get(game_key, {})
     exe_path = info.get("exe_path")
@@ -1781,8 +1635,7 @@ def _install_mod_task(task_id, appid, install_path, game_key, catalog,
 
 
 def remove_mod(appid) -> dict:
-    """Deletes every file this install tracked and forgets it. Port of
-    remove_reshade's shape."""
+    """Deletes every file this install tracked and forgets it."""
     state = load_state()
     installs = state.get("mod_installs", {})
     rec = installs.pop(appid, None)
@@ -2539,135 +2392,6 @@ def restore_dll(game_dll_path) -> dict:
     return {"restored": True, "version": pe_version(game_dll)}
 
 
-# --------------------------------------------------------------------------
-# ReShade
-# --------------------------------------------------------------------------
-
-RESHADE_DOWNLOADS_PAGE = "https://reshade.me/"
-
-# ReShade's own default package selection - crosire/reshade-shaders'
-# EffectPackages.ini lists every installable shader pack; these two
-# (Standard effects + SweetFX) are the ones marked Enabled=1, i.e. what the
-# official Windows installer installs when you accept its defaults.
-DEFAULT_SHADER_PACKAGES = [
-    {"url": "https://github.com/crosire/reshade-shaders/archive/refs/heads/slim.zip",
-     "deny": set()},
-    {"url": "https://github.com/CeeJayDK/SweetFX/archive/refs/heads/master.zip",
-     "deny": {"Template.fx"}},
-]
-
-# Which system DLL name ReShade gets installed as, per detected graphics API.
-# D3D10/11/12 all create their device through DXGI's swap chain, so all three
-# hook via dxgi.dll - that's the standard ReShade convention on both Windows
-# and Linux/Proton. Vulkan (an implicit Vulkan layer, not a proxy DLL) and
-# D3D8 (needs its own D3D9 wrapper first) aren't supported here.
-RESHADE_PROXY_DLL = {
-    "d3d9": "d3d9.dll",
-    "d3d10": "dxgi.dll",
-    "d3d11": "dxgi.dll",
-    "d3d12": "dxgi.dll",
-    "opengl": "opengl32.dll",
-}
-
-# (dll import name, api id, priority) - higher priority wins when a game
-# imports more than one. Mirrors RankFTW/RHI's GraphicsApiDetector.
-_GRAPHICS_DLL_PRIORITY = [
-    ("d3d12.dll", "d3d12", 7),
-    ("vulkan-1.dll", "vulkan", 6),
-    ("d3d11.dll", "d3d11", 5),
-    ("d3d10.dll", "d3d10", 4),
-    ("d3d10_1.dll", "d3d10", 4),
-    ("opengl32.dll", "opengl", 3),
-    ("d3d9.dll", "d3d9", 2),
-    ("d3d8.dll", "d3d8", 1),
-]
-
-
-def pe_imports(path):
-    """Read a PE exe's machine type (32/64-bit) and imported DLL names with no
-    dependency beyond stdlib: parse the DOS/PE/section headers by hand and
-    walk the import directory table. Returns (bitness, {lowercased dll
-    names}), or (None, set()) if it doesn't look like a PE file."""
-    try:
-        data = Path(path).read_bytes()
-    except OSError:
-        return None, set()
-    if len(data) < 0x40 or data[:2] != b"MZ":
-        return None, set()
-    pe_off = struct.unpack_from("<i", data, 0x3C)[0]
-    if pe_off < 0 or pe_off + 24 > len(data) or data[pe_off:pe_off + 4] != b"PE\x00\x00":
-        return None, set()
-    coff = pe_off + 4
-    machine = struct.unpack_from("<H", data, coff)[0]
-    bitness = {0x8664: 64, 0x14c: 32}.get(machine)
-    n_sections = struct.unpack_from("<H", data, coff + 2)[0]
-    size_opt = struct.unpack_from("<H", data, coff + 16)[0]
-    opt_off = coff + 20
-    if size_opt < 2 or opt_off + size_opt > len(data):
-        return bitness, set()
-    magic = struct.unpack_from("<H", data, opt_off)[0]
-    if magic == 0x10B:      # PE32
-        imp_dir_off = opt_off + 104
-    elif magic == 0x20B:    # PE32+
-        imp_dir_off = opt_off + 120
-    else:
-        return bitness, set()
-    if imp_dir_off + 8 > len(data):
-        return bitness, set()
-    import_rva = struct.unpack_from("<I", data, imp_dir_off)[0]
-    if not import_rva:
-        return bitness, set()
-    sections = []
-    for i in range(n_sections):
-        off = opt_off + size_opt + i * 40
-        if off + 40 > len(data):
-            break
-        vsize, va = struct.unpack_from("<II", data, off + 8)
-        raw_ptr = struct.unpack_from("<I", data, off + 20)[0]
-        sections.append((va, vsize, raw_ptr))
-
-    def rva2off(rva):
-        for va, vsize, raw_ptr in sections:
-            if va <= rva < va + vsize:
-                return raw_ptr + (rva - va)
-        return None
-
-    imp_off = rva2off(import_rva)
-    if imp_off is None:
-        return bitness, set()
-    names = set()
-    i = 0
-    while True:
-        entry_off = imp_off + i * 20
-        if entry_off + 20 > len(data):
-            break
-        name_rva = struct.unpack_from("<I", data, entry_off + 12)[0]
-        if not name_rva:
-            break
-        noff = rva2off(name_rva)
-        if noff is not None:
-            end = data.find(b"\x00", noff, noff + 256)
-            if end < 0:
-                end = noff + 256
-            names.add(data[noff:end].decode("ascii", "ignore").lower())
-        i += 1
-    return bitness, names
-
-
-def detect_graphics_api(dll_names) -> str | None:
-    """Highest-priority graphics API among a PE's imported DLLs. A DX12 game
-    that creates its device through dxgi.dll alone (no d3d12.dll import,
-    common in modern engines) is inferred as DX12 when nothing higher-
-    priority was found - same rule RankFTW/RHI's detector uses."""
-    best, best_pri = None, 0
-    for dll, api, pri in _GRAPHICS_DLL_PRIORITY:
-        if dll in dll_names and pri > best_pri:
-            best, best_pri = api, pri
-    if "dxgi.dll" in dll_names and best_pri < 5:
-        return "d3d12"
-    return best
-
-
 def _find_game_exe(install_path):
     """Best-effort: the largest .exe in the install tree, skipping obvious
     installers/redistributables/anti-cheat launchers by name. Nothing on disk
@@ -2695,211 +2419,6 @@ def _find_game_exe(install_path):
             if size > best_size:
                 best, best_size = p, size
     return best
-
-
-def reshade_latest() -> dict:
-    """Scrapes reshade.me for the current version and Full Add-on Support
-    build (needed for third-party addons like OptiScaler to load alongside
-    it). ReShade ships no GitHub releases to query, so the download page is
-    the only source. Cached 6h, same pattern as the GE-Proton release list."""
-    state = load_state()
-    cache = state.get("reshade_latest")
-    now = time.time()
-    if cache and now - cache.get("ts", 0) < 21600:
-        return cache["data"]
-    req = urllib.request.Request(RESHADE_DOWNLOADS_PAGE,
-                                 headers={"User-Agent": "Mozilla/5.0 pcc"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        html = r.read().decode("utf-8", "replace")
-    m = re.search(r"downloads/ReShade_Setup_([\d.]+)_Addon\.exe", html)
-    if not m:
-        raise RuntimeError("Couldn't find a current ReShade build on reshade.me")
-    version = m.group(1)
-    data = {"version": version,
-            "url": f"https://reshade.me/downloads/ReShade_Setup_{version}_Addon.exe"}
-    state["reshade_latest"] = {"ts": now, "data": data}
-    save_state(state)
-    return data
-
-
-def ensure_reshade_engine(version, url=None, task_id=None) -> Path:
-    """Downloads the ReShade setup .exe and pulls ReShade32.dll/ReShade64.dll
-    straight out of it. The installer is a plain zip with a .NET stub exe
-    prepended - stdlib zipfile finds the end-of-central-directory record by
-    scanning back from EOF and reads it with no extra tooling needed (checked
-    against the real 6.8.0 Addon build). Cached per version so repeat
-    installs across games don't re-download."""
-    import zipfile, io
-    engine_dir = RESHADE_DIR / version
-    if (engine_dir / "ReShade64.dll").is_file() and (engine_dir / "ReShade32.dll").is_file():
-        return engine_dir
-    if not url:
-        url = reshade_latest()["url"]
-    if task_id:
-        TASKS[task_id] = {"status": "running", "progress": 10,
-                          "detail": f"Downloading ReShade {version}"}
-    data = _gh_bytes(url, task_id)
-    if task_id:
-        TASKS[task_id]["detail"] = "Extracting"
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        names = set(zf.namelist())
-        for dll in ("ReShade32.dll", "ReShade64.dll"):
-            if dll not in names:
-                raise RuntimeError(f"ReShade installer didn't contain {dll} "
-                                   "(its format may have changed)")
-        engine_dir.mkdir(parents=True, exist_ok=True)
-        for dll in ("ReShade32.dll", "ReShade64.dll"):
-            (engine_dir / dll).write_bytes(zf.read(dll))
-    return engine_dir
-
-
-def ensure_default_shaders(task_id=None) -> Path:
-    """One-time fetch of ReShade's own default shader selection (Standard
-    effects + SweetFX) into a folder every game's ReShade.ini points at, so
-    installing ReShade gives you working effects immediately instead of an
-    empty effects list."""
-    import zipfile, io
-    shaders_dir = RESHADE_SHADERS_DIR / "Shaders"
-    textures_dir = RESHADE_SHADERS_DIR / "Textures"
-    if shaders_dir.is_dir() and any(shaders_dir.glob("*.fx")):
-        return RESHADE_SHADERS_DIR
-    shaders_dir.mkdir(parents=True, exist_ok=True)
-    textures_dir.mkdir(parents=True, exist_ok=True)
-    for pkg in DEFAULT_SHADER_PACKAGES:
-        if task_id:
-            TASKS[task_id]["detail"] = "Fetching default shaders"
-        data = _gh_bytes(pkg["url"], None)
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            roots = {n.split("/", 1)[0] for n in zf.namelist() if "/" in n}
-            if len(roots) != 1:
-                continue
-            root = next(iter(roots))
-            for n in zf.namelist():
-                if n.endswith("/"):
-                    continue
-                if n.startswith(f"{root}/Shaders/"):
-                    fn = n.rsplit("/", 1)[-1]
-                    if fn not in pkg["deny"]:
-                        (shaders_dir / fn).write_bytes(zf.read(n))
-                elif n.startswith(f"{root}/Textures/"):
-                    fn = n.rsplit("/", 1)[-1]
-                    (textures_dir / fn).write_bytes(zf.read(n))
-    return RESHADE_SHADERS_DIR
-
-
-def scan_game_reshade(appid, install_path) -> dict:
-    """Report ReShade status for a game: whatever PCC has on record for it,
-    plus best-effort auto-detection of the exe/graphics API/bitness so the
-    install call can usually proceed without asking the user anything."""
-    state = load_state()
-    rec = state.get("reshade_installs", {}).get(appid)
-    exe = _find_game_exe(install_path)
-    bitness, dll_names = pe_imports(exe) if exe else (None, set())
-    api = detect_graphics_api(dll_names) if dll_names else None
-    result = {"exe": str(exe) if exe else None, "detected_api": api,
-             "detected_bitness": bitness, "installed": False}
-    if rec:
-        p = Path(rec["path"])
-        result.update({"installed": p.is_file(), "path": rec["path"],
-                       "api": rec.get("api"), "version": rec.get("version"),
-                       "bitness": rec.get("bitness"),
-                       "proxy_name": p.name})
-    return result
-
-
-def install_reshade(appid, install_path, exe_override=None, api_override=None,
-                    task_id=None) -> dict:
-    """Installs ReShade for one game: picks (or takes) the exe, detects (or
-    takes) the graphics API and bitness, drops the matching ReShade DLL in
-    next to the exe under the name that API hooks through, and points a
-    fresh ReShade.ini at the shared shader library. Refuses to overwrite any
-    proxy-named DLL it didn't put there itself - the foreign-DLL protection
-    RankFTW/RHI's own installer has, since a game folder's dxgi.dll could
-    just as easily belong to OptiScaler or a bundled DXVK build."""
-    exe = Path(exe_override).expanduser() if exe_override else _find_game_exe(install_path)
-    if not exe or not exe.is_file():
-        raise RuntimeError("Couldn't find the game's .exe under its install folder — "
-                           "point Command Center at it manually.")
-    bitness, dll_names = pe_imports(exe)
-    api = api_override or detect_graphics_api(dll_names)
-    if not api:
-        raise RuntimeError("Couldn't tell which graphics API this game uses — pick one manually.")
-    if api not in RESHADE_PROXY_DLL:
-        raise RuntimeError(f"{api.upper()} isn't supported yet (native Vulkan needs a "
-                           "Wine-prefix layer registration Command Center doesn't do; "
-                           "D3D8 needs a D3D9 wrapper first).")
-    bitness = bitness or 64   # nearly every modern Steam game is 64-bit
-    proxy_name = RESHADE_PROXY_DLL[api]
-    target = exe.parent / proxy_name
-
-    # Foreign-DLL check happens before any download, so a refusal is instant
-    # and never wastes a fetch on a call that was always going to fail.
-    state = load_state()
-    installs = state.setdefault("reshade_installs", {})
-    rec = installs.get(appid)
-    ours = bool(rec and rec.get("path") == str(target))
-    if target.exists() and not ours:
-        raise RuntimeError(f"{proxy_name} already exists in {exe.parent} and wasn't "
-                           "installed by Command Center — refusing to overwrite it "
-                           "(could be DXVK, OptiScaler, or another mod's file). Move "
-                           "it aside first if you're sure it's safe to replace.")
-
-    info = reshade_latest()
-    engine_dir = ensure_reshade_engine(info["version"], info["url"], task_id=task_id)
-    src_dll = engine_dir / ("ReShade64.dll" if bitness == 64 else "ReShade32.dll")
-
-    # No backup step: the refusal above already guarantees target is either
-    # absent or a DLL Command Center itself put there, so there's never a
-    # foreign original to preserve here.
-    shutil.copy2(src_dll, target)
-
-    ensure_default_shaders(task_id=task_id)
-    ini_path = exe.parent / "ReShade.ini"
-    wrote_ini = not ini_path.exists()
-    if wrote_ini:
-        shaders_win = "Z:" + str(RESHADE_SHADERS_DIR / "Shaders").replace("/", "\\")
-        textures_win = "Z:" + str(RESHADE_SHADERS_DIR / "Textures").replace("/", "\\")
-        ini_path.write_text(
-            "[GENERAL]\n"
-            f"EffectSearchPaths={shaders_win}\n"
-            f"TextureSearchPaths={textures_win}\n"
-            "PresetPath=.\\ReShadePreset.ini\n")
-
-    installs[appid] = {"path": str(target), "api": api, "bitness": bitness,
-                       "version": info["version"]}
-    save_state(state)
-    return {"installed": True, "path": str(target), "proxy_dll": proxy_name,
-            "api": api, "bitness": bitness, "version": info["version"],
-            "wrote_ini": wrote_ini,
-            "winedlloverride": f"{proxy_name[:-4]}=n,b"}
-
-
-def remove_reshade(appid) -> dict:
-    """Removes ReShade from a game: deletes the proxy DLL Command Center
-    installed. Install refuses to ever touch a pre-existing foreign DLL (see
-    install_reshade), so there's never an original to restore here. The
-    ReShade.ini and shared shader library are left alone - the ini may hold
-    tuned settings, and the shaders are shared across every other game using
-    it."""
-    state = load_state()
-    installs = state.get("reshade_installs", {})
-    rec = installs.pop(appid, None)
-    if not rec:
-        raise RuntimeError("No ReShade install tracked for this game.")
-    Path(rec["path"]).unlink(missing_ok=True)
-    save_state(state)
-    return {"removed": True}
-
-
-def _reshade_install_task(task_id, appid, install_path, exe, api) -> None:
-    try:
-        result = install_reshade(appid, install_path, exe_override=exe,
-                                 api_override=api, task_id=task_id)
-        TASKS[task_id] = {"status": "done", "progress": 100,
-                          "detail": f"Installed as {result['proxy_dll']}",
-                          "result": result}
-    except Exception as e:
-        TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
 
 
 # --------------------------------------------------------------------------
@@ -3366,7 +2885,7 @@ def list_shortcuts(root: Path) -> list:
     Center's game shape (appid/name/install_path/library/...) so it merges
     straight into the normal library list via all_games(). `library` points
     at the same steamapps Steam itself uses for a shortcut's Proton compat
-    data and shader cache, so has_cache/cache_info work unmodified."""
+    data, so per-game lookups resolve unmodified."""
     path = shortcuts_path(root)
     if not path or not path.is_file():
         return []
@@ -3828,264 +3347,6 @@ def get_benchmark_data(root: Path, appid: str):
 
 
 # --------------------------------------------------------------------------
-# Shader cache
-# --------------------------------------------------------------------------
-
-def cache_info(root: Path, appid: str):
-    out = []
-    for lib in library_folders(root):
-        c = lib / "shadercache" / str(appid)
-        if c.is_dir():
-            size = 0
-            files = 0
-            for dirpath, _, filenames in os.walk(c):
-                for fn in filenames:
-                    try:
-                        size += (Path(dirpath) / fn).stat().st_size
-                        files += 1
-                    except OSError:
-                        pass
-            # Only the count is ever used. This used to ship every .foz path -
-            # hundreds of strings per game - so the UI could call .length on it.
-            foz = sum(1 for _ in c.rglob("*.foz"))
-            out.append({"path": str(c), "size_bytes": size, "files": files,
-                        "foz": foz})
-    return out
-
-
-def clear_cache(root: Path, appid: str, keep_recordings=True) -> dict:
-    """Default clears COMPILED artifacts but preserves fozpipelinesv6/
-    recordings - Steam's source data for its shader pass, costly to
-    regenerate. keep_recordings=False deletes everything."""
-    cleared, kept = [], 0
-    for entry in cache_info(root, appid):
-        base = Path(entry["path"])
-        if not keep_recordings:
-            shutil.rmtree(base, ignore_errors=True)
-            cleared.append(str(base))
-            continue
-        for child in base.iterdir():
-            if child.name == "fozpipelinesv6":
-                kept += sum(1 for _ in child.rglob("*.foz"))
-                continue
-            if child.is_dir():
-                shutil.rmtree(child, ignore_errors=True)
-            else:
-                child.unlink(missing_ok=True)
-            cleared.append(str(child))
-    return {"cleared": cleared, "kept_recordings": kept}
-
-
-# --------------------------------------------------------------------------
-# Steam's own shader processing ("Processing Vulkan shaders" at launch)
-# --------------------------------------------------------------------------
-SHADER_KEY_RE = re.compile(r"shader|fossilize|precach", re.I)
-
-
-def _walk_vdf(node, prefix=()) -> None:
-    for k, v in (node or {}).items():
-        if isinstance(v, dict):
-            yield from _walk_vdf(v, prefix + (k,))
-        else:
-            yield prefix + (k,), v
-
-
-# --------------------------------------------------------------------------
-# Steam's shader background-processing thread count
-# --------------------------------------------------------------------------
-# Steam defaults to a fraction of your logical cores for the "Processing Vulkan
-# shaders" pass, which is why it can crawl on an otherwise idle machine. The
-# override lives in steam_dev.cfg as a plain `key value` line -- NOT in the VDF
-# configs, and NOT in any Steam UI.
-#
-# Two things that make this easy to get wrong:
-#   1. Steam never creates steam_dev.cfg. It does not exist on a stock install,
-#      so this has to write the file, not just edit it.
-#   2. It's read once at client startup, so Steam needs a full restart -- not
-#      just a settings reload -- for a change to apply.
-SHADER_THREADS_KEY = "unShaderBackgroundProcessingThreads"
-# Leave this many logical cores free so the desktop stays responsive while the
-# pass runs. Steam pinned to every core makes the machine miserable to use.
-SHADER_THREADS_RESERVE = 2
-
-
-def logical_cores():
-    """Logical CPUs actually usable by this process.
-    sched_getaffinity respects taskset/cgroup limits; cpu_count doesn't."""
-    try:
-        return len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        return os.cpu_count() or 1
-
-
-def recommended_shader_threads():
-    return max(1, logical_cores() - SHADER_THREADS_RESERVE)
-
-
-def steam_dev_cfg(root: Path):
-    return Path(root) / "steam_dev.cfg"
-
-
-def get_shader_threads(root: Path) -> int | None:
-    """Current override, or None if unset (i.e. Steam's own default applies)."""
-    cfg = steam_dev_cfg(root)
-    if not cfg.is_file():
-        return None
-    for line in cfg.read_text(errors="replace").splitlines():
-        parts = line.strip().split()
-        if len(parts) == 2 and parts[0].lower() == SHADER_THREADS_KEY.lower():
-            try:
-                return int(parts[1])
-            except ValueError:
-                return None
-    return None
-
-
-def set_shader_threads(root: Path, threads) -> dict:
-    """Write the override, creating steam_dev.cfg if absent and preserving any
-    other lines already in it. Pass threads=None to remove the override."""
-    cores = logical_cores()
-    if threads is not None:
-        threads = int(threads)
-        if not 1 <= threads <= cores:
-            raise RuntimeError(f"threads must be between 1 and {cores}")
-    cfg = steam_dev_cfg(root)
-    lines = (cfg.read_text(errors="replace").splitlines()
-             if cfg.is_file() else [])
-    kept = [l for l in lines
-            if l.strip().split()[:1] != [SHADER_THREADS_KEY]
-            and not l.strip().lower().startswith(SHADER_THREADS_KEY.lower())]
-    if threads is not None:
-        kept.append(f"{SHADER_THREADS_KEY} {threads}")
-    body = "\n".join(kept).strip()
-    if body:
-        cfg.parent.mkdir(parents=True, exist_ok=True)
-        cfg.write_text(body + "\n")
-    elif cfg.is_file():
-        cfg.unlink()          # nothing left worth keeping
-    return {"threads": threads, "cores": cores, "file": str(cfg),
-            "restart_required": True}
-
-
-def shader_threads_status(root: Path) -> dict:
-    return {"current": get_shader_threads(root),
-            "cores": logical_cores(),
-            "recommended": recommended_shader_threads(),
-            "reserve": SHADER_THREADS_RESERVE,
-            "file": str(steam_dev_cfg(root)),
-            "exists": steam_dev_cfg(root).is_file()}
-
-
-def steam_shader_settings(root: Path) -> dict:
-    """Steam's shader-related BOOLEAN settings, across its configs.
-
-    Two filters, both learned the hard way from real config data:
-
-    1. Skip the ShaderCacheManager/App/<appid>/ subtree. Those hold
-       ShaderCacheSize - a byte count per game, e.g. 8198563848 - which is
-       reported data, not a setting. Matching on the key name alone surfaced
-       17 of them as checkboxes; toggling one would have written "1" into a
-       size field and corrupted Steam's config.
-    2. Only keep values that are actually "0"/"1". Anything else isn't a
-       switch, whatever its name looks like.
-
-    Steam only persists these once you've touched them, so an empty result
-    means 'still at defaults'.
-    """
-    out = []
-    candidates = [root / "config/config.vdf"] + list(find_localconfigs(root))
-    for cfg in candidates:
-        if not cfg.is_file():
-            continue
-        try:
-            data = vdf_parse(cfg.read_text(errors="replace"))
-        except Exception:
-            continue
-        keys = []
-        for kp, val in _walk_vdf(data):
-            if not SHADER_KEY_RE.search(kp[-1]):
-                continue
-            if any(seg.lower() == "app" for seg in kp[:-1]):
-                continue                      # per-game data, not a setting
-            if str(val) not in ("0", "1"):
-                continue                      # not a switch
-            keys.append({"path": "/".join(kp), "key": kp[-1], "value": val})
-        if keys:
-            out.append({"file": str(cfg), "keys": keys})
-    return {"files": out, "found": bool(out)}
-
-
-def steam_shader_cache_sizes(root: Path) -> dict:
-    """Steam's own per-game shader cache sizes, as it records them.
-
-    Same subtree the settings scan deliberately skips - useful as a total,
-    dangerous as toggles.
-    """
-    cfg = root / "config/config.vdf"
-    total, games = 0, 0
-    if cfg.is_file():
-        try:
-            data = vdf_parse(cfg.read_text(errors="replace"))
-            for kp, val in _walk_vdf(data):
-                if kp[-1].lower() != "shadercachesize":
-                    continue
-                if not any(seg.lower() == "app" for seg in kp[:-1]):
-                    continue
-                try:
-                    n = int(val)
-                except (TypeError, ValueError):
-                    continue
-                if n > 0:
-                    total += n
-                    games += 1
-        except Exception:
-            pass
-    return {"total_bytes": total, "games": games}
-
-
-def set_steam_shader_setting(root: Path, file, path, value, close_steam=False) -> dict:
-    cfg = Path(file)
-    if cfg.name not in ("config.vdf", "localconfig.vdf") or not cfg.is_file():
-        raise RuntimeError("refusing to write an unexpected file")
-    # Belt and braces alongside the filter in steam_shader_settings: the
-    # ShaderCacheManager/App/<appid>/ subtree holds ShaderCacheSize byte counts,
-    # and writing a 0/1 into one would tell Steam a multi-GB cache is "1".
-    segs = [s.lower() for s in str(path).split("/")]
-    if "app" in segs[:-1]:
-        raise RuntimeError("refusing to write per-game shader cache data")
-    if str(value) not in ("0", "1"):
-        raise RuntimeError("shader settings are booleans; refusing to write "
-                           f"{value!r}")
-    if steam_running():
-        if close_steam:
-            shutdown_steam()
-        else:
-            raise RuntimeError("Steam is running — it overwrites its configs "
-                               "on exit. Close it first.")
-    data = vdf_parse(cfg.read_text(errors="replace"))
-    parts = path.split("/")
-    node = data
-    for k in parts[:-1]:
-        nxt = ci_get(node, k)
-        if not isinstance(nxt, dict):
-            raise RuntimeError(f"key path not found: {path}")
-        node = nxt
-    for k in list(node.keys()):
-        if k.lower() == parts[-1].lower():
-            node[k] = str(value)
-            break
-    else:
-        raise RuntimeError(f"key not found: {path}")
-    bak = cfg.with_suffix(f".vdf.pcc-{int(time.time())}.bak")
-    shutil.copy2(cfg, bak)
-    tmp = cfg.with_suffix(".vdf.pcc-tmp")
-    tmp.write_text(vdf_dump(data))
-    tmp.replace(cfg)
-    return {"saved": True, "path": path, "value": str(value), "backup": str(bak)}
-
-
-
-# --------------------------------------------------------------------------
 # Hardware detection + MangoHud configuration
 # --------------------------------------------------------------------------
 MANGOHUD_DIR = Path(os.environ.get("XDG_CONFIG_HOME",
@@ -4258,6 +3519,20 @@ def detect_hardware() -> dict:
         "config_path": str(MANGOHUD_DIR / "MangoHud.conf"),
         "config_exists": (MANGOHUD_DIR / "MangoHud.conf").is_file(),
     }
+
+
+def primary_gpu_vendor() -> str:
+    """Pick the vendor that should drive theming/toggle gating: NVIDIA wins
+    whenever a discrete NVIDIA GPU is present (the common hybrid-laptop
+    case - an NVIDIA dGPU next to an AMD/Intel iGPU - since DLSS is what
+    matters there), otherwise AMD if any AMD GPU is present. Returns
+    "NVIDIA", "AMD", or "unknown" (neither vendor detected)."""
+    vendors = {g.get("vendor") for g in _nvidia_gpus() + _drm_gpus()}
+    if "NVIDIA" in vendors:
+        return "NVIDIA"
+    if "AMD" in vendors:
+        return "AMD"
+    return "unknown"
 
 
 # MangoHud 0.8.2 with legacy_layout=false draws a column per listed param.
@@ -4571,6 +3846,7 @@ class Handler(BaseHTTPRequestHandler):
                     "steam_root": str(root) if root else None,
                     "steam_running": steam_running(),
                     "driver": driver_version(),
+                    "gpu_vendor": primary_gpu_vendor(),
                     "version": VERSION,
                     "started_at": STARTED_AT,
                 })
@@ -4594,7 +3870,6 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                 dlss_seen = state.get("dlss_seen", {})
                 ultraplus_seen = state.get("ultraplus_seen", {})
-                reshade_installs = state.get("reshade_installs", {})
                 try:
                     ultraplus_cat = ultraplus_catalog()
                 except Exception:
@@ -4606,12 +3881,8 @@ class Handler(BaseHTTPRequestHandler):
                     g["has_launch_options"] = (bool(g.get("launch_options_shortcut"))
                                                if g.get("custom")
                                                else g["appid"] in lo_appids)
-                    g["has_cache"] = any(
-                        (Path(lib) / "shadercache" / g["appid"]).is_dir()
-                        for lib in [g["library"]])
                     g["has_dlss"] = bool(dlss_seen.get(g["appid"]))
                     g["has_ultraplus"] = bool(ultraplus_seen.get(g["appid"]))
-                    g["has_reshade"] = g["appid"] in reshade_installs
                     match = match_ultraplus_catalog(g["name"], ultraplus_cat)
                     g["ultraplus_supported"] = match is not None
                     g["ultraplus_url"] = match[1]["url"] if match else ""
@@ -4682,21 +3953,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"games": install_progress(root)})
             elif self.path == "/api/owned_games":
                 self._json({"games": owned_games(root)})
-            elif self.path == "/api/steam/shader_settings":
-                self._json(steam_shader_settings(root))
-            elif self.path == "/api/steam/shader_threads":
-                self._json(shader_threads_status(root))
             elif self.path == "/api/hardware":
                 self._json(detect_hardware())
             elif self.path == "/api/backup/export":
                 self._json(export_backup())
             elif self.path == "/api/proton/list":
                 self._json(list_ge_proton())
-            elif self.path == "/api/env/shaders":
-                st = environment_shader_status()
-                if root:
-                    st["steam_cache"] = steam_shader_cache_sizes(root)
-                self._json(st)
             elif m := re.match(r"^/api/mangohud(?:\?(.*))?$", self.path):
                 qs = urllib.parse.parse_qs(m.group(1) or "")
                 preset = (qs.get("preset") or ["standard"])[0]
@@ -4712,8 +3974,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(browse_dir((qs.get("path") or [""])[0]))
             elif m := re.match(r"^/api/game/(\d+)/compat_tool$", self.path):
                 self._json(get_compat_tool(root, m.group(1)))
-            elif m := re.match(r"^/api/game/(\d+)/cache$", self.path):
-                self._json({"caches": cache_info(root, m.group(1))})
             elif m := re.match(r"^/api/game/(\d+)/protondb(?:\?(.*))?$", self.path):
                 qs = urllib.parse.parse_qs(m.group(2) or "")
                 if qs.get("cached"):
@@ -4729,13 +3989,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(fetch_owned_games(root, force=force))
             elif self.path == "/api/dlss/library":
                 self._json({"dlls": dll_library()})
-            elif self.path == "/api/reshade/latest":
-                self._json(reshade_latest())
-            elif m := re.match(r"^/api/game/(\d+)/reshade$", self.path):
-                games = {g["appid"]: g for g in all_games(root)}
-                g = games.get(m.group(1))
-                self._json(scan_game_reshade(m.group(1), g["install_path"]) if g
-                          else {"installed": False})
             elif m := re.match(r"^/api/art_debug/(\d+)(?:\?(.*))?$", self.path):
                 qs = urllib.parse.parse_qs(m.group(2) or "")
                 gname = (qs.get("name") or [None])[0]
@@ -4792,9 +4045,6 @@ class Handler(BaseHTTPRequestHandler):
                                               close_steam=bool(body.get("close_steam"))))
             elif self.path == "/api/dlss_preset_defaults":
                 self._json(set_dlss_preset_defaults(body.get("settings", {})))
-            elif self.path == "/api/env/shaders":
-                self._json(set_environment_shaders(
-                    bool(body.get("enable")), body.get("size_bytes")))
             elif self.path == "/api/backup/restore":
                 self._json(restore_backup(body["archive"]))
             elif self.path == "/api/mods/install":
@@ -4926,15 +4176,6 @@ class Handler(BaseHTTPRequestHandler):
                     n += 1
                 ART_MISSES.clear()
                 self._json({"cleared": n})
-            elif self.path == "/api/steam/shader_settings":
-                self._json(set_steam_shader_setting(
-                    root, body["file"], body["path"], body["value"],
-                    close_steam=bool(body.get("close_steam"))))
-            elif self.path == "/api/steam/shader_threads":
-                # threads omitted -> use the recommended value; null -> unset
-                t = (body["threads"] if "threads" in body
-                     else recommended_shader_threads())
-                self._json(set_shader_threads(root, t))
             elif self.path == "/api/mangohud/apply":
                 self._json(apply_mangohud_config(
                     body.get("preset", "standard"),
@@ -4960,24 +4201,6 @@ class Handler(BaseHTTPRequestHandler):
                 tid = str(uuid.uuid4())
                 threading.Thread(target=download_latest_sr, args=(tid,), daemon=True).start()
                 self._json({"task": tid})
-            elif self.path == "/api/reshade/install":
-                appid = body["appid"]
-                games = {g["appid"]: g for g in all_games(root)}
-                g = games.get(appid)
-                if not g:
-                    self._json({"error": "unknown appid"}, 404); return
-                tid = str(uuid.uuid4())
-                TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
-                threading.Thread(target=_reshade_install_task,
-                                 args=(tid, appid, g["install_path"],
-                                       body.get("exe"), body.get("api")),
-                                 daemon=True).start()
-                self._json({"task": tid})
-            elif self.path == "/api/reshade/remove":
-                self._json(remove_reshade(body["appid"]))
-            elif m := re.match(r"^/api/game/(\d+)/cache/clear$", self.path):
-                self._json(clear_cache(root, m.group(1),
-                                       keep_recordings=body.get("keep_recordings", True)))
             else:
                 self._json({"error": "not found"}, 404)
         except RuntimeError as e:

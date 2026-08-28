@@ -18,8 +18,9 @@
   --bg:#101418; --panel:#171d24; --panel2:#1e252e; --line:#2a333e;
   --ink:#e8edf2; --muted:#8a97a6;
   --launch:#4da3ff; --dlss:#76b900; --cache:#e8a33d; --compiled:#b07aff; --danger:#ff5d5d;
-  --reshade:#2dd4bf;
   --radius:10px;
+  --accent-nvidia:#76b900; --accent-amd:#ed1c24;
+  --accent: var(--accent-nvidia);
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
@@ -47,12 +48,6 @@ body.gp-active .card.gp-focus .playbtn{opacity:1}
   box-shadow:0 20px 50px #000b}
 #settingsPop::-webkit-scrollbar{width:10px}
 #settingsPop::-webkit-scrollbar-thumb{background:var(--line);border-radius:5px}
-/* NVIDIA cache header - the headline number for this tab */
-#nvCache .big{display:flex;align-items:baseline;gap:10px;margin-bottom:8px}
-#nvCache .big b{font-size:30px;font-family:"Chakra Petch",sans-serif;color:var(--ink)}
-#nvCache .big span{color:var(--muted);font-size:13px}
-#nvCache .usebar{height:6px;border-radius:3px;background:var(--line);overflow:hidden}
-#nvCache .usebar i{display:block;height:100%;background:var(--dlss);width:0;transition:width .5s}
 #gpHint{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:60;
   background:var(--panel2);border:1px solid var(--line);border-radius:999px;
   padding:12px 26px;font-size:16px;color:var(--muted);display:none;gap:22px;
@@ -143,6 +138,11 @@ body.gp-active .card.gp-focus .playbtn{opacity:1}
 .ultraplusbadge.dim img{opacity:.55}
 .ultraplusbadge.dim:hover{border-color:var(--compiled);color:var(--compiled)}
 .ultraplusbadge.dim:hover img{opacity:1}
+.gpubadge{flex:none;display:inline-flex;align-items:center;
+  background:color-mix(in srgb, var(--accent) 15%, transparent);
+  border:1px solid var(--accent);border-radius:999px;
+  padding:2px 9px;font-size:10px;font-weight:700;letter-spacing:.04em;color:var(--accent);
+  margin-left:10px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 
 /* top bar */
@@ -184,8 +184,6 @@ main{padding:22px;max-width:1500px;margin:0 auto}
 .rail i{flex:1;background:var(--line)}
 .rail i.launch.lit{background:var(--launch)}
 .rail i.dlss.lit{background:var(--dlss)}
-.rail i.cache.lit{background:var(--cache)}
-.rail i.reshade.lit{background:var(--reshade)}
 .btn.violet{background:var(--compiled);border-color:var(--compiled);color:#160a24}
 .chip.v{color:var(--compiled);border-color:var(--compiled)}
 #globalBar{height:4px;background:transparent;position:fixed;top:0;left:0;right:0;z-index:40}
@@ -201,7 +199,7 @@ main{padding:22px;max-width:1500px;margin:0 auto}
 .card.installing img{opacity:.55}
 .legend{display:flex;gap:18px;margin:0 0 16px;color:var(--muted);font-size:12.5px}
 .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:-1px}
-.legend .l1 i{background:var(--launch)}.legend .l2 i{background:var(--dlss)}.legend .l3 i{background:var(--cache)}
+.legend .l1 i{background:var(--launch)}.legend .l2 i{background:var(--dlss)}
 #empty{color:var(--muted);padding:60px 0;text-align:center}
 
 /* drawer */
@@ -228,8 +226,6 @@ body.locked{overflow:hidden}
   border-bottom:2px solid transparent}
 .tab.active[data-tab=launch]{color:var(--launch);border-color:var(--launch)}
 .tab.active[data-tab=dlss]{color:var(--dlss);border-color:var(--dlss)}
-.tab.active[data-tab=reshade]{color:var(--reshade);border-color:var(--reshade)}
-.tab.active[data-tab=cache]{color:var(--cache);border-color:var(--cache)}
 .tab.active[data-tab=bench]{color:var(--compiled);border-color:var(--compiled)}
 .statgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .stat{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
@@ -316,6 +312,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
 
 <header>
   <h1>Proton <span>//</span> Command Center</h1>
+  <span class="gpubadge" id="gpuBadge" hidden></span>
   <input id="search" type="text" placeholder="Search your library…" autocomplete="off">
   <button class="btn" id="fsBtn" title="Fullscreen (F11)" aria-label="Toggle fullscreen">⛶</button>
   <button class="btn" id="hwBtn" title="System &amp; MangoHud">🖥</button>
@@ -362,6 +359,17 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
     </label>
   </div>
 
+  <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:16px 0 10px">GPU theme</h3>
+  <p class="note" style="margin:0 0 10px">Auto-detects your GPU vendor and colors the UI to match, hiding NVIDIA-only
+    DLSS controls on an AMD system. Override only if detection guessed wrong, or to preview the other theme.</p>
+  <div class="row">
+    <select id="vendorOverride">
+      <option value="auto">Auto-detect</option>
+      <option value="NVIDIA">Force NVIDIA</option>
+      <option value="AMD">Force AMD</option>
+    </select>
+  </div>
+
   <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:16px 0 10px">Proton versions (GE-Proton)</h3>
   <div id="protonList"><p class="note">Loading…</p></div>
 </div>
@@ -372,7 +380,6 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
   <div class="legend">
     <span class="l1"><i></i>Launch options set</span>
     <span class="l2"><i></i>DLSS detected</span>
-    <span class="l3"><i></i>Shader cache present</span>
   </div>
   <div id="grid"></div>
   <div id="empty" hidden>No games found. Is Steam installed with at least one game?</div>
@@ -441,9 +448,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
   <div class="tabs">
     <button class="tab active" data-tab="launch">Launch</button>
     <button class="tab" data-tab="dlss">DLSS</button>
-    <button class="tab" data-tab="reshade">ReShade</button>
     <button class="tab" data-tab="mods">Mods</button>
-    <button class="tab" data-tab="cache">Shader cache</button>
     <button class="tab" data-tab="bench">Benchmark</button>
   </div>
 
@@ -468,6 +473,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
       <h3>Toggles</h3>
       <div id="toggles"></div>
     </div>
+    <div id="dlssSections">
     <div class="section">
       <h3>DLSS Super Resolution</h3>
       <div class="row">
@@ -543,6 +549,15 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
           itself. "Apply" copies it into the SR/RR/FG controls above for the game you're currently editing.</p>
       </details>
     </div>
+    </div>
+    <div class="section" id="fsrSection" hidden>
+      <h3>AMD FSR</h3>
+      <p class="note">FSR's upscaling quality mode is normally an in-game setting — unlike DLSS, there's no
+        universal Proton env var to force it from outside the game. The <b>FSR4 upgrade</b> toggle above (in the
+        toggle list) covers replacing the game's bundled FSR DLLs with FSR4 on RDNA3/RDNA4 cards.</p>
+      <p class="note">This section is new and community-sourced — not verified against real AMD hardware by this
+        app's author. If something here is wrong, please open an issue.</p>
+    </div>
     <div class="section">
       <h3>Frame rate cap</h3>
       <div class="row">
@@ -591,37 +606,6 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
       <p class="note">All three come straight from NVIDIA's official GitHub repos (DLSS + Streamline SDK).
         Manual import below stays available as a fallback.</p>
       <div class="bar" id="dlBar"><i></i></div>
-    </div>
-  </div>
-
-  <!-- RESHADE -->
-  <div class="pane" id="pane-reshade">
-    <div class="section">
-      <h3>ReShade</h3>
-      <div id="reshadeStatus"><p class="note">Checking…</p></div>
-      <div class="row" style="margin-top:10px;align-items:center;gap:10px" id="reshadeApiRow">
-        <label class="note" for="reshadeApi" style="margin:0">Graphics API</label>
-        <select id="reshadeApi" style="flex:0 0 auto">
-          <option value="">Auto-detect</option>
-          <option value="d3d9">Direct3D 9 (d3d9.dll)</option>
-          <option value="d3d10">Direct3D 10 (dxgi.dll)</option>
-          <option value="d3d11">Direct3D 11 (dxgi.dll)</option>
-          <option value="d3d12">Direct3D 12 (dxgi.dll)</option>
-          <option value="opengl">OpenGL (opengl32.dll)</option>
-        </select>
-      </div>
-      <div class="row" style="margin-top:10px">
-        <input type="text" id="reshadeExePath" placeholder="Auto-detected .exe — override only if it picked the wrong one" style="flex:1">
-      </div>
-      <div class="row" style="margin-top:10px">
-        <button class="btn green" id="reshadeInstallBtn">Install ReShade</button>
-        <button class="btn danger" id="reshadeRemoveBtn" hidden>Remove</button>
-      </div>
-      <div class="bar" id="reshadeBar"><i></i></div>
-      <p class="note" id="reshadeDetail"></p>
-      <p class="note">Full Add-on Support build, straight from reshade.me. Default
-        shaders are ReShade's own Standard effects + SweetFX — drop more .fx files
-        into the shared shader folder to add them for every game.</p>
     </div>
   </div>
 
@@ -679,47 +663,6 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
     </div>
   </div>
 
-  <!-- CACHE -->
-  <div class="pane" id="pane-cache">
-    <div class="section">
-      <div id="nvCache"><p class="note">Reading cache…</p></div>
-      <h3 style="margin-top:16px">Shader cache optimisation (global)</h3>
-      <div class="toggle">
-        <div><b>NVIDIA shader disk cache</b><small>__GL_SHADER_DISK_CACHE (+ path, 10 GiB, no auto-purge) written to /etc/environment for all games. Persists compiled shaders across runs. DXVK's own cache vars are obsolete on modern Proton, so they're not set.</small></div>
-        <label class="switch"><input type="checkbox" id="shaderEnvToggle"><em></em></label>
-      </div>
-      <div class="row" id="cacheSizeRow" style="margin-top:10px;align-items:center;gap:10px">
-        <label class="note" for="cacheSize" style="margin:0">Cache limit</label>
-        <select id="cacheSize" style="flex:0 0 auto"></select>
-        <span class="note" id="cacheSizeNote" style="margin:0"></span>
-      </div>
-      <p class="note" id="shaderEnvNote">Applies to every game. Needs your password (writes a system file) and a re-login to take effect.</p>
-    </div>
-    <div class="section">
-      <h3>Shaders</h3>
-      <div id="cacheList"><p class="note">Checking…</p></div>
-      <p class="note" style="margin-top:12px">Steam downloads and processes shader
-        pipelines itself. To stop the <b>"Processing Vulkan shaders"</b> screen at
-        launch, turn off <b>Allow background processing of Vulkan shaders</b> in
-        Steam → Settings → Downloads → Shader Pre-Caching. (Shaders then compile
-        during play instead, which can cause brief first-encounter stutter.)</p>
-
-      <h3 style="margin-top:18px">Shader processing speed</h3>
-      <div id="threadsBox"><p class="note">Checking…</p></div>
-    </div>
-    <div class="section">
-      <h3>Steam's background processing</h3>
-      <div id="steamShader"><p class="note">Checking…</p></div>
-      <h3 style="margin-top:18px">Manual actions</h3>
-      <div class="row">
-        <button class="btn danger" id="clearCacheBtn">Clear compiled cache</button>
-        <button class="btn danger" id="clearAllBtn">Delete everything</button>
-      </div>
-      <p class="note">"Clear compiled cache" keeps the fozpipelinesv6 recordings (the source data);
-        "Delete everything" removes those too.</p>
-    </div>
-  </div>
-
   <!-- BENCHMARK -->
   <div class="pane" id="pane-bench">
     <div class="section">
@@ -759,7 +702,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
 
 <script>
 "use strict";
-const FRONTEND_VERSION="1.24.0";
+const FRONTEND_VERSION="1.25.0";
 const $=s=>document.querySelector(s);
 const api=async(p,opts)=>{const r=await fetch(p,opts);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j};
 const post=(p,body)=>api(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
@@ -783,10 +726,11 @@ const TOGGLES=[
  {id:"mangohud",label:"MangoHud overlay",hint:"Adds the mangohud wrapper — first enable writes PCC's custom horizontal overlay (orange labels, frametime graph, dGPU-pinned)",wrap:"mangohud"},
  {id:"steamdeckon",label:"Steam Deck spoof (=1)",hint:"SteamDeck=1 — spoofs Deck mode; helps some anti-cheat (ACE) accept Linux",env:"SteamDeck=1"},
  {id:"steamdeckoff",label:"Force Steam Deck off (=0)",hint:"SteamDeck=0 — explicitly disables Deck mode when something else enabled it",env:"SteamDeck=0"},
- {id:"nvapireflex",label:"Reflex low-latency",hint:"DXVK_NVAPI_VKREFLEX=1 — exposes dxvk-nvapi's Vulkan Reflex layer. Only kicks in on games implementing VK_NV_low_latency2; helps latency/frame pacing there, harmless elsewhere. (PROTON_ENABLE_NVAPI was dropped: NVAPI has been on by default since Proton 9 and the variable exists in no current build.)",env:"DXVK_NVAPI_VKREFLEX=1",needs:"DXVK_NVAPI_VKREFLEX"},
- {id:"dlssupgrade",needs:"PROTON_DLSS_UPGRADE",label:"DLSS auto-upgrade",hint:"PROTON_DLSS_UPGRADE=1 — swaps the game's bundled DLSS DLL for the newest one Proton ships, without touching game files. Overlaps with the DLSS tab's manual swaps; pick one approach.",env:"PROTON_DLSS_UPGRADE=1"},
+ {id:"nvapireflex",vendor:"NVIDIA",label:"Reflex low-latency",hint:"DXVK_NVAPI_VKREFLEX=1 — exposes dxvk-nvapi's Vulkan Reflex layer. Only kicks in on games implementing VK_NV_low_latency2; helps latency/frame pacing there, harmless elsewhere. (PROTON_ENABLE_NVAPI was dropped: NVAPI has been on by default since Proton 9 and the variable exists in no current build.)",env:"DXVK_NVAPI_VKREFLEX=1",needs:"DXVK_NVAPI_VKREFLEX"},
+ {id:"dlssupgrade",vendor:"NVIDIA",needs:"PROTON_DLSS_UPGRADE",label:"DLSS auto-upgrade",hint:"PROTON_DLSS_UPGRADE=1 — swaps the game's bundled DLSS DLL for the newest one Proton ships, without touching game files. Overlaps with the DLSS tab's manual swaps; pick one approach.",env:"PROTON_DLSS_UPGRADE=1"},
  {id:"vkd3dheap",label:"VKD3D descriptor heap (experimental)",hint:"VKD3D_CONFIG=descriptor_heap — enables vkd3d-proton's newer Vulkan descriptor-heap path for D3D12 titles, meant to eventually replace the current descriptor-buffer implementation. Still opt-in upstream because of unresolved NVIDIA driver bugs (crashes/visual corruption reported in some titles, e.g. Ready or Not) — worth trying per-game, not as a default. (PROTON_VKD3D_HEAP=1 was the old opt-in for this and is being removed upstream; don't set it alongside this.)",env:"VKD3D_CONFIG=descriptor_heap"},
- {id:"ngxupdater",needs:"PROTON_ENABLE_NGX_UPDATER",label:"DLSS auto-updater (NGX)",hint:"PROTON_ENABLE_NGX_UPDATER=1 — the DLSS render-preset overrides below (DXVK_NVAPI_DRS_*) only pick which preset the game's own DLSS DLL should use; they don't fetch newer DLSS libraries. This lets Proton's own updater install newer DLSS DLLs so a picked preset (e.g. a recent transformer model) actually exists in the game to select. Turn this on alongside any render-preset override.",env:"PROTON_ENABLE_NGX_UPDATER=1"},
+ {id:"ngxupdater",vendor:"NVIDIA",needs:"PROTON_ENABLE_NGX_UPDATER",label:"DLSS auto-updater (NGX)",hint:"PROTON_ENABLE_NGX_UPDATER=1 — the DLSS render-preset overrides below (DXVK_NVAPI_DRS_*) only pick which preset the game's own DLSS DLL should use; they don't fetch newer DLSS libraries. This lets Proton's own updater install newer DLSS DLLs so a picked preset (e.g. a recent transformer model) actually exists in the game to select. Turn this on alongside any render-preset override.",env:"PROTON_ENABLE_NGX_UPDATER=1"},
+ {id:"fsr4upgrade",vendor:"AMD",needs:"PROTON_FSR4_UPGRADE",label:"FSR4 upgrade",hint:"PROTON_FSR4_UPGRADE=1 — auto-downloads and installs AMD's FSR4 upscaler, replacing the game's bundled FSR 3.1 DLLs. Works on RDNA4 out of the box; RDNA3 is supported too as of FSR 4.1 (no longer needs the old DXIL_SPIRV_CONFIG=wmma_rdna3_workaround companion variable, except to enable Multi Frame Generation specifically). Community-reported behavior — not verified against real AMD hardware by this app's author, please report if something's off.",env:"PROTON_FSR4_UPGRADE=1"},
  {id:"ultraplus",label:"Ultra+ mod loader",hint:"WINEDLLOVERRIDES=dwmapi=n,b;version=n,b — two separate hijacks for two separate things. dwmapi.dll is the UE4SS build Ultra+ Manager drops in, loading UE4SS itself and UltraPlusExtensions. version.dll is a generic ASI loader (Ultimate ASI Loader) some games additionally need to run standalone .asi companion fixes (e.g. NaniteRayTracingFix.asi) that aren't part of UE4SS at all - harmless to leave on for games that don't have any. The status note below only appears once a game is open, and only means something if the files are already in the game folder — installed separately via Ultra+ Manager or, for the .asi fixes, wherever that fix is distributed.",env:"WINEDLLOVERRIDES=dwmapi=n,b;version=n,b"},
 ];
 // Trimmed from the default list (Aug 2026 declutter pass): GameMode
@@ -795,12 +739,14 @@ const TOGGLES=[
 // (DXVK_CONFIG=dxgi.maxDeviceMemory=7168 — only matters on 8GB-class cards),
 // D7VK (PROTON_USE_D7VK=1 — only for a handful of ancient Direct3D 7 games),
 // OptiScaler (PROTON_USE_OPTISCALER=1 — needs OptiScaler installed in the
-// game folder to do anything, confusing as a bare toggle), FSR4 upgrade
-// (PROTON_FSR4_UPGRADE=1 — RDNA4-only, a no-op on NVIDIA), and Disable esync
+// game folder to do anything, confusing as a bare toggle), and Disable esync
 // (PROTON_NO_ESYNC=1 — a hang/crash troubleshooting switch, not an everyday
-// option). None of this breaks a game that already has one of these vars set:
-// loadStringIntoUI() below preserves anything it doesn't recognise into the
-// "Extra env vars" box instead of dropping it.
+// option). FSR4 upgrade was also trimmed in that pass but is back (Aug 2026
+// vendor-theming pass) gated behind `vendor:"AMD"` instead of being dropped
+// outright — see applyCapabilities() for how vendor-gated toggles hide on a
+// mismatched GPU. None of the above breaks a game that already has one of
+// these vars set: loadStringIntoUI() below preserves anything it doesn't
+// recognise into the "Extra env vars" box instead of dropping it.
 let manualEdit=false;
 
 /* Which env vars each installed Proton build understands. Populated once at
@@ -885,13 +831,23 @@ function populatePresetDropdown(selectEl,feature,fallback){
 }
 function applyCapabilities(){
   const tool=selectedToolDir();
+  const vendor=typeof effectiveVendor==="function"?effectiveVendor():"unknown";
   populatePresetDropdown($("#dlssPreset"),"sr",SR_PRESET_FALLBACK);
   populatePresetDropdown($("#rrPreset"),"rr",RR_PRESET_FALLBACK);
   for(const t of TOGGLES){
-    if(!t.needs) continue;
     const input=document.querySelector(`#toggles input[data-id="${t.id}"]`);
     if(!input) continue;
     const row=input.closest(".toggle");
+    // Vendor mismatch hides the row entirely (unknown vendor fails open -
+    // never hide a toggle just because detection didn't return a vendor).
+    const vendorHide=t.vendor&&vendor!=="unknown"&&t.vendor!==vendor;
+    row.style.display=vendorHide?"none":"";
+    if(vendorHide){
+      input.checked=false;
+      row.querySelector(".unsupported")?.remove();
+      continue;
+    }
+    if(!t.needs) continue;
     const ok=!tool||buildSupports(tool,t.needs);
     const note=row.querySelector(".unsupported");
     if(ok){
@@ -1212,11 +1168,42 @@ let games=[],current=null,statusById={};
 
 function seedStatus(list){
   list.forEach(g=>statusById[g.appid]={...statusById[g.appid],
-    launch:!!g.has_launch_options,dlss:!!g.has_dlss,cache:!!g.has_cache,
-    reshade:!!g.has_reshade,
+    launch:!!g.has_launch_options,dlss:!!g.has_dlss,
     installing:g.fully_installed===false,pct:g.download_pct});
 }
 let steamIsRunning=false;
+
+/* ---------- GPU vendor theming ----------
+   Auto-detected via /api/status's gpu_vendor ("NVIDIA"/"AMD"/"unknown"),
+   overridable in Settings (localStorage "pcc.vendorOverride") so the AMD
+   theme/section can be visually QA'd without owning AMD hardware. */
+let detectedVendor="unknown";
+function effectiveVendor(){
+  let override="auto";
+  try{override=localStorage.getItem("pcc.vendorOverride")||"auto"}catch(e){}
+  return override!=="auto"?override:detectedVendor;
+}
+function applyVendorTheme(){
+  const v=effectiveVendor();
+  const root=document.documentElement;
+  root.style.setProperty("--accent",
+    v==="AMD"?"var(--accent-amd)":"var(--accent-nvidia)");
+  if(v==="NVIDIA"||v==="AMD")root.dataset.vendor=v.toLowerCase();
+  else delete root.dataset.vendor;
+  const badge=$("#gpuBadge");
+  if(v==="NVIDIA"||v==="AMD"){badge.textContent=v;badge.hidden=false}
+  else badge.hidden=true;
+
+  const isAmd=v==="AMD";
+  const dlssTabBtn=document.querySelector('.tab[data-tab="dlss"]');
+  if(dlssTabBtn)dlssTabBtn.hidden=isAmd;
+  const dlssSections=$("#dlssSections");if(dlssSections)dlssSections.hidden=isAmd;
+  const fsrSection=$("#fsrSection");if(fsrSection)fsrSection.hidden=!isAmd;
+  // don't strand the user on a tab that just got hidden
+  if(isAmd&&dlssTabBtn&&dlssTabBtn.classList.contains("active"))switchTab("launch");
+
+  applyCapabilities();
+}
 async function refreshStatus(){
   try{
     const s=await api("/api/status");
@@ -1229,6 +1216,8 @@ async function refreshStatus(){
     $("#startSteam").hidden=steamIsRunning;
     $("#verWarn").classList.toggle("show",!!s.version&&s.version!==FRONTEND_VERSION);
     if(!s.version)$("#verWarn").classList.add("show");
+    detectedVendor=s.gpu_vendor||"unknown";
+    applyVendorTheme();
   }catch(e){}
 }
 setInterval(refreshStatus,5000);
@@ -1237,9 +1226,7 @@ function railFor(g){
   const st=statusById[g.appid]||{};
   return `<div class="rail">
     <i class="launch ${st.launch?"lit":""}"></i>
-    <i class="dlss ${st.dlss?"lit":""}"></i>
-    <i class="reshade ${st.reshade?"lit":""}"></i>
-    <i class="cache ${st.cache?"lit":""}"></i></div>`;
+    <i class="dlss ${st.dlss?"lit":""}"></i></div>`;
 }
 let ownedOnly=[];   // owned but not installed
 function renderGrid(filter=""){
@@ -1384,6 +1371,18 @@ $("#fsBtn")?.addEventListener("click",toggleFullscreen);
     localStorage.setItem(FS_PREF,box.checked?"1":"0");
     toast(box.checked?"Will open fullscreen":"Won't open fullscreen");
     if(box.checked&&!fsOn())toggleFullscreen();   // this click IS the gesture
+  });
+})();
+(function(){
+  const sel=$("#vendorOverride");
+  if(!sel)return;
+  let saved="auto";
+  try{saved=localStorage.getItem("pcc.vendorOverride")||"auto"}catch(e){}
+  sel.value=saved;
+  sel.addEventListener("change",()=>{
+    try{localStorage.setItem("pcc.vendorOverride",sel.value)}catch(e){}
+    applyVendorTheme();
+    toast(sel.value==="auto"?"Auto-detecting GPU vendor":`Forced ${sel.value} theme`);
   });
 })();
 // F11 is the browser's own shortcut and works regardless; this only adds the
@@ -1652,7 +1651,6 @@ async function openGame(appid){
   $("#drawer").classList.add("open");$("#overlay").classList.add("open");
   document.body.classList.add("locked");
   $("#dlssList").innerHTML='<p class="note">Scanning game folder…</p>';
-  $("#cacheList").innerHTML='<p class="note">Checking…</p>';
   try{
     const lo=await api(`/api/game/${appid}/launch_options`);
     loadStringIntoUI(lo.value||"");
@@ -1660,7 +1658,7 @@ async function openGame(appid){
   }catch(e){loadStringIntoUI("")}
   loadUltraPlus(appid);
   refreshCapabilities();
-  loadLibrary().then(()=>loadDLSS(appid));loadCache(appid);loadBench(appid);loadCompat(appid);loadSteamShader();loadShaderEnv();loadCachedPdb(appid);loadReshade(appid);loadMods(appid);
+  loadLibrary().then(()=>loadDLSS(appid));loadBench(appid);loadCompat(appid);loadCachedPdb(appid);loadMods(appid);
 }
 
 async function loadDLSS(appid){
@@ -1712,82 +1710,6 @@ async function loadDLSS(appid){
     };
   }catch(e){$("#dlssList").innerHTML=`<p class="note">Scan failed: ${esc(e.message)}</p>`}
 }
-
-/* ---------- ReShade ---------- */
-function applyWineDllOverride(pair){
-  const box=$("#launchStr");
-  const cur=box.value||"";
-  const m=cur.match(/WINEDLLOVERRIDES=(\S+)/);
-  const [dll]=pair.split("=");
-  let entries=m?m[1].split(",").filter(e=>!e.startsWith(dll+"=")):[];
-  entries.push(pair);
-  const token="WINEDLLOVERRIDES="+entries.join(",");
-  box.value=m?cur.replace(/WINEDLLOVERRIDES=\S+/,token):(cur?cur+" "+token:token);
-  manualEdit=true;
-  switchTab("launch");
-  toast("Added to launch options — click Save to Steam to apply");
-}
-
-async function loadReshade(appid){
-  const box=$("#reshadeStatus");
-  box.innerHTML='<p class="note">Scanning game folder…</p>';
-  $("#reshadeRemoveBtn").hidden=true;
-  try{
-    const d=await api(`/api/game/${appid}/reshade`);
-    statusById[appid]={...statusById[appid],reshade:!!d.installed};
-    renderGrid($("#search").value);
-    window._reshadeState=d;
-    $("#reshadeExePath").value="";
-    $("#reshadeExePath").placeholder=d.exe?`Auto-detected: ${d.exe}`:"No .exe auto-detected — point PCC at it manually";
-    $("#reshadeApi").value="";
-    if(d.installed){
-      const wine=(d.proxy_name||"").replace(/\.dll$/,"")+"=n,b";
-      box.innerHTML=`
-        <div class="item">
-          <div class="top"><b>${esc(d.proxy_name)}</b>
-            <span class="chip g">v${esc(d.version||"?")}</span>
-            <span class="chip a">${esc((d.api||"").toUpperCase())}</span></div>
-          <div class="path mono">${esc(d.path)}</div>
-        </div>
-        <div class="row" style="margin-top:10px">
-          <button class="btn" id="reshadeApplyOverride" data-pair="${esc(wine)}">Add WINEDLLOVERRIDES=${esc(wine)} to launch options</button>
-        </div>
-        <p class="note">Toggle the effects overlay in-game with <b>Shift+F2</b> once it's running.</p>`;
-      $("#reshadeApplyOverride").addEventListener("click",e=>applyWineDllOverride(e.target.dataset.pair));
-      $("#reshadeInstallBtn").textContent="Reinstall / update";
-      $("#reshadeRemoveBtn").hidden=false;
-    }else{
-      box.innerHTML=d.exe
-        ? `<p class="note">Detected <b class="mono">${esc(d.exe.split("/").pop())}</b>${d.detected_api?` — looks like <b>${esc(d.detected_api.toUpperCase())}</b>`:" — couldn't tell the graphics API, pick one below"}.</p>`
-        : `<p class="note">No .exe found automatically — point Command Center at it manually below.</p>`;
-      $("#reshadeInstallBtn").textContent="Install ReShade";
-    }
-  }catch(e){box.innerHTML=`<p class="note">${esc(e.message)}</p>`}
-}
-$("#reshadeInstallBtn").addEventListener("click",async()=>{
-  if(!current)return;
-  const btn=$("#reshadeInstallBtn");
-  btn.disabled=true;
-  try{
-    const body={appid:current.appid};
-    if($("#reshadeExePath").value.trim())body.exe=$("#reshadeExePath").value.trim();
-    if($("#reshadeApi").value)body.api=$("#reshadeApi").value;
-    const {task}=await post("/api/reshade/install",body);
-    trackTask(task,"#reshadeBar",(t)=>{
-      btn.disabled=false;
-      if(t.result)toast(`Installed as ${t.result.proxy_dll}`);
-      loadReshade(current.appid);
-    },"#reshadeDetail");
-  }catch(e){toast(e.message,true);btn.disabled=false}
-});
-$("#reshadeRemoveBtn").addEventListener("click",async()=>{
-  if(!current)return;
-  if(!await pccConfirm(`Remove ReShade from ${current.name}?`,{yes:"Remove",danger:true}))return;
-  try{
-    await post("/api/reshade/remove",{appid:current.appid});
-    toast("Removed");loadReshade(current.appid);
-  }catch(e){toast(e.message,true)}
-});
 
 /* ---------- Ultra+ Mods ---------- */
 $("#modsHeadingLogo").src=ULTRAPLUS_LOGO;
@@ -2021,101 +1943,6 @@ $("#importBtn").addEventListener("click",async()=>{
   }catch(e){toast(e.message,true)}
 });
 
-/* ---------- Steam shader processing threads ----------
-   Lives in steam_dev.cfg, which Steam never creates and exposes nowhere in its
-   UI. Read once at client startup, so changes need a full Steam restart.     */
-async function loadShaderThreads(){
-  const box=$("#threadsBox");
-  if(!box)return;
-  try{
-    const d=await api("/api/steam/shader_threads");
-    const set=d.current!=null;
-    const optimal=set&&d.current===d.recommended;
-    box.innerHTML=`
-      <div class="item"><div class="top">
-        <b>${set?`Using ${d.current} of ${d.cores} threads`:`Steam default (${d.cores} threads available)`}</b>
-        <span class="chip ${optimal?"v":"m"}">${optimal?"optimal":set?"custom":"not set"}</span>
-      </div>
-      <div class="path">${set
-        ? `Set in steam_dev.cfg. Steam must be fully restarted for changes to apply.`
-        : `Steam uses only a fraction of your cores by default, which is why the
-           "Processing Vulkan shaders" pass can crawl. Nothing in Steam's UI
-           changes this — the override lives in a file Steam doesn't create.`}</div></div>
-      <div class="row" style="margin-top:10px">
-        <button class="btn primary" id="threadsFast">Use ${d.recommended} threads (all but ${d.reserve})</button>
-        ${set?`<button class="btn" id="threadsReset">Back to Steam default</button>`:""}
-      </div>
-      <p class="note">Leaves ${d.reserve} cores free so the desktop stays usable while it runs.</p>`;
-    $("#threadsFast").addEventListener("click",async()=>{
-      try{
-        const r=await post("/api/steam/shader_threads",{threads:d.recommended});
-        toast(`Set to ${r.threads} threads — restart Steam to apply`);
-        loadShaderThreads();
-      }catch(e){toast(e.message||"Failed",true)}
-    });
-    $("#threadsReset")?.addEventListener("click",async()=>{
-      if(!await pccConfirm("Remove the thread override?\n\nSteam goes back to using a fraction of your cores, and its shader pass will be slower."))return;
-      try{
-        await post("/api/steam/shader_threads",{threads:null});
-        toast("Override removed — restart Steam to apply");
-        loadShaderThreads();
-      }catch(e){toast(e.message||"Failed",true)}
-    });
-  }catch(e){box.innerHTML=`<p class="note">Couldn't read Steam's config.</p>`}
-}
-
-async function loadCache(appid){
-  loadShaderThreads();
-  try{
-    const d=await api(`/api/game/${appid}/cache`);
-    statusById[appid]={...statusById[appid],cache:d.caches.length>0};
-    renderGrid($("#search").value);
-    $("#cacheList").innerHTML=(d.caches.length?d.caches.map(c=>`
-      <div class="item">
-        <div class="top"><b>${fmtMB(c.size_bytes)}</b>
-          <span class="chip a">${c.files} files</span>
-          <span class="chip ${c.foz?"a":"m"}">${c.foz} .foz pipelines</span></div>
-        <div class="path mono">${esc(c.path)}</div>
-      </div>`).join("")
-      :'<p class="note">No shader cache yet — launch the game once from Steam.</p>');
-  }catch(e){$("#cacheList").innerHTML=`<p class="note">${esc(e.message)}</p>`}
-}
-$("#clearCacheBtn").addEventListener("click",async()=>{
-  if(!current)return;
-  if(!await pccConfirm(`Clear the compiled shader cache for ${current.name}?\n\nThe fozpipelinesv6 recordings are kept, so Steam can rebuild from them.`,{yes:"Clear",danger:true}))return;
-  try{
-    const r=await post(`/api/game/${current.appid}/cache/clear`,{keep_recordings:true});
-    toast(r.cleared.length?`Compiled cache cleared (${r.kept_recordings} recordings kept)`:"Nothing to clear");
-    loadCache(current.appid);
-  }catch(e){toast(e.message,true)}
-});
-$("#clearAllBtn").addEventListener("click",async()=>{
-  if(!current)return;
-  if(!await pccConfirm(`Delete ALL shader cache data for ${current.name}, including the foz recordings?\n\nSteam will re-download/collect them next time.`,{yes:"Delete everything",danger:true}))return;
-  try{
-    const r=await post(`/api/game/${current.appid}/cache/clear`,{keep_recordings:false});
-    toast(r.cleared.length?"Everything deleted":"Nothing to delete");
-    loadCache(current.appid);
-  }catch(e){toast(e.message,true)}
-});
-async function disableSteamBackgroundShaders(){
-  try{
-    const d=await api("/api/steam/shader_settings");
-    if(!d.found)return {ok:false,reason:"defaults"};
-    let changed=0;
-    for(const f of d.files){
-      for(const k of f.keys){
-        if(/background|precach/i.test(k.key) && k.value==="1"){
-          await post("/api/steam/shader_settings",
-            {file:f.file,path:k.path,value:0,close_steam:true});
-          changed++;
-        }
-      }
-    }
-    return {ok:true,changed};
-  }catch(e){return {ok:false,reason:e.message}}
-}
-
 function trackTask(id,barSel,onDone,detailSel){
   const bar=$(barSel);bar.classList.add("show");bar.querySelector("i").style.width="0%";
   const iv=setInterval(async()=>{
@@ -2127,39 +1954,6 @@ function trackTask(id,barSel,onDone,detailSel){
       if(t.status==="error"){clearInterval(iv);bar.classList.remove("show");toast(t.detail,true)}
     }catch(e){clearInterval(iv)}
   },800);
-}
-
-/* ---------- steam shader processing ---------- */
-async function loadSteamShader(){
-  try{
-    const d=await api("/api/steam/shader_settings");
-    if(!d.found){
-      $("#steamShader").innerHTML=`<div class="item"><div class="top"><b>Steam is using defaults</b>
-        <span class="chip m">nothing written yet</span></div>
-        <div class="path">Open Steam → Settings → Shader Pre-Caching and toggle either box once.
-        Steam then writes the setting to disk and PCC can manage it from here.</div></div>`;
-      return;
-    }
-    $("#steamShader").innerHTML=d.files.map(f=>f.keys.map(k=>`
-      <div class="toggle">
-        <div><b>${esc(k.key)}</b><small class="mono">${esc(k.path)}</small></div>
-        <label class="switch"><input type="checkbox" data-sfile="${esc(f.file)}"
-          data-spath="${esc(k.path)}" ${k.value==="1"?"checked":""}><em></em></label>
-      </div>`).join("")).join("");
-    $("#steamShader").onchange=async e=>{
-      const i=e.target;if(!i.dataset.spath)return;
-      if(steamIsRunning&&!await pccConfirm("Steam will be closed cleanly to change this setting. Continue?",{yes:"Close Steam & continue"})){
-        i.checked=!i.checked;return;
-      }
-      try{
-        await post("/api/steam/shader_settings",{file:i.dataset.sfile,path:i.dataset.spath,
-          value:i.checked?1:0,close_steam:true});
-        toast(i.checked?"Enabled — Steam processes shaders before launch"
-                       :"Disabled — shaders compile during play instead");
-        refreshStatus();
-      }catch(err){toast(err.message,true);i.checked=!i.checked}
-    };
-  }catch(e){$("#steamShader").innerHTML=`<p class="note">${esc(e.message)}</p>`}
 }
 
 /* ---------- ProtonDB check ---------- */
@@ -2330,78 +2124,6 @@ async function loadCompat(appid){
   }catch(e){$("#compatSel").innerHTML='<option value="">Steam default</option>'}
 }
 /* compat now saved via the merged Save all button */
-
-/* ---------- global shader optimisation ---------- */
-async function loadShaderEnv(){
-  try{
-    const d=await api("/api/env/shaders");
-    const t=$("#shaderEnvToggle");if(t)t.checked=d.enabled;
-    renderNvCache(d);
-    renderCacheSizes(d);
-  }catch(e){/* /etc/environment unreadable — leave unchecked */}
-}
-function renderCacheSizes(d){
-  const sel=$("#cacheSize");
-  if(!sel||!d.sizes)return;
-  const cur=d.cache?d.cache.limit_bytes:null;
-  sel.innerHTML=d.sizes.map(s=>
-    `<option value="${s.bytes}" ${s.bytes===cur?"selected":""}>${s.gb} GB</option>`).join("");
-  // A ceiling, not an allocation - nothing is reserved until shaders build up.
-  $("#cacheSizeNote").textContent=d.enabled?"":"enable the toggle to apply";
-  sel.disabled=!d.enabled;
-  sel.onchange=async()=>{
-    const bytes=parseInt(sel.value,10);
-    $("#shaderEnvNote").textContent="Applying (password prompt)…";
-    try{
-      await post("/api/env/shaders",{enable:true,size_bytes:bytes});
-      $("#shaderEnvNote").textContent="✓ Limit set. Log out and back in for it to take effect.";
-      toast(`Cache limit set to ${bytes/1073741824} GB`);
-      loadShaderEnv();
-    }catch(e){toast(e.message||"Failed",true);loadShaderEnv()}
-  };
-}
-function renderNvCache(d){
-  const box=$("#nvCache");
-  if(!box||!d.cache)return;
-  const c=d.cache, pct=c.limit_bytes?Math.min(100,100*c.size_bytes/c.limit_bytes):0;
-  // The default dir keeps filling until you re-login, because the env vars only
-  // reach newly-started processes. Bytes there aren't a fault, just stale.
-  const stale=c.default_size_bytes>1048576
-    ? `<p class="note">${fmtMB(c.default_size_bytes)} still sits in <span class="mono">${esc(c.default_path)}</span>
-       from processes started before the redirect. Harmless; clears on next log out, or delete it yourself.</p>`
-    : "";
-  // Steam keeps its own, separate shader cache and records the size per game.
-  // It's usually far bigger than the driver's, so it belongs on screen too.
-  const sc=d.steam_cache;
-  const steamLine=sc&&sc.total_bytes
-    ? `<p class="note">Steam also keeps <b>${fmtMB(sc.total_bytes)}</b> of its own shader cache
-       across ${sc.games} games — cleared per game below.</p>`
-    : "";
-  box.innerHTML=`
-    <div class="big"><b>${fmtMB(c.size_bytes)}</b>
-      <span>of ${fmtMB(c.limit_bytes)} NVIDIA shader cache${d.enabled?"":" · redirect off"}</span></div>
-    <div class="usebar"><i style="width:${pct.toFixed(1)}%"></i></div>
-    <p class="note" style="margin-top:8px"><span class="mono">${esc(c.path)}</span></p>
-    ${steamLine}${stale}`;
-}
-$("#shaderEnvToggle")?.addEventListener("change",async e=>{
-  const on=e.target.checked;
-  $("#shaderEnvNote").textContent="Applying (password prompt)…";
-  try{
-    // keep whatever ceiling is selected rather than silently reverting to 10 GB
-    const sizeSel=$("#cacheSize");
-    const size=sizeSel&&sizeSel.value?parseInt(sizeSel.value,10):undefined;
-    const r=await post("/api/env/shaders",on?{enable:true,size_bytes:size}:{enable:false});
-    $("#shaderEnvNote").textContent=on
-      ? "✓ Enabled globally. Log out and back in for it to take effect."
-      : "✓ Removed from /etc/environment. Log out and back in to clear.";
-    toast(on?"Shader cache enabled globally":"Shader cache disabled");
-  }catch(err){
-    e.target.checked=!on;
-    $("#shaderEnvNote").textContent="Couldn't write /etc/environment (cancelled or no permission).";
-    toast(err.message,true);
-  }
-});
 
 /* ---------- system & mangohud ---------- */
 let hwPreset="reference";

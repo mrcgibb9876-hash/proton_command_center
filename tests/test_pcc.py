@@ -19,7 +19,6 @@ def make_mock_steam(base: Path) -> Path:
     root = base / "Steam"
     (root / "steamapps/common/TestGame/Engine").mkdir(parents=True)
     (root / "userdata/12345678/config").mkdir(parents=True)
-    (root / "steamapps/shadercache/12345/fozpipelinesv6").mkdir(parents=True)
 
     (root / "steamapps/appmanifest_12345.acf").write_text(
         '"AppState"\n{\n\t"appid"\t\t"12345"\n\t"name"\t\t"Test Game"\n'
@@ -40,7 +39,6 @@ def make_mock_steam(base: Path) -> Path:
             + struct.pack("<I", 0x00010000)
             + struct.pack("<II", (310 << 16) | 3, 0) + b"\x00" * 100)
     (root / "steamapps/common/TestGame/Engine/nvngx_dlss.dll").write_bytes(blob)
-    (root / "steamapps/shadercache/12345/fozpipelinesv6/steam_pipeline_cache.foz").write_bytes(b"foz")
     return root
 
 
@@ -62,9 +60,7 @@ class PCCTests(unittest.TestCase):
         pcc.STATE_FILE = pcc.DATA_DIR / "state.json"
         pcc.CONFIG_FILE = pcc.DATA_DIR / "config.json"
         pcc.ART_DIR = pcc.DATA_DIR / "art"
-        pcc.RESHADE_DIR = pcc.DATA_DIR / "reshade"
-        pcc.RESHADE_SHADERS_DIR = pcc.RESHADE_DIR / "shaders"
-        for d in (pcc.DLL_LIBRARY, pcc.BACKUP_DIR, pcc.ART_DIR, pcc.RESHADE_DIR):
+        for d in (pcc.DLL_LIBRARY, pcc.BACKUP_DIR, pcc.ART_DIR):
             d.mkdir(parents=True, exist_ok=True)
         pcc.steam_running = lambda: False
         pcc.ART_MISSES.clear()
@@ -822,17 +818,6 @@ class PCCTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             pcc.swap_dll(str(game_dll), str(wrong))
 
-    # ---- ReShade ----
-    def test_detect_graphics_api_priority_and_dxgi_inference(self):
-        """DX12 > Vulkan > DX11 > DX10 > OpenGL > DX9 > DX8, and a dxgi.dll
-        import with nothing higher-priority present is inferred as DX12 (many
-        modern engines create their device through DXGI alone)."""
-        self.assertEqual(pcc.detect_graphics_api({"d3d11.dll", "d3d9.dll"}), "d3d11")
-        self.assertEqual(pcc.detect_graphics_api({"opengl32.dll"}), "opengl")
-        self.assertEqual(pcc.detect_graphics_api({"dxgi.dll"}), "d3d12")
-        self.assertEqual(pcc.detect_graphics_api({"dxgi.dll", "d3d11.dll"}), "d3d11")
-        self.assertIsNone(pcc.detect_graphics_api(set()))
-
     def test_find_game_exe_skips_installers_picks_largest(self):
         d = self.root / "steamapps/common/TestGame"
         (d / "UnInstall.exe").write_bytes(b"x" * 500)
@@ -842,68 +827,6 @@ class PCCTests(unittest.TestCase):
         real.write_bytes(b"x" * 2000)
         found = pcc._find_game_exe(d)
         self.assertEqual(found, real)
-
-    def _fake_exe(self):
-        d = self.root / "steamapps/common/TestGame"
-        exe = d / "Game.exe"
-        exe.write_bytes(b"MZ" + b"\x00" * 62)   # not a real PE; api_override bypasses detection
-        return d, exe
-
-    def test_install_reshade_refuses_foreign_dll(self):
-        d, exe = self._fake_exe()
-        (d / "dxgi.dll").write_bytes(b"not ours")
-        with self.assertRaises(RuntimeError) as ctx:
-            pcc.install_reshade("12345", str(d), api_override="d3d11")
-        self.assertIn("wasn't installed by Command Center", str(ctx.exception))
-
-    def test_install_reshade_full_flow_and_update_and_remove(self):
-        d, exe = self._fake_exe()
-
-        engine_dir = pcc.RESHADE_DIR / "9.9.9"
-        engine_dir.mkdir(parents=True)
-        (engine_dir / "ReShade64.dll").write_bytes(b"fake reshade64")
-        (engine_dir / "ReShade32.dll").write_bytes(b"fake reshade32")
-        real_latest, real_ensure_engine, real_ensure_shaders = (
-            pcc.reshade_latest, pcc.ensure_reshade_engine, pcc.ensure_default_shaders)
-        pcc.reshade_latest = lambda: {"version": "9.9.9", "url": "http://x"}
-        pcc.ensure_reshade_engine = lambda version, url=None, task_id=None: engine_dir
-        pcc.ensure_default_shaders = lambda task_id=None: pcc.RESHADE_SHADERS_DIR
-        try:
-            r = pcc.install_reshade("12345", str(d), api_override="d3d11")
-        finally:
-            pcc.reshade_latest = real_latest
-            pcc.ensure_reshade_engine = real_ensure_engine
-            pcc.ensure_default_shaders = real_ensure_shaders
-
-        self.assertEqual(r["proxy_dll"], "dxgi.dll")
-        self.assertEqual(r["winedlloverride"], "dxgi=n,b")
-        self.assertTrue(r["wrote_ini"])
-        target = d / "dxgi.dll"
-        self.assertEqual(target.read_bytes(), b"fake reshade64")
-        ini = (d / "ReShade.ini").read_text()
-        self.assertIn("EffectSearchPaths=", ini)
-
-        # updating (same appid, same target, now tracked as ours) must be
-        # allowed even though the target already exists.
-        (engine_dir / "ReShade64.dll").write_bytes(b"fake reshade64 v2")
-        pcc.reshade_latest = lambda: {"version": "9.9.9", "url": "http://x"}
-        pcc.ensure_reshade_engine = lambda version, url=None, task_id=None: engine_dir
-        pcc.ensure_default_shaders = lambda task_id=None: pcc.RESHADE_SHADERS_DIR
-        try:
-            r2 = pcc.install_reshade("12345", str(d), api_override="d3d11")
-        finally:
-            pcc.reshade_latest = real_latest
-            pcc.ensure_reshade_engine = real_ensure_engine
-            pcc.ensure_default_shaders = real_ensure_shaders
-        self.assertTrue(r2["installed"])
-        self.assertEqual(target.read_bytes(), b"fake reshade64 v2")
-        self.assertFalse(r2["wrote_ini"])          # existing ini left alone
-
-        rm = pcc.remove_reshade("12345")
-        self.assertTrue(rm["removed"])
-        self.assertFalse(target.exists())
-        with self.assertRaises(RuntimeError):
-            pcc.remove_reshade("12345")   # nothing tracked any more
 
     # ---- compile state ----
     def test_sgdb_fetch_and_cache(self):
@@ -955,15 +878,6 @@ class PCCTests(unittest.TestCase):
         ds = pcc._downsample(ft, target=40)
         self.assertLessEqual(len(ds), 45)
         self.assertGreater(max(ds), 40)  # spikes preserved
-
-    def test_smart_cache_clear_keeps_recordings(self):
-        cache = self.root / "steamapps/shadercache/12345"
-        (cache / "compiled_artifact.foz").write_bytes(b"compiled")
-        r = pcc.clear_cache(self.root, "12345", keep_recordings=True)
-        self.assertTrue(
-            (cache / "fozpipelinesv6/steam_pipeline_cache.foz").exists())
-        self.assertFalse((cache / "compiled_artifact.foz").exists())
-        self.assertEqual(r["kept_recordings"], 1)
 
     def test_skip_list(self):
         self.assertIn("1493710", pcc.SKIP_APPIDS)
@@ -1196,26 +1110,6 @@ class PCCTests(unittest.TestCase):
             pcc.owned_games(self.root)
 
     # ---- auto-tune ----
-    def test_steam_shader_settings_discovery_and_write(self):
-        cfg = self.root / "userdata/12345678/config/localconfig.vdf"
-        txt = cfg.read_text().replace(
-            '"friends"',
-            '"system"\n\t{\n\t\t"BackgroundShaderProcessing"\t\t"1"\n\t}\n\t"friends"', 1)
-        cfg.write_text(txt)
-        s = pcc.steam_shader_settings(self.root)
-        self.assertTrue(s["found"])
-        path = s["files"][0]["keys"][0]["path"]
-        pcc.set_steam_shader_setting(self.root, s["files"][0]["file"], path, 0)
-        s2 = pcc.steam_shader_settings(self.root)
-        self.assertEqual(s2["files"][0]["keys"][0]["value"], "0")
-        d = pcc.vdf_parse(cfg.read_text())
-        self.assertEqual(
-            d["UserLocalConfigStore"]["friends"]["VoiceReceiveVolume"], "0.75")
-
-    def test_steam_shader_setting_rejects_odd_file(self):
-        with self.assertRaises(RuntimeError):
-            pcc.set_steam_shader_setting(self.root, "/etc/passwd", "a/b", 0)
-
     def test_backend_and_frontend_versions_match(self):
         """Guard: a missed version bump shipped 1.3.7 code labelled 1.3.0."""
         import re as _re
@@ -1286,6 +1180,31 @@ class PCCTests(unittest.TestCase):
         r = pcc.apply_mangohud_config("minimal")
         self.assertTrue(Path(r["written"]).read_text().startswith("### Generated"))
         self.assertEqual(Path(r["backup"]).read_text(), "old\n")
+
+    def test_primary_gpu_vendor_nvidia_only(self):
+        pcc._nvidia_gpus = lambda: [{"vendor": "NVIDIA"}]
+        pcc._drm_gpus = lambda: []
+        self.assertEqual(pcc.primary_gpu_vendor(), "NVIDIA")
+
+    def test_primary_gpu_vendor_amd_only(self):
+        pcc._nvidia_gpus = lambda: []
+        pcc._drm_gpus = lambda: [{"vendor": "AMD"}]
+        self.assertEqual(pcc.primary_gpu_vendor(), "AMD")
+
+    def test_primary_gpu_vendor_hybrid_nvidia_wins(self):
+        pcc._nvidia_gpus = lambda: [{"vendor": "NVIDIA"}]
+        pcc._drm_gpus = lambda: [{"vendor": "AMD"}]
+        self.assertEqual(pcc.primary_gpu_vendor(), "NVIDIA")
+
+    def test_primary_gpu_vendor_intel_only_is_unknown(self):
+        pcc._nvidia_gpus = lambda: []
+        pcc._drm_gpus = lambda: [{"vendor": "Intel"}]
+        self.assertEqual(pcc.primary_gpu_vendor(), "unknown")
+
+    def test_primary_gpu_vendor_no_gpus(self):
+        pcc._nvidia_gpus = lambda: []
+        pcc._drm_gpus = lambda: []
+        self.assertEqual(pcc.primary_gpu_vendor(), "unknown")
 
     def test_manifest_section_mapping(self):
         """SR/FG/RR map to the verified manifest section names."""
@@ -1556,41 +1475,6 @@ class PCCTests(unittest.TestCase):
             self.assertNotIn("sha256sums = SKIP", s.read_text(),
                              ".SRCINFO ships a SKIP checksum")
 
-    def test_shader_threads_creates_missing_dev_cfg(self):
-        """Steam never ships steam_dev.cfg -- it does not exist on a stock
-        install -- so the override has to CREATE the file, not just edit it.
-        Regression: the existing VDF writer only updates keys in files that
-        already exist, so it would have silently done nothing here."""
-        root = Path(self.tmp.name) / "steamroot"
-        root.mkdir()
-        real = pcc.logical_cores
-        pcc.logical_cores = lambda: 16
-        try:
-            st = pcc.shader_threads_status(root)
-            self.assertFalse(st["exists"])
-            self.assertIsNone(st["current"])
-            self.assertEqual(st["recommended"], 14)      # 16 - 2 reserved
-
-            pcc.set_shader_threads(root, st["recommended"])
-            cfg = root / "steam_dev.cfg"
-            self.assertTrue(cfg.is_file(), "must create steam_dev.cfg")
-            self.assertEqual(pcc.get_shader_threads(root), 14)
-
-            # must not clobber unrelated lines, nor duplicate the key
-            cfg.write_text("unSomethingElse 1\n"
-                           "unShaderBackgroundProcessingThreads 4\n")
-            pcc.set_shader_threads(root, 9)
-            txt = cfg.read_text()
-            self.assertIn("unSomethingElse 1", txt)
-            self.assertEqual(txt.count("unShaderBackgroundProcessingThreads"), 1)
-            self.assertEqual(pcc.get_shader_threads(root), 9)
-
-            for bad in (0, 17, -1):
-                with self.assertRaises(RuntimeError):
-                    pcc.set_shader_threads(root, bad)
-        finally:
-            pcc.logical_cores = real
-
     def test_proton_capabilities_fail_open(self):
         """Builds differ: GE-Proton11-1 reads 29 vars Valve's Proton 11.0 does
         not, so a launch string valid under GE can be inert under Valve. The
@@ -1672,59 +1556,6 @@ class PCCTests(unittest.TestCase):
         self.assertIn("proton_experimental", names)
         self.assertNotIn("proton_9", names)     # not installed -> not offered
         self.assertNotIn("proton_10", names)
-
-    def test_shader_settings_excludes_per_game_sizes(self):
-        """ShaderCacheManager/App/<id>/ShaderCacheSize is a byte count Steam
-        records per game (8198563848 on a real config), not a setting. Matching
-        on the key name alone rendered 17 of them as checkboxes; flipping one
-        would write "1" into a size field and corrupt Steam's config. Only
-        genuine 0/1 settings outside the App subtree may be shown or written."""
-        root = Path(self.tmp.name) / "ss"
-        (root / "config").mkdir(parents=True)
-        apps = "".join('"%s" { "ShaderCacheSize" "%d" }\n' % (a, s)
-                       for a, s in [("553850", 8198563848),
-                                    ("1971870", 3446367914),
-                                    ("228980", 0)])
-        (root / "config/config.vdf").write_text(
-            '"InstallConfigStore"{"Software"{"Valve"{"Steam"'
-            '{"ShaderCacheManager"{"EnableShaderBackgroundProcessing" "1"\n'
-            '"App"{' + apps + '}}}}}}')
-
-        d = pcc.steam_shader_settings(root)
-        keys = [k for f in d["files"] for k in f["keys"]]
-        self.assertEqual(len(keys), 1)
-        self.assertEqual(keys[0]["key"], "EnableShaderBackgroundProcessing")
-
-        # the sizes are still readable as a total, just never as switches
-        sizes = pcc.steam_shader_cache_sizes(root)
-        self.assertEqual(sizes["games"], 2)
-        self.assertEqual(sizes["total_bytes"], 8198563848 + 3446367914)
-
-        # and writing into that subtree must be refused outright
-        with self.assertRaises(RuntimeError):
-            pcc.set_steam_shader_setting(
-                root, str(root / "config/config.vdf"),
-                "InstallConfigStore/Software/Valve/Steam/ShaderCacheManager/"
-                "App/553850/ShaderCacheSize", "1")
-        with self.assertRaises(RuntimeError):
-            pcc.set_steam_shader_setting(
-                root, str(root / "config/config.vdf"),
-                "InstallConfigStore/Software/Valve/Steam/ShaderCacheManager/"
-                "EnableShaderBackgroundProcessing", "8198563848")
-
-    def test_shader_cache_size_is_configurable(self):
-        """The ceiling was hardcoded at 10 GiB. It's a limit, not an
-        allocation, so bigger costs nothing until shaders accumulate - but only
-        the offered sizes may be written, since this goes into /etc/environment
-        as root."""
-        self.assertEqual([gb for gb, _ in pcc.SHADER_CACHE_SIZES],
-                         [10, 30, 50, 100])
-        for _, b in pcc.SHADER_CACHE_SIZES:
-            self.assertEqual(b % (1024 ** 3), 0)
-        # anything not on the list is refused rather than written blindly
-        for bad in (12345, 0, -1, 999 * 1024 ** 3):
-            with self.assertRaises(RuntimeError):
-                pcc.set_environment_shaders(True, bad)
 
     # -- DLSS render-preset control (DXVK-NVAPI DRS layer) ------------------
 

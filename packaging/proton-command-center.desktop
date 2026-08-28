@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
 Name=Proton Command Center
-Comment=Launch options, DLSS DLLs, and shader caches for Steam games
+Comment=Launch options, DLSS/FSR DLLs, and Proton mods for Steam games
 Exec=proton-command-center
 Icon=steam
 Terminal=false
 Categories=Game;Utility;
-Keywords=steam;proton;dlss;shader;launch;
+Keywords=steam;proton;dlss;fsr;launch;
