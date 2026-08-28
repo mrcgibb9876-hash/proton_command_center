@@ -725,6 +725,46 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
       <div class="bar" id="rhiAddonsBar"><i></i></div>
       <p class="note" id="rhiAddonsDetail"></p>
     </div>
+    <div class="section">
+      <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:0 0 10px">OptiScaler</h3>
+      <p class="note" style="margin:0 0 10px">Redirects DLSS/FSR/XeSS calls to any upscaler + frame gen, on any GPU.
+        Installs alongside ReShade when both are wanted (auto-renamed to coexist).</p>
+      <div id="rhiOsStatus"><p class="note">Checking…</p></div>
+      <div class="row" style="margin-top:10px;align-items:center;gap:10px;flex-wrap:wrap">
+        <label class="note" for="rhiOsVariant" style="margin:0">Variant</label>
+        <select id="rhiOsVariant">
+          <option value="stable">Stable</option>
+          <option value="nightly">Nightly</option>
+        </select>
+        <label class="note" for="rhiOsGpuType" style="margin:0">GPU</label>
+        <select id="rhiOsGpuType">
+          <option value="NVIDIA">NVIDIA</option>
+          <option value="AMD">AMD</option>
+        </select>
+        <label class="note" style="margin:0;display:flex;align-items:center;gap:6px">
+          <input type="checkbox" id="rhiOsDlssInputs" checked style="width:auto"> DLSS-input spoofing (AMD/Intel)
+        </label>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn green" id="rhiOsInstallBtn">Install OptiScaler</button>
+        <button class="btn" id="rhiOsUpdateBtn" hidden>Update</button>
+        <button class="btn danger" id="rhiOsRemoveBtn" hidden>Remove</button>
+      </div>
+      <div class="bar" id="rhiOsBar"><i></i></div>
+      <p class="note" id="rhiOsDetail"></p>
+      <div class="row" style="margin-top:14px;align-items:center;gap:10px;flex-wrap:wrap">
+        <label class="note" for="rhiOsHotkey" style="margin:0">Overlay hotkey</label>
+        <select id="rhiOsHotkey"></select>
+        <button class="btn" id="rhiOsHotkeyBtn">Set for all games</button>
+      </div>
+      <div class="row" id="rhiOsFgRow" hidden style="margin-top:10px;align-items:center;gap:10px;flex-wrap:wrap">
+        <label class="note" for="rhiOsFgInput" style="margin:0">Frame gen input</label>
+        <select id="rhiOsFgInput"></select>
+        <label class="note" for="rhiOsFgOutput" style="margin:0">output</label>
+        <select id="rhiOsFgOutput"></select>
+        <button class="btn" id="rhiOsFgApplyBtn">Apply</button>
+      </div>
+    </div>
     <p class="note" style="margin-top:10px">Ported from <a href="https://github.com/RankFTW/RHI"
       target="_blank" rel="noopener noreferrer" style="color:var(--compiled)">RHI</a>.</p>
   </div>
@@ -1704,7 +1744,7 @@ async function openGame(appid){
   }catch(e){loadStringIntoUI("")}
   loadUltraPlus(appid);
   refreshCapabilities();
-  loadLibrary().then(()=>loadDLSS(appid));loadCompat(appid);loadCachedPdb(appid);loadMods(appid);loadRhiReshade(appid).then(()=>loadRhiAddons(appid));loadRhiShaderPacks(appid);
+  loadLibrary().then(()=>loadDLSS(appid));loadCompat(appid);loadCachedPdb(appid);loadMods(appid);loadRhiReshade(appid).then(()=>loadRhiAddons(appid));loadRhiShaderPacks(appid);loadRhiOptiscaler(appid);
 }
 
 async function loadDLSS(appid){
@@ -2175,6 +2215,102 @@ $("#rhiAddonsRemoveBtn").addEventListener("click",async()=>{
   try{
     await post("/api/rhi/addons/remove",{appid:current.appid});
     toast("Removed");loadRhiAddons(current.appid);
+  }catch(e){toast(e.message,true)}
+});
+
+/* ---------- RHI: OptiScaler ---------- */
+const RHI_OS_HOTKEYS=["Insert","Delete","Home","End","Page Up","Page Down",
+  "F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"];
+const RHI_OS_FG_INPUTS=["auto","nofg","dlssg","nukems","fsrfg","upscaler","fsrfg30"];
+const RHI_OS_FG_OUTPUTS=["auto","nofg","fsrfg","xefg","nukems"];
+(function initRhiOsSelects(){
+  $("#rhiOsHotkey").innerHTML=RHI_OS_HOTKEYS.map(k=>`<option value="${esc(k)}">${esc(k)}</option>`).join("");
+  $("#rhiOsHotkey").value="Insert";
+  $("#rhiOsFgInput").innerHTML=RHI_OS_FG_INPUTS.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join("");
+  $("#rhiOsFgOutput").innerHTML=RHI_OS_FG_OUTPUTS.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join("");
+})();
+async function loadRhiOptiscaler(appid){
+  const box=$("#rhiOsStatus");
+  box.innerHTML='<p class="note">Scanning game folder…</p>';
+  $("#rhiOsRemoveBtn").hidden=true;$("#rhiOsUpdateBtn").hidden=true;$("#rhiOsFgRow").hidden=true;
+  try{
+    const d=await api(`/api/game/${appid}/rhi/optiscaler`);
+    window._rhiOsState=d;
+    if(d.installed){
+      $("#rhiOsVariant").value=d.variant||"stable";
+      $("#rhiOsGpuType").value=d.gpu_type||"NVIDIA";
+      $("#rhiOsDlssInputs").checked=d.dlss_inputs!==false;
+      box.innerHTML=`
+        <div class="item">
+          <div class="top"><b>${esc(d.installed_as)}</b>
+            <span class="chip g">${esc(d.version||"?")}</span>
+            <span class="chip m">${esc(d.variant||"stable")}</span>
+            ${d.detected_api?`<span class="chip a">${esc(d.detected_api.toUpperCase())}</span>`:""}
+            ${d.update_available?'<span class="chip a">update available</span>':""}</div>
+          <div class="path mono">${esc(d.path)}</div>
+        </div>`;
+      $("#rhiOsInstallBtn").textContent="Reinstall";
+      $("#rhiOsRemoveBtn").hidden=false;
+      $("#rhiOsUpdateBtn").hidden=!d.update_available;
+      $("#rhiOsFgRow").hidden=false;
+    }else{
+      $("#rhiOsGpuType").value=effectiveVendor()==="AMD"?"AMD":"NVIDIA";
+      $("#rhiOsInstallBtn").textContent="Install OptiScaler";
+      box.innerHTML=d.exe
+        ? `<p class="note">Detected <b class="mono">${esc(d.exe.split("/").pop())}</b>${d.detected_api?` — looks like <b>${esc(d.detected_api.toUpperCase())}</b>`:" — couldn't tell the graphics API"}.</p>`
+        : `<p class="note">No .exe found automatically — install ReShade first (it shares the exe-override field) or point Command Center at it manually.</p>`;
+    }
+  }catch(e){box.innerHTML=`<p class="note">${esc(e.message)}</p>`}
+}
+$("#rhiOsInstallBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  const btn=$("#rhiOsInstallBtn");btn.disabled=true;
+  try{
+    const body={appid:current.appid,variant:$("#rhiOsVariant").value,
+      gpu_type:$("#rhiOsGpuType").value,dlss_inputs:$("#rhiOsDlssInputs").checked,
+      hotkey:$("#rhiOsHotkey").value};
+    if($("#rhiExePath").value.trim())body.exe=$("#rhiExePath").value.trim();
+    const {task}=await post("/api/rhi/optiscaler/install",body);
+    trackTask(task,"#rhiOsBar",(t)=>{
+      btn.disabled=false;
+      if(t.result)toast(`Installed OptiScaler ${t.result.version}`);
+      loadRhiOptiscaler(current.appid);
+    },"#rhiOsDetail");
+  }catch(e){toast(e.message,true);btn.disabled=false}
+});
+$("#rhiOsUpdateBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  const btn=$("#rhiOsUpdateBtn");btn.disabled=true;
+  try{
+    const {task}=await post("/api/rhi/optiscaler/update",{appid:current.appid});
+    trackTask(task,"#rhiOsBar",(t)=>{
+      btn.disabled=false;
+      if(t.result)toast(`Updated OptiScaler to ${t.result.version}`);
+      loadRhiOptiscaler(current.appid);
+    },"#rhiOsDetail");
+  }catch(e){toast(e.message,true);btn.disabled=false}
+});
+$("#rhiOsRemoveBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  if(!await pccConfirm(`Remove OptiScaler from ${current.name}?`,{yes:"Remove",danger:true}))return;
+  try{
+    await post("/api/rhi/optiscaler/remove",{appid:current.appid});
+    toast("Removed");loadRhiOptiscaler(current.appid);
+  }catch(e){toast(e.message,true)}
+});
+$("#rhiOsHotkeyBtn").addEventListener("click",async()=>{
+  try{
+    const {updated_games}=await post("/api/rhi/optiscaler/hotkey",
+      {hotkey:$("#rhiOsHotkey").value,apply_all:true});
+    toast(`Hotkey set — updated ${updated_games} installed game(s)`);
+  }catch(e){toast(e.message,true)}
+});
+$("#rhiOsFgApplyBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  try{
+    await post("/api/rhi/optiscaler/fg",{appid:current.appid,
+      fg_input:$("#rhiOsFgInput").value,fg_output:$("#rhiOsFgOutput").value});
+    toast("Frame gen settings applied");
   }catch(e){toast(e.message,true)}
 });
 

@@ -12,6 +12,7 @@ import re
 import shutil
 import struct
 import subprocess
+import tempfile
 import threading
 import time
 import zlib
@@ -2780,10 +2781,10 @@ def list_custom_reshade_files() -> list:
 
 
 def _identify_dxgi_file(path) -> str:
-    """Is an existing dxgi.dll ours (ReShade), or something foreign? Positive
-    evidence only, never guessed from size alone - port of RHI's
-    IdentifyDxgiFile (minus the OptiScaler/DXVK branches, out of scope for
-    this phase)."""
+    """Is an existing dxgi.dll ours (ReShade), OptiScaler's, or something
+    foreign? Positive evidence only, never guessed from size alone - port
+    of RHI's IdentifyDxgiFile (minus the DXVK branch - DXVK variant
+    management isn't built in pcc.py yet)."""
     path = Path(path)
     try:
         size = path.stat().st_size
@@ -2797,6 +2798,8 @@ def _identify_dxgi_file(path) -> str:
         return "unknown"
     if b"ReShade" in data and (b"reshade.me" in data or b"crosire" in data):
         return "reshade"
+    if b"OptiScaler" in data:
+        return "optiscaler"
     search_dirs = ([RESHADE_NIGHTLY_STAGING_DIR, RESHADE_CUSTOM_DIR]
                    + list(RESHADE_STAGING_DIR.glob("*"))
                    + list(RESHADE_NORMAL_STAGING_DIR.glob("*"))
@@ -3594,6 +3597,900 @@ def set_game_addon_selection(appid, addon_ids) -> dict:
 def _deploy_reshade_addons_task(task_id, install_path, addon_ids, bitness) -> None:
     try:
         deploy_reshade_addons(install_path, addon_ids, bitness, task_id=task_id)
+    except Exception as e:
+        TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
+
+
+# --------------------------------------------------------------------------
+# RHI port: OptiScaler (upscaler redirection DLSS<->FSR<->XeSS + frame gen)
+# --------------------------------------------------------------------------
+# Unlike ReShade's self-extracting .exe, every OptiScaler release (Stable
+# and Nightly) ships only as a .7z archive - confirmed live, no zip
+# fallback exists. That needs a real system 7-Zip install (`7z` on PATH),
+# same as this file already shells out to `steam`/`pkexec`/`systemctl`
+# rather than adding a new Python dependency (py7zr pulls in several
+# C-extension packages - pyzstd, brotli, pyppmd, pycryptodomex - which
+# would violate this file's stdlib-only design far more than shelling out
+# to a standard Linux CLI tool does).
+OPTISCALER_DATA_DIR = RHI_DATA_DIR / "optiscaler"
+OPTISCALER_STAGING_DIR = OPTISCALER_DATA_DIR / "stable"
+OPTISCALER_NIGHTLY_DIR = OPTISCALER_DATA_DIR / "nightly"
+OPTISCALER_INIS_DIR = OPTISCALER_DATA_DIR / "inis"          # user-editable, seeded once
+OPTIPATCHER_STAGING_DIR = OPTISCALER_DATA_DIR / "optipatcher"
+OPTISCALER_DLSS_DIR = OPTISCALER_DATA_DIR / "dlss"           # SR/RR/FG dll cache
+OPTISCALER_INI_TEMPLATES_DIR = Path(__file__).resolve().parent / "optiscaler_inis"
+
+OPTISCALER_RELEASES_API = "https://api.github.com/repos/optiscaler/OptiScaler/releases/latest"
+OPTISCALER_NIGHTLY_RELEASES_API = "https://api.github.com/repos/optiscaler/OptiScaler-nightly/releases"
+OPTIPATCHER_RELEASES_API = "https://api.github.com/repos/optiscaler/OptiPatcher/releases/tags/rolling"
+OPTISCALER_DLSS_MANIFEST_URL = ("https://raw.githubusercontent.com/beeradmoore/"
+                                "dlss-swapper-manifest-builder/main/manifest.json")
+
+# Ported verbatim from OptiScalerService.cs - the DLL names OptiScaler can
+# be renamed to (dxgi.dll by default; winmm.dll for Vulkan games), and the
+# 3 DLSS DLL kinds it can swap in from the DLSS Swapper manifest. Loose
+# companion DLLs (fakenvapi, libxess*, amd_fidelityfx_*, etc) vary by
+# release and aren't hardcoded - each install's own actual footprint is
+# tracked in its state record instead (deployed_files/deployed_subdirs).
+OPTISCALER_SUPPORTED_DLL_NAMES = [
+    "dxgi.dll", "winmm.dll", "d3d11.dll", "d3d12.dll", "dbghelp.dll",
+    "version.dll", "wininet.dll", "winhttp.dll",
+]
+OPTISCALER_DLSS_DLL_NAMES = {"dlss": "nvngx_dlss.dll", "dlss_d": "nvngx_dlssd.dll",
+                             "dlss_g": "nvngx_dlssg.dll"}
+
+# Friendly key name -> Windows VK hex code, ported verbatim from
+# OptiScalerService.cs - purely OptiScaler's own INI value format, resolved
+# entirely inside the DLL's own in-process keyboard hook, so it works
+# identically under Proton with no Windows-host dependency.
+OPTISCALER_HOTKEY_VK_CODES = {
+    "Insert": "0x2D", "Delete": "0x2E", "Home": "0x24", "End": "0x23",
+    "Page Up": "0x21", "Page Down": "0x22",
+    "F1": "0x70", "F2": "0x71", "F3": "0x72", "F4": "0x73", "F5": "0x74",
+    "F6": "0x75", "F7": "0x76", "F8": "0x77", "F9": "0x78", "F10": "0x79",
+    "F11": "0x7A", "F12": "0x7B",
+}
+# Real allowed values, sourced from the bundled OptiScaler.ini's own
+# [FrameGen] comments (not invented).
+OPTISCALER_FG_INPUT_VALUES = ["auto", "nofg", "dlssg", "nukems", "fsrfg", "upscaler", "fsrfg30"]
+OPTISCALER_FG_OUTPUT_VALUES = ["auto", "nofg", "fsrfg", "xefg", "nukems"]
+
+# The 4 real bundled INI templates (of RHI's nominal 6 - nvidia.ini and
+# amd-dlss.ini are byte-identical, so only the dlss/nodlss split matters).
+_OPTISCALER_INI_CONFIGS = (
+    ("NVIDIA", True, False), ("AMD", True, False), ("AMD", False, False),
+    ("NVIDIA", True, True), ("AMD", True, True), ("AMD", False, True),
+)
+
+
+def _find_7z_binary() -> str | None:
+    for name in ("7z", "7za", "7zr"):
+        p = shutil.which(name)
+        if p:
+            return p
+    return None
+
+
+def _optiscaler_staging_dir(nightly=False) -> Path:
+    return OPTISCALER_NIGHTLY_DIR if nightly else OPTISCALER_STAGING_DIR
+
+
+def optiscaler_staging_version(nightly=False):
+    p = _optiscaler_staging_dir(nightly) / "version.txt"
+    return p.read_text().strip() if p.is_file() else None
+
+
+def optiscaler_staging_ready(nightly=False) -> bool:
+    d = _optiscaler_staging_dir(nightly)
+    return (d / "OptiScaler.dll").is_file() and (d / "version.txt").is_file()
+
+
+def optiscaler_latest(nightly=False) -> dict:
+    """Latest OptiScaler release metadata (tag + .7z asset URL), 6h cached.
+    Stable has a real 'latest' alias; Nightly's repo doesn't, so the first
+    (newest) entry of the plain /releases list is used instead - matches
+    RHI's own approach (Staging.cs:800-864)."""
+    state = load_state()
+    cache_key = "optiscaler_nightly_latest" if nightly else "optiscaler_latest"
+    cache = state.get(cache_key)
+    now = time.time()
+    if cache and now - cache.get("ts", 0) < 21600:
+        return cache["data"]
+    if nightly:
+        releases = _gh_json(OPTISCALER_NIGHTLY_RELEASES_API)
+        if not releases:
+            raise RuntimeError("Couldn't reach OptiScaler-nightly's releases")
+        release = releases[0]
+        tag = (release["tag_name"] or "").replace("nightly-", "")
+    else:
+        release = _gh_json(OPTISCALER_RELEASES_API)
+        tag = release["tag_name"]
+    asset = next((a for a in release.get("assets", [])
+                 if a["name"].lower().endswith(".7z")), None)
+    if not asset:
+        raise RuntimeError("No .7z asset found in the latest OptiScaler release")
+    data = {"version": tag, "url": asset["browser_download_url"], "asset_name": asset["name"]}
+    state[cache_key] = {"ts": now, "data": data}
+    save_state(state)
+    return data
+
+
+def check_optiscaler_update(nightly=False) -> bool:
+    try:
+        info = optiscaler_latest(nightly=nightly)
+    except Exception:
+        return False
+    return optiscaler_staging_ready(nightly) and optiscaler_staging_version(nightly) != info["version"]
+
+
+def ensure_optiscaler_staging(nightly=False, task_id=None) -> Path:
+    """Downloads+extracts the latest OptiScaler .7z release into the
+    staging dir via a system `7z` binary. Port of EnsureStagingAsync /
+    EnsureNightlyStagingAsync (Staging.cs:11-247, 800-1024), collapsed into
+    one function parameterized by `nightly` rather than RHI's two
+    near-duplicate copies."""
+    info = optiscaler_latest(nightly=nightly)
+    staging_dir = _optiscaler_staging_dir(nightly)
+    if optiscaler_staging_ready(nightly) and optiscaler_staging_version(nightly) == info["version"]:
+        return staging_dir
+
+    seven_zip = _find_7z_binary()
+    if not seven_zip:
+        raise RuntimeError(
+            "OptiScaler needs the 7-Zip CLI to extract its .7z release - "
+            "install it first (Arch: `sudo pacman -S 7zip`, other distros: "
+            "the `p7zip` package) then try again.")
+
+    if task_id:
+        TASKS[task_id] = {"status": "running", "progress": 10,
+                          "detail": f"Downloading OptiScaler {info['version']}"}
+    data = _gh_bytes(info["url"], task_id)
+
+    with tempfile.TemporaryDirectory(prefix="pcc_optiscaler_") as tmp:
+        tmp = Path(tmp)
+        archive = tmp / info["asset_name"]
+        archive.write_bytes(data)
+        extract_dir = tmp / "extracted"
+        extract_dir.mkdir()
+        if task_id:
+            TASKS[task_id]["detail"] = "Extracting"
+            TASKS[task_id]["progress"] = 75
+        proc = subprocess.run([seven_zip, "x", str(archive), f"-o{extract_dir}", "-y"],
+                              capture_output=True, text=True, timeout=180)
+        if proc.returncode != 0:
+            raise RuntimeError(f"7z extraction failed: {proc.stderr.strip()[:300]}")
+        candidates = list(extract_dir.rglob("OptiScaler.dll"))
+        if not candidates:
+            raise RuntimeError("OptiScaler.dll not found in the extracted archive "
+                               "(its release format may have changed)")
+        source_dir = candidates[0].parent
+        if staging_dir.is_dir():
+            shutil.rmtree(staging_dir)
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        for item in source_dir.iterdir():
+            if item.name.lower() == "licenses":
+                continue
+            dest = staging_dir / item.name
+            if item.is_dir():
+                shutil.copytree(item, dest)
+            else:
+                shutil.copy2(item, dest)
+
+    (staging_dir / "version.txt").write_text(info["version"])
+    if task_id:
+        TASKS[task_id]["detail"] = f"OptiScaler {info['version']} staged"
+        TASKS[task_id]["progress"] = 90
+    return staging_dir
+
+
+def _resolve_optiscaler_dll_name(api, user_override=None) -> str:
+    """dxgi.dll by default; winmm.dll for Vulkan games (dxgi.dll won't
+    load there) - port of Install.cs:74-86."""
+    if user_override:
+        return user_override
+    if api == "vulkan":
+        return "winmm.dll"
+    return "dxgi.dll"
+
+
+def _is_optiscaler_file(path) -> bool:
+    """Byte-scan for OptiScaler's signature string in the first 8MB - port
+    of IsOptiScalerFileStatic (Install.cs:1300-1328)."""
+    try:
+        with Path(path).open("rb") as f:
+            data = f.read(8 * 1024 * 1024)
+    except OSError:
+        return False
+    return b"OptiScaler" in data
+
+
+def detect_optiscaler_installation(install_path) -> str | None:
+    """Scans the known DLL-name slots for OptiScaler's signature, falling
+    back to ini-presence + DLL-existence-only if the signature scan misses
+    - port of DetectInstallation (Install.cs:1250-1287)."""
+    base = Path(install_path)
+    if not base.is_dir():
+        return None
+    for name in OPTISCALER_SUPPORTED_DLL_NAMES:
+        p = base / name
+        if p.is_file() and _is_optiscaler_file(p):
+            return name
+    if (base / "OptiScaler.ini").is_file():
+        for name in OPTISCALER_SUPPORTED_DLL_NAMES:
+            if (base / name).is_file():
+                return name
+    return None
+
+
+def _backup_original_if_exists(path) -> None:
+    """Renames an existing file aside to <name>.original before OptiScaler
+    overwrites it, so it can be restored on uninstall - port of
+    BackupOriginalIfExists (Install.cs:1066-1080). Unlike
+    _backup_foreign_dll, this never checks ownership first: by the time
+    this runs, any ReShade filename conflict has already been resolved by
+    the coexistence rename step in install_optiscaler(), so whatever's
+    still here really is a game-owned original."""
+    path = Path(path)
+    if not path.is_file():
+        return
+    backup = path.with_name(path.name + ".original")
+    if backup.exists():
+        return
+    path.rename(backup)
+
+
+def _restore_original_if_exists(path) -> None:
+    path = Path(path)
+    backup = path.with_name(path.name + ".original")
+    if backup.is_file() and not path.exists():
+        backup.rename(path)
+
+
+def _optiscaler_ini_template_name(gpu_type, dlss_inputs, nightly) -> str:
+    prefix = "nightly" if nightly else "stable"
+    suffix = "dlss" if (gpu_type == "NVIDIA" or dlss_inputs) else "nodlss"
+    return f"{prefix}-{suffix}.ini"
+
+
+def get_optiscaler_ini_template_path(gpu_type, dlss_inputs, nightly=False) -> Path:
+    return OPTISCALER_INI_TEMPLATES_DIR / _optiscaler_ini_template_name(gpu_type, dlss_inputs, nightly)
+
+
+def get_optiscaler_user_ini_path(gpu_type, dlss_inputs, nightly=False) -> Path:
+    return OPTISCALER_INIS_DIR / _optiscaler_ini_template_name(gpu_type, dlss_inputs, nightly)
+
+
+def seed_optiscaler_user_inis() -> None:
+    """Copies each of the 4 bundled templates into the user-editable INIs
+    dir on first run only - never overwrites existing user edits. Port of
+    SeedUserInis (Install.cs:989-1018)."""
+    OPTISCALER_INIS_DIR.mkdir(parents=True, exist_ok=True)
+    for gpu_type, dlss_inputs, nightly in _OPTISCALER_INI_CONFIGS:
+        user_path = get_optiscaler_user_ini_path(gpu_type, dlss_inputs, nightly)
+        bundled_path = get_optiscaler_ini_template_path(gpu_type, dlss_inputs, nightly)
+        if not user_path.is_file() and bundled_path.is_file():
+            shutil.copy2(bundled_path, user_path)
+
+
+def _enforce_ini_flag(ini_path, key, value) -> None:
+    """Rewrites (or appends) a single top-level `key=value` line in an INI
+    file, removing duplicates - generic port of RHI's EnforceLoadReshade/
+    EnforceLoadAsiPlugins (Install.cs:1144-1208), parameterized by key
+    rather than duplicated per-flag."""
+    ini_path = Path(ini_path)
+    lines = ini_path.read_text().splitlines() if ini_path.is_file() else []
+    prefix = f"{key}="
+    found = False
+    out = []
+    for line in lines:
+        if line.lstrip().startswith(prefix):
+            if not found:
+                out.append(f"{key}={value}")
+                found = True
+            continue  # drop duplicates
+        out.append(line)
+    if not found:
+        out.append(f"{key}={value}")
+    ini_path.write_text("\n".join(out) + "\n")
+
+
+def _resolve_hotkey_vk(name) -> str:
+    return OPTISCALER_HOTKEY_VK_CODES.get(name, name)
+
+
+def write_optiscaler_shortcut_key(ini_path, hotkey) -> None:
+    _enforce_ini_flag(ini_path, "ShortcutKey", _resolve_hotkey_vk(hotkey))
+
+
+def set_optiscaler_hotkey(hotkey) -> None:
+    """Writes ShortcutKey= to all 4 seeded user-INI templates so future
+    installs pick it up, and remembers it as the global default - port of
+    SetHotkey (Install.cs:1396-1415)."""
+    state = load_state()
+    state["rhi_optiscaler_hotkey"] = hotkey
+    save_state(state)
+    OPTISCALER_INIS_DIR.mkdir(parents=True, exist_ok=True)
+    for gpu_type, dlss_inputs, nightly in _OPTISCALER_INI_CONFIGS:
+        p = get_optiscaler_user_ini_path(gpu_type, dlss_inputs, nightly)
+        if p.is_file():
+            write_optiscaler_shortcut_key(p, hotkey)
+
+
+def apply_optiscaler_hotkey_to_all_games(hotkey) -> int:
+    """Writes ShortcutKey= into every installed game's live OptiScaler.ini -
+    port of ApplyHotkeyToAllGames (Install.cs:1418-1445)."""
+    state = load_state()
+    installs = state.get("rhi_optiscaler_installs", {})
+    updated = 0
+    for rec in installs.values():
+        ini_path = Path(rec["install_path"]) / "OptiScaler.ini"
+        if ini_path.is_file():
+            write_optiscaler_shortcut_key(ini_path, hotkey)
+            updated += 1
+    return updated
+
+
+def _parse_ini_sections(ini_path) -> dict:
+    """section -> {key: value} - port of ParseIniSections (Install.cs:
+    1111-1137), used for the update-time merge-preserve pass."""
+    result = {}
+    section = ""
+    for raw in Path(ini_path).read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith(";") or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            result.setdefault(section, {})
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        result.setdefault(section, {})[key.strip()] = value.strip()
+    return result
+
+
+def set_optiscaler_ini_value(install_path, section, key, value) -> None:
+    """Writes key=value under [section] in a game's live OptiScaler.ini,
+    creating the section if missing - port of SetOptiScalerIniValue
+    (Install.cs:1509-1559)."""
+    ini_path = Path(install_path) / "OptiScaler.ini"
+    if not ini_path.is_file():
+        return
+    lines = ini_path.read_text().splitlines()
+    target = f"[{section}]".lower()
+    key_prefix = (key + "=").lower()
+    section_start = None
+    section_end = len(lines)
+    key_line = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if section_start is not None:
+                section_end = i
+                break
+            if stripped.lower() == target:
+                section_start = i
+        elif section_start is not None and stripped.lower().startswith(key_prefix):
+            key_line = i
+    if key_line is not None:
+        lines[key_line] = f"{key}={value}"
+    elif section_start is not None:
+        lines.insert(section_end, f"{key}={value}")
+    else:
+        lines.append(f"[{section}]")
+        lines.append(f"{key}={value}")
+    ini_path.write_text("\n".join(lines) + "\n")
+
+
+def set_optiscaler_fg(appid, fg_input, fg_output, fg_nvngx_replacement=None) -> dict:
+    """Writes the 3 FrameGen keys into one game's live OptiScaler.ini -
+    direct port of ApplyFgSettings (Install.cs:1565-1572), including its
+    fg_output=='dlssg' gate on FGNvngxReplacement (kept as-is even though
+    'dlssg' isn't itself a documented FGOutput value - matching RHI's own
+    condition rather than guessing at a fix)."""
+    state = load_state()
+    rec = state.get("rhi_optiscaler_installs", {}).get(str(appid))
+    if not rec:
+        raise RuntimeError("No OptiScaler install tracked for this game.")
+    install_path = rec["install_path"]
+    set_optiscaler_ini_value(install_path, "FrameGen", "FGInput", fg_input)
+    set_optiscaler_ini_value(install_path, "FrameGen", "FGOutput", fg_output)
+    if str(fg_output).lower() == "dlssg" and fg_nvngx_replacement:
+        set_optiscaler_ini_value(install_path, "FrameGen", "FGNvngxReplacement", fg_nvngx_replacement)
+    return {"applied": True}
+
+
+def _dlss_manifest() -> dict:
+    state = load_state()
+    cache = state.get("optiscaler_dlss_manifest")
+    now = time.time()
+    if cache and now - cache.get("ts", 0) < 21600:
+        return cache["data"]
+    req = urllib.request.Request(OPTISCALER_DLSS_MANIFEST_URL, headers={"User-Agent": "pcc"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        data = json.loads(r.read())
+    state["optiscaler_dlss_manifest"] = {"ts": now, "data": data}
+    save_state(state)
+    return data
+
+
+def _dlss_latest_entry(key):
+    """Last non-dev-file entry in the manifest's dlss/dlss_d/dlss_g array -
+    matches RHI's own 'keep overwriting remoteVersion, last wins' loop
+    (Staging.cs:678-691)."""
+    entries = _dlss_manifest().get(key) or []
+    latest = None
+    for entry in entries:
+        if entry.get("is_dev_file"):
+            continue
+        latest = entry
+    return latest
+
+
+def ensure_dlss_dll_cached(key, task_id=None) -> Path | None:
+    """Downloads+caches the latest DLSS SR/RR/FG dll from the real DLSS
+    Swapper manifest (a plain .zip, no 7z needed here) - one generic
+    function covering what RHI splits across 3 near-identical
+    DlssStreamlineService methods."""
+    import zipfile, io
+    entry = _dlss_latest_entry(key)
+    if not entry:
+        return None
+    dll_name = OPTISCALER_DLSS_DLL_NAMES[key]
+    version_dir = OPTISCALER_DLSS_DIR / key / entry["version"]
+    cached = version_dir / dll_name
+    if cached.is_file():
+        return cached
+    if task_id and task_id in TASKS:
+        TASKS[task_id]["detail"] = f"Downloading {dll_name} {entry['version']}"
+    data = _gh_bytes(entry["download_url"])
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        names = [n for n in zf.namelist() if n.lower().endswith(dll_name)]
+        if not names:
+            raise RuntimeError(f"DLSS manifest zip didn't contain {dll_name}")
+        version_dir.mkdir(parents=True, exist_ok=True)
+        cached.write_bytes(zf.read(names[0]))
+    return cached
+
+
+def get_staged_dlss_dll(key) -> Path | None:
+    """Newest already-cached DLSS DLL of the given kind, without triggering
+    a network fetch - used during install/update so a slow/offline DLSS
+    check never blocks getting OptiScaler itself installed."""
+    base = OPTISCALER_DLSS_DIR / key
+    if not base.is_dir():
+        return None
+    dll_name = OPTISCALER_DLSS_DLL_NAMES[key]
+    versions = sorted((d for d in base.iterdir() if (d / dll_name).is_file()),
+                      key=lambda d: d.name, reverse=True)
+    return (versions[0] / dll_name) if versions else None
+
+
+def optipatcher_latest() -> dict:
+    """OptiPatcher's rolling release has no version number - its build
+    commit hash (parsed from the release body text) stands in for one,
+    matching RHI's own regex-on-body-text approach (Staging.cs:417-431)."""
+    release = _gh_json(OPTIPATCHER_RELEASES_API)
+    body = release.get("body") or ""
+    m = re.search(r"Build commit:\**\s*([0-9a-fA-F]+)", body)
+    version = m.group(1).lower() if m else "unknown"
+    asset = next((a for a in release.get("assets", [])
+                 if a["name"].lower() == "optipatcher.asi"), None)
+    if not asset:
+        raise RuntimeError("No OptiPatcher.asi asset found in the rolling release")
+    return {"version": version, "url": asset["browser_download_url"]}
+
+
+def ensure_optipatcher_staged(task_id=None) -> Path:
+    """OptiScaler's own dxgi.dll loads .asi plugins itself (LoadAsiPlugins=
+    true, enforced at install time) - no separate ASI loader needed."""
+    OPTIPATCHER_STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    dest = OPTIPATCHER_STAGING_DIR / "OptiPatcher.asi"
+    version_file = OPTIPATCHER_STAGING_DIR / "version.txt"
+    info = optipatcher_latest()
+    if dest.is_file() and version_file.is_file() and version_file.read_text().strip() == info["version"]:
+        return dest
+    if task_id and task_id in TASKS:
+        TASKS[task_id]["detail"] = "Downloading OptiPatcher"
+    data = _gh_bytes(info["url"])
+    dest.write_bytes(data)
+    version_file.write_text(info["version"])
+    return dest
+
+
+def _resolve_reshade_reclaim_name(rs_rec, optiscaler_rec) -> str:
+    """Which filename ReShade should go back to once OptiScaler is removed
+    - simplified port of ResolveReShadeFilename (Coexist.cs:14-43): pcc.py
+    has no DLL-override service, so this falls back straight to the
+    detected graphics API, defaulting to dxgi.dll."""
+    exe = rs_rec.get("exe") or optiscaler_rec.get("exe")
+    api = detect_game_graphics_api(exe)["api"] if exe else None
+    if api == "d3d9":
+        return "d3d9.dll"
+    if api == "opengl":
+        return "opengl32.dll"
+    return "dxgi.dll"
+
+
+def scan_game_optiscaler(appid, install_path, exe_path=None) -> dict:
+    """OptiScaler status for one game: detected graphics API (reused from
+    Part 1a), whatever PCC has on record, and whether a newer release is
+    staged than what's installed."""
+    state = load_state()
+    rec = state.get("rhi_optiscaler_installs", {}).get(str(appid))
+    if not exe_path and rec and rec.get("exe"):
+        exe_path = rec["exe"]
+    exe = Path(exe_path) if exe_path else _find_game_exe(install_path)
+    detected = detect_game_graphics_api(exe) if exe else {"bitness": None, "api": None}
+    result = {"exe": str(exe) if exe else None, "detected_api": detected["api"],
+             "detected_bitness": detected["bitness"], "installed": False,
+             "update_available": False}
+    if rec:
+        p = Path(rec["install_path"]) / rec["installed_as"]
+        nightly = rec.get("variant") == "nightly"
+        result.update({"installed": p.is_file(), "path": str(p),
+                       "installed_as": rec["installed_as"], "variant": rec.get("variant"),
+                       "gpu_type": rec.get("gpu_type"), "dlss_inputs": rec.get("dlss_inputs"),
+                       "version": rec.get("version")})
+        if p.is_file():
+            try:
+                result["update_available"] = check_optiscaler_update(nightly=nightly)
+            except Exception:
+                pass
+    return result
+
+
+def install_optiscaler(appid, install_path, exe_override=None, gpu_type=None,
+                       dlss_inputs=True, variant="stable", hotkey=None,
+                       task_id=None) -> dict:
+    """Installs OptiScaler for one game: resolves the effective DLL name
+    from the detected graphics API (dxgi.dll, or winmm.dll for Vulkan),
+    renames an already-installed ReShade out of the way first if its
+    filename would otherwise collide, deploys the staged release + INI +
+    any cached DLSS DLLs, and (for AMD/Intel) OptiPatcher."""
+    nightly = variant == "nightly"
+    exe = Path(exe_override).expanduser() if exe_override else _find_game_exe(install_path)
+    if not exe or not exe.is_file():
+        raise RuntimeError("Couldn't find the game's .exe under its install folder — "
+                           "point Command Center at it manually.")
+    detected = detect_game_graphics_api(exe)
+    gpu_type = gpu_type or primary_gpu_vendor()
+    if gpu_type == "unknown":
+        gpu_type = "NVIDIA"
+
+    staging_dir = ensure_optiscaler_staging(nightly=nightly, task_id=task_id)
+    version = optiscaler_staging_version(nightly=nightly)
+    effective_dll_name = _resolve_optiscaler_dll_name(detected["api"])
+    target_dir = exe.parent
+
+    # ReShade coexistence - rename it out of the way first if it would
+    # otherwise collide with OptiScaler's chosen filename. Port of
+    # Install.cs:90-161. Only a real conflict if ReShade lives in the SAME
+    # directory OptiScaler is about to deploy into - matching by filename
+    # alone isn't enough (e.g. a wrong-exe auto-detection could put the two
+    # in different folders entirely, and a bare .rename() across
+    # directories would silently relocate ReShade instead of refusing).
+    state = load_state()
+    rs_rec = state.get("rhi_reshade_installs", {}).get(str(appid))
+    if rs_rec:
+        rs_path = Path(rs_rec["path"])
+        if (rs_path.is_file() and rs_path.parent == target_dir
+                and rs_path.name.lower() == effective_dll_name.lower()
+                and rs_path.name.lower() != "reshade64.dll"):
+            rs_dest = target_dir / "ReShade64.dll"
+            if rs_dest.exists():
+                rs_dest.unlink()
+            rs_path.rename(rs_dest)
+            rs_rec["path"] = str(rs_dest)
+            save_state(state)
+
+    if task_id and task_id in TASKS:
+        TASKS[task_id]["detail"] = "Deploying OptiScaler files"
+        TASKS[task_id]["progress"] = 80
+
+    # Track exactly what gets deployed (filenames + subdir names) so
+    # remove/update can act on precisely this install's own footprint later,
+    # rather than re-scanning a staging dir that may have since been
+    # replaced by a newer version (e.g. from updating a different game).
+    deployed_files = []
+    deployed_subdirs = []
+    for item in staging_dir.iterdir():
+        name = item.name
+        if name.lower() in ("version.txt", "optiscaler.ini"):
+            continue
+        if item.is_file() and name.lower().endswith((".bat", ".sh", ".txt")):
+            continue
+        if item.is_dir():
+            if name.lower() == "licenses":
+                continue
+            dest_dir = target_dir / name
+            for sub in item.rglob("*"):
+                if sub.is_file():
+                    rel = sub.relative_to(item)
+                    dest = dest_dir / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(sub, dest)
+            deployed_subdirs.append(name)
+            continue
+        dest_name = effective_dll_name if name.lower() == "optiscaler.dll" else name
+        dest = target_dir / dest_name
+        _backup_original_if_exists(dest)
+        shutil.copy2(item, dest)
+        if name.lower() != "optiscaler.dll":
+            deployed_files.append(name)
+
+    # INI seed + deploy + enforce
+    seed_optiscaler_user_inis()
+    user_ini = get_optiscaler_user_ini_path(gpu_type, dlss_inputs, nightly)
+    game_ini = target_dir / "OptiScaler.ini"
+    if not game_ini.is_file() and user_ini.is_file():
+        shutil.copy2(user_ini, game_ini)
+    if game_ini.is_file():
+        _enforce_ini_flag(game_ini, "LoadReshade", "true")
+        _enforce_ini_flag(game_ini, "LoadAsiPlugins", "true")
+        effective_hotkey = hotkey or state.get("rhi_optiscaler_hotkey")
+        if effective_hotkey:
+            write_optiscaler_shortcut_key(game_ini, effective_hotkey)
+
+    # DLSS DLL swap - best-effort, never blocks the install itself.
+    for key, dll_name in OPTISCALER_DLSS_DLL_NAMES.items():
+        try:
+            src = get_staged_dlss_dll(key)
+            if src:
+                dest = target_dir / dll_name
+                _backup_original_if_exists(dest)
+                shutil.copy2(src, dest)
+        except Exception:
+            pass
+
+    state = load_state()
+    installs = state.setdefault("rhi_optiscaler_installs", {})
+    installs[str(appid)] = {
+        "install_path": str(target_dir), "installed_as": effective_dll_name,
+        "variant": variant, "gpu_type": gpu_type, "dlss_inputs": dlss_inputs,
+        "version": version, "exe": str(exe),
+        "deployed_files": deployed_files, "deployed_subdirs": deployed_subdirs,
+        "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    save_state(state)
+
+    # OptiPatcher for AMD/Intel - best-effort, install still counts as a
+    # success if this fails (matches RHI's own try/catch around this step).
+    if gpu_type in ("AMD", "Intel"):
+        try:
+            if task_id and task_id in TASKS:
+                TASKS[task_id]["detail"] = "Downloading OptiPatcher"
+                TASKS[task_id]["progress"] = 95
+            asi = ensure_optipatcher_staged(task_id=task_id)
+            plugins_dir = target_dir / "plugins"
+            plugins_dir.mkdir(exist_ok=True)
+            shutil.copy2(asi, plugins_dir / "OptiPatcher.asi")
+        except Exception as e:
+            if task_id and task_id in TASKS:
+                TASKS[task_id]["detail"] = f"OptiPatcher deploy skipped: {e}"
+
+    if task_id:
+        TASKS[task_id] = {"status": "done", "progress": 100,
+                          "detail": f"Installed OptiScaler {version}",
+                          "result": {"version": version, "installed_as": effective_dll_name}}
+    return {"installed": True, "installed_as": effective_dll_name, "version": version,
+            "api": detected["api"], "gpu_type": gpu_type}
+
+
+def _install_optiscaler_task(task_id, appid, install_path, exe, gpu_type,
+                             dlss_inputs, variant, hotkey) -> None:
+    try:
+        install_optiscaler(appid, install_path, exe_override=exe, gpu_type=gpu_type,
+                           dlss_inputs=dlss_inputs, variant=variant, hotkey=hotkey,
+                           task_id=task_id)
+    except Exception as e:
+        TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
+
+
+def remove_optiscaler(appid) -> dict:
+    """Uninstalls OptiScaler for one game: deletes the deployed DLL (+
+    restores its .original backup, unless ReShade is about to reclaim that
+    exact filename), OptiScaler.ini, deployed DLSS DLLs, companion
+    subdirectories, OptiPatcher, and restores ReShade's real filename if it
+    was parked at ReShade64.dll for coexistence. Port of Uninstall
+    (Install.cs:423-736)."""
+    state = load_state()
+    installs = state.get("rhi_optiscaler_installs", {})
+    rec = installs.pop(str(appid), None)
+    if not rec:
+        raise RuntimeError("No OptiScaler install tracked for this game.")
+    target_dir = Path(rec["install_path"])
+    installed_dll = rec["installed_as"]
+
+    rs_rec = state.get("rhi_reshade_installs", {}).get(str(appid))
+    rs_reclaim_name = None
+    rs_coexist_path = target_dir / "ReShade64.dll"
+    if rs_rec and rs_coexist_path.is_file():
+        rs_reclaim_name = _resolve_reshade_reclaim_name(rs_rec, rec)
+
+    dll_path = target_dir / installed_dll
+    if dll_path.is_file():
+        dll_path.unlink()
+        if rs_reclaim_name is None or installed_dll.lower() != rs_reclaim_name.lower():
+            _restore_original_if_exists(dll_path)
+        else:
+            dll_path.with_name(dll_path.name + ".original").unlink(missing_ok=True)
+
+    (target_dir / "OptiScaler.ini").unlink(missing_ok=True)
+
+    for dll_name in OPTISCALER_DLSS_DLL_NAMES.values():
+        p = target_dir / dll_name
+        if p.is_file():
+            p.unlink()
+            _restore_original_if_exists(p)
+
+    # Every other file/subdirectory install_optiscaler() deployed - read
+    # from this install's OWN recorded footprint (deployed_files/
+    # deployed_subdirs, captured at install/update time) rather than
+    # re-scanning the current staging dir, which may have since been
+    # replaced by a newer version via another game's install/update.
+    # Records from before this tracking existed fall back to scanning
+    # staging (best-effort, matches the old behavior).
+    if "deployed_files" in rec:
+        companion_files = rec.get("deployed_files", [])
+        companion_subdirs = rec.get("deployed_subdirs", [])
+    else:
+        staging_dir = _optiscaler_staging_dir(rec.get("variant") == "nightly")
+        companion_files, companion_subdirs = [], []
+        if staging_dir.is_dir():
+            for item in staging_dir.iterdir():
+                if item.name.lower() in ("version.txt", "optiscaler.dll", "optiscaler.ini"):
+                    continue
+                if item.is_file():
+                    companion_files.append(item.name)
+                elif item.is_dir() and item.name.lower() != "licenses":
+                    companion_subdirs.append(item.name)
+
+    for name in companion_files:
+        p = target_dir / name
+        if p.is_file():
+            p.unlink()
+            _restore_original_if_exists(p)
+    for name in companion_subdirs:
+        game_sub = target_dir / name
+        if not game_sub.is_dir():
+            continue
+        for sub in game_sub.rglob("*"):
+            if sub.is_file():
+                sub.unlink()
+                _restore_original_if_exists(sub)
+        shutil.rmtree(game_sub, ignore_errors=True)
+
+    optipatcher_path = target_dir / "plugins" / "OptiPatcher.asi"
+    if optipatcher_path.is_file():
+        optipatcher_path.unlink()
+        plugins_dir = target_dir / "plugins"
+        if plugins_dir.is_dir() and not any(plugins_dir.iterdir()):
+            plugins_dir.rmdir()
+
+    optiscaler_subdir = target_dir / "OptiScaler"
+    if optiscaler_subdir.is_dir():
+        shutil.rmtree(optiscaler_subdir, ignore_errors=True)
+
+    if rs_rec and rs_coexist_path.is_file():
+        resolved_name = rs_reclaim_name or "ReShade64.dll"
+        resolved_path = target_dir / resolved_name
+        if resolved_name.lower() != "reshade64.dll" and not resolved_path.is_file():
+            rs_coexist_path.rename(resolved_path)
+            rs_rec["path"] = str(resolved_path)
+        else:
+            rs_rec["path"] = str(rs_coexist_path)
+        state.setdefault("rhi_reshade_installs", {})[str(appid)] = rs_rec
+
+    save_state(state)
+    return {"removed": True}
+
+
+def update_optiscaler(appid, task_id=None) -> dict:
+    """Updates an installed OptiScaler to the latest staged release:
+    redeploys files (no .original backups - these are all previously
+    OptiScaler-owned, not game originals), removes stale companions no
+    longer shipped, and merge-preserves any user-changed OptiScaler.ini
+    values across the fresh template. Port of UpdateAsync (Install.cs:
+    739-985)."""
+    state = load_state()
+    rec = state.get("rhi_optiscaler_installs", {}).get(str(appid))
+    if not rec:
+        raise RuntimeError("No OptiScaler install tracked for this game.")
+    nightly = rec.get("variant") == "nightly"
+    target_dir = Path(rec["install_path"])
+    installed_dll = rec["installed_as"]
+
+    staging_dir = ensure_optiscaler_staging(nightly=nightly, task_id=task_id)
+    version = optiscaler_staging_version(nightly=nightly)
+
+    if task_id and task_id in TASKS:
+        TASKS[task_id]["detail"] = "Updating OptiScaler files"
+        TASKS[task_id]["progress"] = 60
+
+    # Remove companions the new release no longer ships, diffing against
+    # THIS install's own previously-recorded footprint (not a hardcoded
+    # name list - see the same reasoning in remove_optiscaler()). Records
+    # from before this tracking existed have nothing to diff against, so
+    # nothing stale gets removed for them (best-effort, matches old
+    # behavior rather than risking deleting an unrelated game file).
+    old_files = set(rec.get("deployed_files", []))
+    old_subdirs = set(rec.get("deployed_subdirs", []))
+    new_files = {p.name for p in staging_dir.iterdir()
+                if p.is_file() and p.name.lower() not in ("version.txt", "optiscaler.dll", "optiscaler.ini")
+                and not p.name.lower().endswith((".bat", ".sh", ".txt"))}
+    new_subdirs = {p.name for p in staging_dir.iterdir() if p.is_dir() and p.name.lower() != "licenses"}
+    for name in old_files - new_files:
+        p = target_dir / name
+        if p.is_file() and name.lower() != installed_dll.lower():
+            p.unlink()
+    for name in old_subdirs - new_subdirs:
+        game_sub = target_dir / name
+        if game_sub.is_dir():
+            shutil.rmtree(game_sub, ignore_errors=True)
+
+    deployed_files, deployed_subdirs = [], []
+    for item in staging_dir.iterdir():
+        name = item.name
+        if name.lower() in ("version.txt", "optiscaler.ini"):
+            continue
+        if item.is_file() and name.lower().endswith((".bat", ".sh", ".txt")):
+            continue
+        if item.is_dir():
+            if name.lower() == "licenses":
+                continue
+            game_sub = target_dir / name
+            if game_sub.is_dir():
+                shutil.rmtree(game_sub)
+            shutil.copytree(item, game_sub)
+            deployed_subdirs.append(name)
+            continue
+        dest_name = installed_dll if name.lower() == "optiscaler.dll" else name
+        shutil.copy2(item, target_dir / dest_name)
+        if name.lower() != "optiscaler.dll":
+            deployed_files.append(name)
+
+    game_ini = target_dir / "OptiScaler.ini"
+    staged_ini = staging_dir / "OptiScaler.ini"
+    if game_ini.is_file() and staged_ini.is_file():
+        user_values = _parse_ini_sections(game_ini)
+        staged_values = _parse_ini_sections(staged_ini)
+        shutil.copy2(staged_ini, game_ini)
+        for section, keys in user_values.items():
+            for key, value in keys.items():
+                staged_val = staged_values.get(section, {}).get(key)
+                if staged_val is not None and staged_val.lower() == value.lower():
+                    continue
+                set_optiscaler_ini_value(str(target_dir), section, key, value)
+    elif not game_ini.is_file() and staged_ini.is_file():
+        shutil.copy2(staged_ini, game_ini)
+
+    for key, dll_name in OPTISCALER_DLSS_DLL_NAMES.items():
+        try:
+            src = get_staged_dlss_dll(key)
+            if src:
+                shutil.copy2(src, target_dir / dll_name)
+        except Exception:
+            pass
+
+    rec["version"] = version
+    rec["deployed_files"] = deployed_files
+    rec["deployed_subdirs"] = deployed_subdirs
+    rec["installed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    state["rhi_optiscaler_installs"][str(appid)] = rec
+    save_state(state)
+
+    if task_id:
+        TASKS[task_id] = {"status": "done", "progress": 100,
+                          "detail": f"Updated OptiScaler to {version}",
+                          "result": {"version": version}}
+    return {"updated": True, "version": version}
+
+
+def _update_optiscaler_task(task_id, appid) -> None:
+    try:
+        update_optiscaler(appid, task_id=task_id)
     except Exception as e:
         TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
 
@@ -4979,6 +5876,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"addons": reshade_addons_catalog()})
             elif m := re.match(r"^/api/game/(\d+)/rhi/addons$", self.path):
                 self._json({"selection": get_game_addon_selection(m.group(1))})
+            elif m := re.match(r"^/api/game/(\d+)/rhi/optiscaler$", self.path):
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(m.group(1))
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                self._json(scan_game_optiscaler(m.group(1), g["install_path"]))
             elif self.path == "/api/progress":
                 self._json({"games": install_progress(root)})
             elif self.path == "/api/owned_games":
@@ -5239,6 +6142,38 @@ class Handler(BaseHTTPRequestHandler):
                 set_game_addon_selection(appid, [])
                 self._json(remove_reshade_addons(str(Path(rec["path"]).parent)) if rec
                           else {"removed": 0})
+            elif self.path == "/api/rhi/optiscaler/install":
+                appid = body["appid"]
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(appid)
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                tid = str(uuid.uuid4())
+                TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
+                threading.Thread(target=_install_optiscaler_task,
+                                 args=(tid, appid, g["install_path"], body.get("exe"),
+                                       body.get("gpu_type"), body.get("dlss_inputs", True),
+                                       body.get("variant", "stable"), body.get("hotkey")),
+                                 daemon=True).start()
+                self._json({"task": tid})
+            elif self.path == "/api/rhi/optiscaler/remove":
+                self._json(remove_optiscaler(body["appid"]))
+            elif self.path == "/api/rhi/optiscaler/update":
+                appid = body["appid"]
+                tid = str(uuid.uuid4())
+                TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
+                threading.Thread(target=_update_optiscaler_task,
+                                 args=(tid, appid), daemon=True).start()
+                self._json({"task": tid})
+            elif self.path == "/api/rhi/optiscaler/hotkey":
+                hotkey = body.get("hotkey", "")
+                set_optiscaler_hotkey(hotkey)
+                updated = apply_optiscaler_hotkey_to_all_games(hotkey) if body.get("apply_all") else 0
+                self._json({"applied": True, "updated_games": updated})
+            elif self.path == "/api/rhi/optiscaler/fg":
+                self._json(set_optiscaler_fg(body["appid"], body.get("fg_input", "auto"),
+                                             body.get("fg_output", "auto"),
+                                             body.get("fg_nvngx_replacement")))
             elif self.path == "/api/proton/install":
                 tid = str(uuid.uuid4())
                 threading.Thread(target=install_ge_proton,

@@ -120,6 +120,12 @@ class PCCTests(unittest.TestCase):
         pcc.RESHADE_SHADERS_STAGE_DIR = pcc.RHI_DATA_DIR / "shaders" / "Shaders"
         pcc.RESHADE_TEXTURES_STAGE_DIR = pcc.RHI_DATA_DIR / "shaders" / "Textures"
         pcc.RESHADE_ADDONS_CACHE_FILE = pcc.RHI_DATA_DIR / "addons_cache.ini"
+        pcc.OPTISCALER_DATA_DIR = pcc.RHI_DATA_DIR / "optiscaler"
+        pcc.OPTISCALER_STAGING_DIR = pcc.OPTISCALER_DATA_DIR / "stable"
+        pcc.OPTISCALER_NIGHTLY_DIR = pcc.OPTISCALER_DATA_DIR / "nightly"
+        pcc.OPTISCALER_INIS_DIR = pcc.OPTISCALER_DATA_DIR / "inis"
+        pcc.OPTIPATCHER_STAGING_DIR = pcc.OPTISCALER_DATA_DIR / "optipatcher"
+        pcc.OPTISCALER_DLSS_DIR = pcc.OPTISCALER_DATA_DIR / "dlss"
         for d in (pcc.DLL_LIBRARY, pcc.BACKUP_DIR, pcc.ART_DIR):
             d.mkdir(parents=True, exist_ok=True)
         pcc.steam_running = lambda: False
@@ -1458,6 +1464,374 @@ class PCCTests(unittest.TestCase):
         self.assertEqual(pcc.get_game_addon_selection("12345"), [])
         pcc.set_game_addon_selection("12345", ["addon-a"])
         self.assertEqual(pcc.get_game_addon_selection("12345"), ["addon-a"])
+
+    # ---- RHI: OptiScaler ----
+    def _fake_optiscaler_staging(self, nightly=False, version=None):
+        """Pre-populates a ready staging dir AND stubs optiscaler_latest() to
+        report the same version, so install/update flows take the
+        already-staged fast path in ensure_optiscaler_staging() without
+        hitting the real network (that function always calls
+        optiscaler_latest() first, even when staging looks ready, to check
+        for updates - matching RHI's own EnsureStagingAsync)."""
+        d = pcc._optiscaler_staging_dir(nightly)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "OptiScaler.dll").write_bytes(b"OptiScaler fake build" + b"\x00" * 500)
+        template = pcc.get_optiscaler_ini_template_path("NVIDIA", True, nightly)
+        import shutil
+        shutil.copy2(template, d / "OptiScaler.ini")
+        version = version or ("20260101" if nightly else "v1.2.3")
+        (d / "version.txt").write_text(version)
+        real_latest = pcc.optiscaler_latest
+        pcc.optiscaler_latest = (lambda nightly=False, _v=version: {
+            "version": _v, "url": "http://x", "asset_name": "OptiScaler.7z"})
+        self.addCleanup(lambda: setattr(pcc, "optiscaler_latest", real_latest))
+        return d
+
+    def _fake_optipatcher_asi(self):
+        p = Path(self.tmp.name) / "OptiPatcher.asi"
+        p.write_bytes(b"fake asi")
+        return p
+
+    def test_optiscaler_ini_template_paths_resolve_to_real_bundled_files(self):
+        # Confirms the 4 real files ported from RHI are actually on disk and
+        # distinct where they should be (dlss vs nodlss), identical where
+        # RHI's own source is identical (nvidia.ini == amd-dlss.ini).
+        for gpu_type, dlss_inputs, nightly in pcc._OPTISCALER_INI_CONFIGS:
+            p = pcc.get_optiscaler_ini_template_path(gpu_type, dlss_inputs, nightly)
+            self.assertTrue(p.is_file(), p)
+        dlss_path = pcc.get_optiscaler_ini_template_path("NVIDIA", True, False)
+        nodlss_path = pcc.get_optiscaler_ini_template_path("AMD", False, False)
+        self.assertNotEqual(dlss_path.read_text(), nodlss_path.read_text())
+        self.assertEqual(
+            pcc.get_optiscaler_ini_template_path("NVIDIA", True, False),
+            pcc.get_optiscaler_ini_template_path("AMD", True, False))
+
+    def test_resolve_optiscaler_dll_name(self):
+        self.assertEqual(pcc._resolve_optiscaler_dll_name("d3d11"), "dxgi.dll")
+        self.assertEqual(pcc._resolve_optiscaler_dll_name("vulkan"), "winmm.dll")
+        self.assertEqual(pcc._resolve_optiscaler_dll_name("vulkan", user_override="d3d12.dll"),
+                         "d3d12.dll")
+
+    def test_identify_dxgi_file_recognizes_optiscaler(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / "dxgi.dll"
+        p.write_bytes(b"junk header OptiScaler build info trailer" + b"\x00" * 1000)
+        self.assertEqual(pcc._identify_dxgi_file(p), "optiscaler")
+        p.write_bytes(b"totally unrelated content")
+        self.assertEqual(pcc._identify_dxgi_file(p), "unknown")
+
+    def test_is_optiscaler_file_and_detect_installation(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "dxgi.dll").write_bytes(b"header OptiScaler marker" + b"\x00" * 2000)
+        self.assertTrue(pcc._is_optiscaler_file(d / "dxgi.dll"))
+        self.assertEqual(pcc.detect_optiscaler_installation(str(d)), "dxgi.dll")
+        self.assertIsNone(pcc.detect_optiscaler_installation(str(d / "nope")))
+
+    def test_ensure_optiscaler_staging_requires_7z(self):
+        real_find = pcc._find_7z_binary
+        real_latest = pcc.optiscaler_latest
+        pcc._find_7z_binary = lambda: None
+        pcc.optiscaler_latest = lambda nightly=False: {
+            "version": "v9.9.9", "url": "http://x", "asset_name": "OptiScaler.7z"}
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                pcc.ensure_optiscaler_staging()
+            self.assertIn("7-Zip", str(ctx.exception))
+        finally:
+            pcc._find_7z_binary = real_find
+            pcc.optiscaler_latest = real_latest
+
+    def test_ensure_optiscaler_staging_downloads_and_extracts_real_7z(self):
+        if not pcc._find_7z_binary():
+            self.skipTest("7z not installed on this machine")
+        import subprocess
+        src = Path(self.tmp.name) / "optiscaler_src"
+        src.mkdir()
+        (src / "OptiScaler.dll").write_bytes(b"fake OptiScaler build" + b"\x00" * 500)
+        (src / "OptiScaler.ini").write_text("[Upscalers]\nSpoofing=auto\n")
+        (src / "README.txt").write_text("readme")
+        archive = Path(self.tmp.name) / "OptiScaler.7z"
+        subprocess.run(["7z", "a", str(archive), str(src) + "/."],
+                       check=True, capture_output=True)
+        data = archive.read_bytes()
+
+        real_latest, real_bytes = pcc.optiscaler_latest, pcc._gh_bytes
+        pcc.optiscaler_latest = lambda nightly=False: {
+            "version": "v9.9.9", "url": "http://x", "asset_name": "OptiScaler.7z"}
+        pcc._gh_bytes = lambda url, task=None: data
+        try:
+            staging_dir = pcc.ensure_optiscaler_staging()
+        finally:
+            pcc.optiscaler_latest = real_latest
+            pcc._gh_bytes = real_bytes
+        self.assertTrue((staging_dir / "OptiScaler.dll").is_file())
+        self.assertEqual(pcc.optiscaler_staging_version(), "v9.9.9")
+        self.assertTrue(pcc.optiscaler_staging_ready())
+        # Staging mirrors the extracted archive as-is (matches RHI's own
+        # EnsureStagingAsync) - doc/script filtering happens later, only at
+        # per-game deploy time in install_optiscaler().
+        self.assertTrue((staging_dir / "README.txt").is_file())
+
+    def test_check_optiscaler_update(self):
+        self._fake_optiscaler_staging()
+        real_latest = pcc.optiscaler_latest
+        try:
+            pcc.optiscaler_latest = lambda nightly=False: {
+                "version": "v1.2.3", "url": "x", "asset_name": "x"}
+            self.assertFalse(pcc.check_optiscaler_update())
+            pcc.optiscaler_latest = lambda nightly=False: {
+                "version": "v9.9.9", "url": "x", "asset_name": "x"}
+            self.assertTrue(pcc.check_optiscaler_update())
+        finally:
+            pcc.optiscaler_latest = real_latest
+
+    def test_remove_optiscaler_cleans_up_all_deployed_companions(self):
+        """Regression: live-testing against a real OptiScaler release found
+        loose companion DLLs (libxess.dll, amd_fidelityfx_*.dll, etc - a
+        full real release ships ~10 of these, not just the 2 RHI happens to
+        hardcode a constant for) and a companion subdirectory
+        (D3D12_Optiscaler) left behind after Remove, because the old code
+        only ever cleaned up a short hardcoded allowlist. install_optiscaler
+        must now track every file/subdir it actually deploys, and
+        remove_optiscaler must delete exactly that recorded footprint."""
+        d, exe = self._fake_game_exe()
+        staging = self._fake_optiscaler_staging()
+        (staging / "libxess.dll").write_bytes(b"xess")
+        (staging / "amd_fidelityfx_dx12.dll").write_bytes(b"ffx")
+        (staging / "D3D12_Optiscaler").mkdir()
+        (staging / "D3D12_Optiscaler" / "extra.dll").write_bytes(b"extra")
+        pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="NVIDIA")
+        self.assertTrue((d / "libxess.dll").is_file())
+        self.assertTrue((d / "amd_fidelityfx_dx12.dll").is_file())
+        self.assertTrue((d / "D3D12_Optiscaler" / "extra.dll").is_file())
+
+        pcc.remove_optiscaler("12345")
+        self.assertFalse((d / "libxess.dll").exists())
+        self.assertFalse((d / "amd_fidelityfx_dx12.dll").exists())
+        self.assertFalse((d / "D3D12_Optiscaler").exists())
+
+    def test_update_optiscaler_removes_companion_dropped_by_new_release(self):
+        d, exe = self._fake_game_exe()
+        staging = self._fake_optiscaler_staging(version="v1.0.0")
+        (staging / "old_companion.dll").write_bytes(b"old")
+        pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="NVIDIA")
+        self.assertTrue((d / "old_companion.dll").is_file())
+
+        # Simulate a newer release that no longer ships old_companion.dll.
+        (staging / "old_companion.dll").unlink()
+        (staging / "version.txt").write_text("v2.0.0")
+        real_ensure = pcc.ensure_optiscaler_staging
+        pcc.ensure_optiscaler_staging = (
+            lambda nightly=False, task_id=None: pcc._optiscaler_staging_dir(nightly))
+        try:
+            r = pcc.update_optiscaler("12345")
+        finally:
+            pcc.ensure_optiscaler_staging = real_ensure
+        self.assertEqual(r["version"], "v2.0.0")
+        self.assertFalse((d / "old_companion.dll").exists())
+
+    def test_install_optiscaler_full_flow_and_remove(self):
+        d, exe = self._fake_game_exe()
+        self._fake_optiscaler_staging()
+        r = pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="NVIDIA")
+        self.assertTrue(r["installed"])
+        self.assertEqual(r["installed_as"], "dxgi.dll")
+        target = d / "dxgi.dll"
+        self.assertTrue(target.is_file())
+        ini_text = (d / "OptiScaler.ini").read_text()
+        self.assertIn("LoadReshade=true", ini_text)
+        self.assertIn("LoadAsiPlugins=true", ini_text)
+
+        status = pcc.scan_game_optiscaler("12345", str(d), exe_path=str(exe))
+        self.assertTrue(status["installed"])
+        self.assertEqual(status["installed_as"], "dxgi.dll")
+
+        rm = pcc.remove_optiscaler("12345")
+        self.assertTrue(rm["removed"])
+        self.assertFalse(target.exists())
+        self.assertFalse((d / "OptiScaler.ini").exists())
+        with self.assertRaises(RuntimeError):
+            pcc.remove_optiscaler("12345")
+
+    def test_install_optiscaler_backs_up_game_original_dxgi(self):
+        d, exe = self._fake_game_exe()
+        (d / "dxgi.dll").write_bytes(b"totally unrelated game-owned dxgi")
+        self._fake_optiscaler_staging()
+        pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="NVIDIA")
+        backup = d / "dxgi.dll.original"
+        self.assertTrue(backup.is_file())
+        self.assertEqual(backup.read_bytes(), b"totally unrelated game-owned dxgi")
+        pcc.remove_optiscaler("12345")
+        self.assertEqual((d / "dxgi.dll").read_bytes(), b"totally unrelated game-owned dxgi")
+
+    def test_install_optiscaler_vulkan_uses_winmm(self):
+        d, exe = self._fake_game_exe(dlls=["vulkan-1.dll"])
+        self._fake_optiscaler_staging()
+        r = pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="NVIDIA")
+        self.assertEqual(r["installed_as"], "winmm.dll")
+        self.assertTrue((d / "winmm.dll").is_file())
+
+    def test_install_optiscaler_renames_conflicting_reshade(self):
+        d, exe = self._fake_game_exe()
+        (d / "dxgi.dll").write_bytes(b"R" * 100)  # stands in for an installed ReShade
+        state = pcc.load_state()
+        state.setdefault("rhi_reshade_installs", {})["12345"] = {
+            "path": str(d / "dxgi.dll"), "channel": "stable", "version": "6.8.0",
+            "bitness": 64, "exe": str(exe),
+        }
+        pcc.save_state(state)
+        self._fake_optiscaler_staging()
+        pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="NVIDIA")
+
+        self.assertTrue((d / "ReShade64.dll").is_file())
+        self.assertEqual((d / "ReShade64.dll").read_bytes(), b"R" * 100)
+        rs_rec = pcc.load_state()["rhi_reshade_installs"]["12345"]
+        self.assertEqual(rs_rec["path"], str(d / "ReShade64.dll"))
+        self.assertIn(b"OptiScaler", (d / "dxgi.dll").read_bytes())
+
+        pcc.remove_optiscaler("12345")
+        # ReShade reclaims dxgi.dll (its detected-API default) once OptiScaler is gone
+        self.assertTrue((d / "dxgi.dll").is_file())
+        self.assertEqual((d / "dxgi.dll").read_bytes(), b"R" * 100)
+        self.assertFalse((d / "ReShade64.dll").exists())
+
+    def test_install_optiscaler_ignores_reshade_in_a_different_directory(self):
+        """Regression: live-testing surfaced a real bug where a wrong
+        auto-detected exe (the same largest-.exe heuristic issue that hit
+        the ReShade port) put OptiScaler's target directory somewhere other
+        than where ReShade was actually installed. The old coexistence
+        check matched on filename alone and did a bare Path.rename(), which
+        silently DRAGGED ReShade's dxgi.dll across directories into
+        OptiScaler's (wrong) folder - the fix requires the two paths' own
+        parent directories to match before treating it as a real conflict."""
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "bin/x64").mkdir(parents=True)
+        real_exe = d / "bin/x64/Game.exe"
+        real_exe.write_bytes(_build_fake_pe64(regular_dlls=["d3d11.dll"]))
+        wrong_exe = d / "launcher.exe"
+        wrong_exe.write_bytes(_build_fake_pe64(regular_dlls=["d3d11.dll"]))
+        (d / "bin/x64/dxgi.dll").write_bytes(b"R" * 100)  # ReShade, correctly nested
+        state = pcc.load_state()
+        state.setdefault("rhi_reshade_installs", {})["12345"] = {
+            "path": str(d / "bin/x64/dxgi.dll"), "channel": "stable", "version": "6.8.0",
+            "bitness": 64, "exe": str(real_exe),
+        }
+        pcc.save_state(state)
+        self._fake_optiscaler_staging()
+        # Installed against the WRONG exe (game root, not bin/x64/) - simulates
+        # the auto-detect heuristic picking a launcher stub.
+        pcc.install_optiscaler("12345", str(d), exe_override=str(wrong_exe), gpu_type="NVIDIA")
+
+        # ReShade must be left exactly where it was - not renamed, not moved.
+        self.assertEqual((d / "bin/x64/dxgi.dll").read_bytes(), b"R" * 100)
+        self.assertFalse((d / "bin/x64/ReShade64.dll").exists())
+        self.assertFalse((d / "ReShade64.dll").exists())
+        rs_rec = pcc.load_state()["rhi_reshade_installs"]["12345"]
+        self.assertEqual(rs_rec["path"], str(d / "bin/x64/dxgi.dll"))
+        # OptiScaler deployed at the (wrong) root, independent of ReShade.
+        self.assertIn(b"OptiScaler", (d / "dxgi.dll").read_bytes())
+
+    def test_seed_optiscaler_user_inis_never_overwrites(self):
+        pcc.seed_optiscaler_user_inis()
+        p = pcc.get_optiscaler_user_ini_path("NVIDIA", True, False)
+        p.write_text("EDITED_BY_USER=true\n")
+        pcc.seed_optiscaler_user_inis()
+        self.assertEqual(p.read_text(), "EDITED_BY_USER=true\n")
+
+    def test_optiscaler_hotkey_writes_to_all_templates_and_games(self):
+        pcc.seed_optiscaler_user_inis()
+        pcc.set_optiscaler_hotkey("F5")
+        for gpu_type, dlss_inputs, nightly in pcc._OPTISCALER_INI_CONFIGS:
+            p = pcc.get_optiscaler_user_ini_path(gpu_type, dlss_inputs, nightly)
+            self.assertIn("ShortcutKey=0x74", p.read_text())
+        self.assertEqual(pcc.load_state()["rhi_optiscaler_hotkey"], "F5")
+
+        d, exe = self._fake_game_exe()
+        self._fake_optiscaler_staging()
+        pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="NVIDIA")
+        self.assertIn("ShortcutKey=0x74", (d / "OptiScaler.ini").read_text())
+
+        updated = pcc.apply_optiscaler_hotkey_to_all_games("F1")
+        self.assertEqual(updated, 1)
+        self.assertIn("ShortcutKey=0x70", (d / "OptiScaler.ini").read_text())
+
+    def test_set_optiscaler_fg_writes_frame_gen_section(self):
+        d, exe = self._fake_game_exe()
+        self._fake_optiscaler_staging()
+        pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="NVIDIA")
+        r = pcc.set_optiscaler_fg("12345", "fsrfg", "xefg")
+        self.assertTrue(r["applied"])
+        ini_text = (d / "OptiScaler.ini").read_text()
+        self.assertIn("FGInput=fsrfg", ini_text)
+        self.assertIn("FGOutput=xefg", ini_text)
+
+        with self.assertRaises(RuntimeError):
+            pcc.set_optiscaler_fg("99999", "auto", "auto")
+
+    def test_update_optiscaler_preserves_user_ini_changes(self):
+        d, exe = self._fake_game_exe()
+        self._fake_optiscaler_staging()
+        pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="NVIDIA")
+        pcc.set_optiscaler_ini_value(str(d), "FrameGen", "FGInput", "fsrfg")
+
+        (pcc._optiscaler_staging_dir() / "version.txt").write_text("v2.0.0")
+        real_ensure = pcc.ensure_optiscaler_staging
+        pcc.ensure_optiscaler_staging = (
+            lambda nightly=False, task_id=None: pcc._optiscaler_staging_dir(nightly))
+        try:
+            r = pcc.update_optiscaler("12345")
+        finally:
+            pcc.ensure_optiscaler_staging = real_ensure
+        self.assertEqual(r["version"], "v2.0.0")
+        ini_text = (d / "OptiScaler.ini").read_text()
+        self.assertIn("FGInput=fsrfg", ini_text)  # user's change preserved across the update
+
+    def test_optipatcher_latest_parses_build_commit(self):
+        real_gh_json = pcc._gh_json
+        pcc._gh_json = lambda url: {
+            "body": "Rolling build\n**Build commit:** abc1234\n",
+            "assets": [{"name": "OptiPatcher.asi", "browser_download_url": "http://x/p.asi"}],
+        }
+        try:
+            info = pcc.optipatcher_latest()
+        finally:
+            pcc._gh_json = real_gh_json
+        self.assertEqual(info["version"], "abc1234")
+        self.assertEqual(info["url"], "http://x/p.asi")
+
+    def test_install_optiscaler_deploys_optipatcher_for_amd(self):
+        d, exe = self._fake_game_exe()
+        self._fake_optiscaler_staging()
+        real_optipatcher = pcc.ensure_optipatcher_staged
+        pcc.ensure_optipatcher_staged = lambda task_id=None: self._fake_optipatcher_asi()
+        try:
+            pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="AMD",
+                                   dlss_inputs=False)
+        finally:
+            pcc.ensure_optipatcher_staged = real_optipatcher
+        self.assertTrue((d / "plugins" / "OptiPatcher.asi").is_file())
+
+    def test_ensure_dlss_dll_cached_downloads_from_manifest(self):
+        import zipfile, io
+        manifest = {"dlss": [{"version": "310.7.129.0", "is_dev_file": False,
+                              "download_url": "http://x/dlss.zip"}]}
+        real_manifest, real_bytes = pcc._dlss_manifest, pcc._gh_bytes
+        pcc._dlss_manifest = lambda: manifest
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("nvngx_dlss.dll", b"fake dlss dll")
+        pcc._gh_bytes = lambda url, task=None: buf.getvalue()
+        try:
+            p = pcc.ensure_dlss_dll_cached("dlss")
+        finally:
+            pcc._dlss_manifest = real_manifest
+            pcc._gh_bytes = real_bytes
+        self.assertTrue(p.is_file())
+        self.assertEqual(p.read_bytes(), b"fake dlss dll")
+        self.assertEqual(pcc.get_staged_dlss_dll("dlss"), p)
 
     # ---- compile state ----
     def test_sgdb_fetch_and_cache(self):
