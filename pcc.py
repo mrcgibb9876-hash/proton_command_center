@@ -3077,6 +3077,376 @@ def scan_re_framework(appid, install_path) -> dict:
 
 
 # --------------------------------------------------------------------------
+# RHI port: shader pack management
+# --------------------------------------------------------------------------
+# Ported verbatim from RHI's ShaderPackService.cs DefaultPacks array - this
+# is hardcoded data in RHI too, not fetched from a remote catalog at
+# runtime. kind is "gh_release" (GitHub Releases API, picks the first
+# release asset matching asset_ext) or "direct_url" (a static branch-zip
+# URL). requires lists pack ids that get pulled in automatically (BFS
+# dependency expansion) when this pack is selected.
+RESHADE_SHADER_PACKS = [
+    {"id": "Lilium", "name": "Lilium HDR Shaders", "kind": "gh_release",
+     "url": "https://api.github.com/repos/EndlesslyFlowering/ReShade_HDR_shaders/releases/latest",
+     "asset_ext": ".7z", "category": "essential",
+     "description": "HDR tone mapping and inverse tone mapping shaders"},
+    {"id": "CrosireMaster", "name": "crosire reshade-shaders (master)", "kind": "direct_url",
+     "url": "https://github.com/crosire/reshade-shaders/archive/refs/heads/master.zip",
+     "category": "recommended",
+     "description": "Official ReShade standard effects - full master branch"},
+    {"id": "CrosireLegacy", "name": "crosire reshade-shaders (legacy)", "kind": "direct_url",
+     "url": "https://github.com/crosire/reshade-shaders/archive/refs/heads/legacy.zip",
+     "category": "extra", "requires": ["CrosireMaster"],
+     "description": "Legacy ReShade effects (older versions removed from master)"},
+    {"id": "PumboAutoHDR", "name": "PumboAutoHDR", "kind": "gh_release",
+     "url": "https://api.github.com/repos/Filoppi/PumboAutoHDR/releases/latest",
+     "asset_ext": ".zip", "category": "recommended",
+     "description": "Automatic HDR conversion for SDR games"},
+    {"id": "SmolbbsoopShaders", "name": "smolbbsoop shaders", "kind": "direct_url",
+     "url": "https://github.com/smolbbsoop/smolbbsoopshaders/archive/refs/heads/main.zip",
+     "category": "extra", "description": "HDR utility shaders and effects"},
+    {"id": "MaxG2DSimpleHDR", "name": "MaxG2D Simple HDR Shaders", "kind": "direct_url",
+     "url": "https://github.com/MaxG2D/ReshadeSimpleHDRShaders/archive/refs/heads/main.zip",
+     "category": "recommended", "description": "Simple HDR bloom, lens flare, and tone mapping"},
+    {"id": "ClshortfuseShaders", "name": "clshortfuse ReShade shaders", "kind": "direct_url",
+     "url": "https://github.com/clshortfuse/reshade-shaders/archive/refs/heads/main.zip",
+     "category": "recommended", "description": "HDR and color correction shaders for RenoDX"},
+    {"id": "PotatoFX", "name": "potatoFX (CreepySasquatch)", "kind": "direct_url",
+     "url": "https://github.com/CreepySasquatch/potatoFX/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Lightweight post-processing effects for low-end hardware"},
+    {"id": "Azen", "name": "Azen by Zenteon", "kind": "direct_url",
+     "url": "https://github.com/Zenteon/Azen/archive/refs/heads/main.zip",
+     "category": "extra", "requires": ["SmolbbsoopShaders"],
+     "description": "Zenteon's casual shader collection - experimental effects"},
+    {"id": "SweetFX", "name": "SweetFX by CeeJay.dk", "kind": "direct_url",
+     "url": "https://github.com/CeeJayDK/SweetFX/archive/refs/heads/master.zip",
+     "category": "extra", "description": "Classic color grading, sharpening, and bloom effects"},
+    {"id": "OtisFX", "name": "OtisFX by Otis_Inf", "kind": "direct_url",
+     "url": "https://github.com/FransBouma/OtisFX/archive/refs/heads/master.zip",
+     "category": "extra", "description": "Cinematic depth of field, light rays, and camera effects"},
+    {"id": "Depth3D", "name": "Depth3D by BlueSkyDefender", "kind": "direct_url",
+     "url": "https://github.com/BlueSkyDefender/Depth3D/archive/refs/heads/master.zip",
+     "category": "extra", "description": "Stereoscopic 3D and depth-based visual effects"},
+    {"id": "DaodanShaders", "name": "reshade-shaders by Daodan", "kind": "direct_url",
+     "url": "https://github.com/Daodan317081/reshade-shaders/archive/refs/heads/master.zip",
+     "category": "extra", "description": "Comic, crosshatch, and artistic style effects"},
+    {"id": "BrussellShaders", "name": "Shaders by brussell", "kind": "direct_url",
+     "url": "https://github.com/brussell1/Shaders/archive/refs/heads/master.zip",
+     "category": "extra", "description": "Halftone, sketch, and stylized rendering effects"},
+    {"id": "FubaxShaders", "name": "fubax-shaders by Fubaxiusz", "kind": "direct_url",
+     "url": "https://github.com/Fubaxiusz/fubax-shaders/archive/refs/heads/master.zip",
+     "category": "extra", "description": "VR-friendly lens distortion and chromatic aberration"},
+    {"id": "qUINT", "name": "qUINT by Marty McFly", "kind": "direct_url",
+     "url": "https://github.com/martymcmodding/qUINT/archive/refs/heads/master.zip",
+     "category": "extra", "description": "MXAO, ADOF, lightroom, and screen-space reflections"},
+    {"id": "AlucardDH", "name": "dh-reshade-shaders by AlucardDH", "kind": "direct_url",
+     "url": "https://github.com/AlucardDH/dh-reshade-shaders/archive/refs/heads/master.zip",
+     "category": "extra", "description": "Ambient occlusion, undither, and color enhancement"},
+    {"id": "WarpFX", "name": "Warp-FX by Radegast", "kind": "direct_url",
+     "url": "https://github.com/Radegast-FFXIV/Warp-FX/archive/refs/heads/master.zip",
+     "category": "extra", "description": "Screen warp, swirl, and distortion effects"},
+    {"id": "Prod80", "name": "Color effects by prod80", "kind": "direct_url",
+     "url": "https://github.com/prod80/prod80-ReShade-Repository/archive/refs/heads/master.zip",
+     "category": "extra", "description": "Professional color grading, curves, and tone tools"},
+    {"id": "CorgiFX", "name": "CorgiFX by originalnicodr", "kind": "direct_url",
+     "url": "https://github.com/originalnicodr/CorgiFX/archive/refs/heads/master.zip",
+     "category": "extra", "description": "Screenshot and virtual photography tools"},
+    {"id": "InsaneShaders", "name": "Insane-Shaders by Lord of Lunacy", "kind": "direct_url",
+     "url": "https://github.com/LordOfLunacy/Insane-Shaders/archive/refs/heads/master.zip",
+     "category": "extra", "description": "Advanced dithering, fog removal, and edge detection"},
+    {"id": "CobraFX", "name": "CobraFX by SirCobra", "kind": "direct_url",
+     "url": "https://github.com/LordKobra/CobraFX/archive/refs/heads/master.zip",
+     "category": "extra", "description": "Gravity, auto-focus, and real-time ray tracing effects"},
+    {"id": "AstrayFX", "name": "AstrayFX by BlueSkyDefender", "kind": "direct_url",
+     "url": "https://github.com/BlueSkyDefender/AstrayFX/archive/refs/heads/master.zip",
+     "category": "extra", "description": "Depth-based fog, haze, and atmospheric effects"},
+    {"id": "CRTRoyale", "name": "CRT-Royale-ReShade by akgunter", "kind": "direct_url",
+     "url": "https://github.com/akgunter/crt-royale-reshade/archive/refs/heads/master.zip",
+     "category": "extra", "description": "CRT monitor simulation with phosphor and scanline emulation"},
+    {"id": "RSRetroArch", "name": "RSRetroArch by Matsilagi", "kind": "direct_url",
+     "url": "https://github.com/Matsilagi/RSRetroArch/archive/refs/heads/main.zip",
+     "category": "extra", "description": "RetroArch shader ports - CRT, LCD, and retro filters"},
+    {"id": "VRToolkit", "name": "VRToolkit by retroluxfilm", "kind": "direct_url",
+     "url": "https://github.com/retroluxfilm/reshade-vrtoolkit/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Sharpening and clarity tools optimized for VR headsets"},
+    {"id": "FGFX", "name": "FGFX by AlexTuduran", "kind": "direct_url",
+     "url": "https://github.com/AlexTuduran/FGFX/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Film grain, multi-LUT, and cinematic post-processing"},
+    {"id": "CShade", "name": "CShade by papadanku", "kind": "direct_url",
+     "url": "https://github.com/papadanku/CShade/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Optical flow, motion blur, and convolution effects"},
+    {"id": "iMMERSE", "name": "iMMERSE by Marty McFly", "kind": "direct_url",
+     "url": "https://github.com/martymcmodding/iMMERSE/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Next-gen RTGI, MXAO, and anti-aliasing suite"},
+    {"id": "VortShaders", "name": "vort_Shaders by vortigern11", "kind": "direct_url",
+     "url": "https://github.com/vortigern11/vort_Shaders/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Sharpening, color correction, and depth effects"},
+    {"id": "BXShade", "name": "BX-Shade by BarricadeMKXX", "kind": "direct_url",
+     "url": "https://github.com/liuxd17thu/BX-Shade/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Bloom, exposure, and color enhancement effects"},
+    {"id": "SHADERDECK", "name": "SHADERDECK by TreyM", "kind": "direct_url",
+     "url": "https://github.com/IAmTreyM/SHADERDECK/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Curated collection of color and lighting effects"},
+    {"id": "METEOR", "name": "METEOR by Marty McFly", "kind": "direct_url",
+     "url": "https://github.com/martymcmodding/METEOR/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Advanced denoiser and image reconstruction"},
+    {"id": "AnnReShade", "name": "Ann-ReShade by Anastasia Bouwsma", "kind": "direct_url",
+     "url": "https://github.com/AnastasiaGals/Ann-ReShade/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Soft bloom, color grading, and ambient light presets"},
+    {"id": "ZenteonFX", "name": "ZenteonFX Shaders by Zenteon", "kind": "direct_url",
+     "url": "https://github.com/Zenteon/ZenteonFX/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Global illumination, SSR, and path tracing effects"},
+    {"id": "GShadeShaders", "name": "GShade-Shaders by Marot", "kind": "direct_url",
+     "url": "https://github.com/Mortalitas/GShade-Shaders/archive/refs/heads/master.zip",
+     "category": "extra", "description": "Large collection of community shaders from GShade"},
+    {"id": "PthoFX", "name": "Ptho-FX by PthoEastCoast", "kind": "direct_url",
+     "url": "https://github.com/PthoEastCoast/Ptho-FX/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Cinematic color grading and film emulation"},
+    {"id": "Anagrama", "name": "The Anagrama Collection by nullfractal", "kind": "direct_url",
+     "url": "https://github.com/nullfrctl/reshade-shaders/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Artistic and experimental visual effects"},
+    {"id": "BarbatosShaders", "name": "reshade-shaders by Barbatos", "kind": "direct_url",
+     "url": "https://github.com/BarbatosBachiko/Reshade-Shaders/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Ambient occlusion, bloom, and color effects"},
+    {"id": "BFBFX", "name": "BFBFX by yaboi BFB", "kind": "direct_url",
+     "url": "https://github.com/yplebedev/BFBFX/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Stylized and artistic post-processing effects"},
+    {"id": "Rendepth", "name": "Rendepth by cybereality", "kind": "direct_url",
+     "url": "https://github.com/outmode/rendepth-reshade/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Depth-based 3D rendering and stereo effects"},
+    {"id": "CropAndResize", "name": "Crop and Resize by P0NYSLAYSTATION", "kind": "direct_url",
+     "url": "https://github.com/P0NYSLAYSTATION/Scaling-Shaders/archive/refs/heads/main.zip",
+     "category": "extra", "description": "Screen cropping, scaling, and aspect ratio tools"},
+    {"id": "FXShaders", "name": "FXShaders by luluco250", "kind": "direct_url",
+     "url": "https://github.com/luluco250/FXShaders/archive/refs/heads/master.zip",
+     "category": "extra", "description": "Bloom, grain, dithering, and utility shader library"},
+    {"id": "LumeniteFX", "name": "LumeniteFX by Kaido", "kind": "direct_url",
+     "url": "https://github.com/umar-afzaal/LumeniteFX/archive/refs/heads/mainline.zip",
+     "category": "extra", "description": "Lighting, bloom, and atmospheric glow effects"},
+    {"id": "NNShaders", "name": "NN-Shaders by Sarenya", "kind": "direct_url",
+     "url": "https://github.com/Sarenya/NN-Shaders/archive/refs/heads/master.zip",
+     "category": "extra", "description": "Neural network-based image processing shaders"},
+    {"id": "QdOledAplFixer", "name": "QD-OLED APL Fixer by mspeedo", "kind": "direct_url",
+     "url": "https://github.com/mspeedo/QD-OLED-APL-FIXER/archive/refs/heads/main.zip",
+     "category": "extra", "description": "HDR brightness boost to compensate for QD-OLED ABL dimming"},
+    {"id": "GlamaryeFX", "name": "Glamarye Fast Effects by rj200", "kind": "direct_url",
+     "url": "https://github.com/rj200/Glamarye_Fast_Effects_for_ReShade/archive/refs/heads/main.zip",
+     "category": "extra",
+     "description": "Lightweight all-in-one: sharpening, AO, indirect lighting, color correction"},
+    {"id": "LumaBoost", "name": "LumaBoost by Valadore", "kind": "direct_url",
+     "url": "https://github.com/Valadore/LumaBoost/archive/refs/heads/main.zip",
+     "category": "extra",
+     "description": "OLED ABL compensation - dynamically lifts midtones"},
+    {"id": "RenoFXHDRToolkit", "name": "RenoFX HDR Toolkit by OopyDoopy", "kind": "direct_url",
+     "url": "https://github.com/clshortfuse/renofx/archive/refs/heads/main.zip",
+     "category": "recommended",
+     "description": "SDR to HDR conversion, tone mapping, and color grading"},
+]
+RESHADE_SHADER_PACKS_BY_ID = {p["id"]: p for p in RESHADE_SHADER_PACKS}
+# Shader files that fail to compile and should never be extracted or
+# deployed - matched against the filename (leaf) of each archive entry.
+SHADER_EXCLUDED_FILES = {"BX_XIV_ChromakeyPlus.fx", "GrainSpread.fx",
+                         "NTSCCustom.fx", "NTSC_XOT.fx"}
+RESHADE_SHADERS_STAGE_DIR = RHI_DATA_DIR / "shaders" / "Shaders"
+RESHADE_TEXTURES_STAGE_DIR = RHI_DATA_DIR / "shaders" / "Textures"
+GAME_RESHADE_SHADERS_DIR = "reshade-shaders"
+GAME_RESHADE_SHADERS_ORIGINAL = "reshade-shaders-original"
+RESHADE_SHADERS_MANAGED_MARKER = "Managed by Proton Command Center.txt"
+
+
+def _expand_pack_dependencies(pack_ids) -> list:
+    """BFS over each pack's `requires` list so selecting a pack automatically
+    pulls in whatever it declares as required. Port of RHI's
+    ExpandPackDependencies."""
+    seen, queue = [], list(pack_ids)
+    visited = set()
+    while queue:
+        pid = queue.pop(0)
+        if pid in visited or pid not in RESHADE_SHADER_PACKS_BY_ID:
+            continue
+        visited.add(pid)
+        seen.append(pid)
+        queue.extend(RESHADE_SHADER_PACKS_BY_ID[pid].get("requires") or [])
+    return seen
+
+
+def ensure_shader_pack(pack_id, task_id=None) -> list:
+    """Downloads/extracts one shader pack into its own ID-named subfolder of
+    the shared staging tree, recording every extracted file's staging-
+    relative path in state (source of truth for later pruning). Skips the
+    download if the recorded files are all still present on disk. Returns
+    the list of staging-relative paths (e.g. "Shaders/Lilium/HDR.fx")."""
+    import zipfile, io
+    pack = RESHADE_SHADER_PACKS_BY_ID.get(pack_id)
+    if not pack:
+        raise RuntimeError(f"Unknown shader pack: {pack_id}")
+    state = load_state()
+    cache = state.setdefault("rhi_shader_packs", {})
+    entry = cache.get(pack_id)
+    if entry and entry.get("files"):
+        if all((RHI_DATA_DIR / "shaders" / f).is_file() for f in entry["files"]):
+            return entry["files"]
+
+    if task_id:
+        TASKS[task_id] = {"status": "running", "progress": 10,
+                          "detail": f"Downloading {pack['name']}"}
+    if pack["kind"] == "gh_release":
+        release = _gh_json(pack["url"])
+        asset = next((a for a in release.get("assets", [])
+                     if a["name"].lower().endswith(pack.get("asset_ext", ""))), None)
+        url = asset["browser_download_url"] if asset else release.get("zipball_url")
+        if not url:
+            raise RuntimeError(f"No downloadable asset found for {pack['name']}")
+    else:
+        url = pack["url"]
+    data = _gh_bytes(url, task_id)
+    if task_id:
+        TASKS[task_id]["detail"] = f"Extracting {pack['name']}"
+
+    files = []
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        names = zf.namelist()
+        roots = {n.split("/", 1)[0] for n in names if "/" in n}
+        prefix = f"{next(iter(roots))}/" if len(roots) == 1 else ""
+        for n in names:
+            if n.endswith("/"):
+                continue
+            rel = n[len(prefix):] if prefix and n.startswith(prefix) else n
+            fn = rel.rsplit("/", 1)[-1]
+            if fn in SHADER_EXCLUDED_FILES:
+                continue
+            low = rel.lower()
+            if "/shaders/" in f"/{low}":
+                # keep only the part after the archive's own Shaders/ segment
+                idx = low.find("shaders/")
+                out_rel = f"Shaders/{pack_id}/{rel[idx + len('shaders/'):]}"
+            elif "/textures/" in f"/{low}":
+                idx = low.find("textures/")
+                out_rel = f"Textures/{pack_id}/{rel[idx + len('textures/'):]}"
+            elif fn.endswith((".fx", ".fxh")) and "/" not in rel:
+                # root-level single-file packs (no Shaders/ folder at all)
+                out_rel = f"Shaders/{pack_id}/{fn}"
+            else:
+                continue
+            dest = RHI_DATA_DIR / "shaders" / out_rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(zf.read(n))
+            files.append(out_rel)
+            # shared framework headers also get a copy at the staging root
+            if fn in ("ReShade.fxh", "ReShadeUI.fxh"):
+                (RESHADE_SHADERS_STAGE_DIR / fn).write_bytes(zf.read(n))
+
+    if not files:
+        raise RuntimeError(f"{pack['name']}'s archive didn't contain any usable "
+                           "shader files (its layout may have changed)")
+    cache[pack_id] = {"files": files, "fetched_at": time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    save_state(state)
+    if task_id:
+        TASKS[task_id] = {"status": "done", "progress": 100,
+                          "detail": f"{pack['name']}: {len(files)} files"}
+    return files
+
+
+def get_shader_pack_catalog() -> list:
+    state = load_state()
+    cache = state.get("rhi_shader_packs", {})
+    return [{"id": p["id"], "name": p["name"], "category": p["category"],
+            "description": p["description"], "requires": p.get("requires") or [],
+            "cached": p["id"] in cache}
+           for p in RESHADE_SHADER_PACKS]
+
+
+def deploy_shader_packs(install_path, pack_ids, task_id=None) -> dict:
+    """Deploys the given packs (dependency-expanded) into
+    <install_path>/reshade-shaders/{Shaders,Textures}/ - ReShade's own
+    default relative search path, so no reshade.ini rewriting is needed at
+    all (unlike the old removed PCC shader-cache feature, which needed a
+    shared dir + EffectSearchPaths/TextureSearchPaths). Prunes files from
+    packs that were previously deployed here but are no longer selected,
+    without touching anything not in that tracked list (user-placed files
+    survive). Non-destructive: a pre-existing, non-PCC-managed
+    reshade-shaders/ folder is renamed aside once and restored on removal."""
+    install_path = Path(install_path)
+    game_dir = install_path / GAME_RESHADE_SHADERS_DIR
+    original_dir = install_path / GAME_RESHADE_SHADERS_ORIGINAL
+    marker = game_dir / RESHADE_SHADERS_MANAGED_MARKER
+
+    if game_dir.is_dir() and not marker.is_file() and not original_dir.exists():
+        game_dir.rename(original_dir)
+
+    pack_ids = _expand_pack_dependencies(pack_ids)
+    all_files = []
+    for pid in pack_ids:
+        all_files += ensure_shader_pack(pid, task_id=task_id)
+
+    state = load_state()
+    prev_deployed = set(state.get("rhi_shader_deployments", {}).get(str(install_path), []))
+    new_deployed = set(all_files)
+
+    game_dir.mkdir(parents=True, exist_ok=True)
+    marker.write_text("This folder is managed by Proton Command Center's RHI "
+                      "port. Deleting this file will make PCC treat the "
+                      "folder as user-managed and stop touching it.\n")
+    for rel in new_deployed:
+        src = RHI_DATA_DIR / "shaders" / rel
+        dest = game_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.is_file() or dest.stat().st_size != src.stat().st_size:
+            shutil.copy2(src, dest)
+    for rel in prev_deployed - new_deployed:
+        stale = game_dir / rel
+        stale.unlink(missing_ok=True)
+
+    deployments = state.setdefault("rhi_shader_deployments", {})
+    deployments[str(install_path)] = sorted(new_deployed)
+    save_state(state)
+    return {"deployed": len(new_deployed), "packs": pack_ids}
+
+
+def remove_reshade_shaders(install_path) -> dict:
+    """Deletes PCC's managed reshade-shaders/ folder and restores whatever
+    non-managed folder it renamed aside on first deploy, if any."""
+    install_path = Path(install_path)
+    game_dir = install_path / GAME_RESHADE_SHADERS_DIR
+    original_dir = install_path / GAME_RESHADE_SHADERS_ORIGINAL
+    marker = game_dir / RESHADE_SHADERS_MANAGED_MARKER
+    if game_dir.is_dir() and marker.is_file():
+        shutil.rmtree(game_dir)
+    state = load_state()
+    state.get("rhi_shader_deployments", {}).pop(str(install_path), None)
+    save_state(state)
+    if original_dir.is_dir() and not game_dir.exists():
+        original_dir.rename(game_dir)
+    return {"removed": True}
+
+
+def get_game_shader_selection(appid) -> list:
+    return load_state().get("rhi_shader_selection", {}).get(str(appid), [])
+
+
+def set_game_shader_selection(appid, pack_ids) -> dict:
+    state = load_state()
+    sel = state.setdefault("rhi_shader_selection", {})
+    if pack_ids:
+        sel[str(appid)] = list(pack_ids)
+    else:
+        sel.pop(str(appid), None)
+    save_state(state)
+    return {"selection": pack_ids}
+
+
+def _deploy_shader_packs_task(task_id, install_path, pack_ids) -> None:
+    try:
+        result = deploy_shader_packs(install_path, pack_ids, task_id=task_id)
+        TASKS[task_id] = {"status": "done", "progress": 100,
+                          "detail": f"{result['deployed']} files deployed",
+                          "result": result}
+    except Exception as e:
+        TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
+
+
+# --------------------------------------------------------------------------
 # Owned library (community profile XML - no API key needed)
 # --------------------------------------------------------------------------
 
@@ -4449,6 +4819,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not g:
                     self._json({"error": "unknown appid"}, 404); return
                 self._json(scan_re_framework(m.group(1), g["install_path"]))
+            elif self.path == "/api/rhi/shader_packs":
+                self._json({"packs": get_shader_pack_catalog()})
+            elif m := re.match(r"^/api/game/(\d+)/rhi/shaders$", self.path):
+                self._json({"selection": get_game_shader_selection(m.group(1))})
             elif self.path == "/api/progress":
                 self._json({"games": install_progress(root)})
             elif self.path == "/api/owned_games":
@@ -4661,6 +5035,28 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"task": tid})
             elif self.path == "/api/rhi/refwork/remove":
                 self._json(remove_re_framework(body["appid"]))
+            elif self.path == "/api/rhi/shaders/deploy":
+                appid = body["appid"]
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(appid)
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                pack_ids = body.get("pack_ids") or []
+                set_game_shader_selection(appid, pack_ids)
+                tid = str(uuid.uuid4())
+                TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
+                threading.Thread(target=_deploy_shader_packs_task,
+                                 args=(tid, g["install_path"], pack_ids),
+                                 daemon=True).start()
+                self._json({"task": tid})
+            elif self.path == "/api/rhi/shaders/remove":
+                appid = body["appid"]
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(appid)
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                set_game_shader_selection(appid, [])
+                self._json(remove_reshade_shaders(g["install_path"]))
             elif self.path == "/api/proton/install":
                 tid = str(uuid.uuid4())
                 threading.Thread(target=install_ge_proton,

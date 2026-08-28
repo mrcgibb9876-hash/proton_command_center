@@ -699,9 +699,23 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
       </div>
       <div class="bar" id="rhiRefBar"><i></i></div>
     </div>
+    <div class="section">
+      <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:0 0 10px">Shader packs</h3>
+      <p class="note" style="margin:0 0 10px">Deployed to <code>reshade-shaders/</code> next to the game's exe -
+        ReShade's own default search path, so nothing needs editing in <code>reshade.ini</code>. A pre-existing
+        non-PCC folder there is renamed aside and restored if you remove everything.</p>
+      <input id="rhiShaderSearch" type="text" placeholder="Search packs…" style="width:100%;margin-bottom:10px">
+      <div id="rhiShaderCategories"></div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn green" id="rhiShaderDeployBtn">Deploy selected</button>
+        <button class="btn danger" id="rhiShaderRemoveBtn">Remove all</button>
+      </div>
+      <div class="bar" id="rhiShaderBar"><i></i></div>
+      <p class="note" id="rhiShaderDetail"></p>
+    </div>
     <p class="note" style="margin-top:10px">Ported from <a href="https://github.com/RankFTW/RHI"
-      target="_blank" rel="noopener noreferrer" style="color:var(--compiled)">RHI</a> - shader packs and
-      addons land in a follow-up pass.</p>
+      target="_blank" rel="noopener noreferrer" style="color:var(--compiled)">RHI</a> - addons land in a
+      follow-up pass.</p>
   </div>
 </aside>
 
@@ -1679,7 +1693,7 @@ async function openGame(appid){
   }catch(e){loadStringIntoUI("")}
   loadUltraPlus(appid);
   refreshCapabilities();
-  loadLibrary().then(()=>loadDLSS(appid));loadCompat(appid);loadCachedPdb(appid);loadMods(appid);loadRhiReshade(appid);
+  loadLibrary().then(()=>loadDLSS(appid));loadCompat(appid);loadCachedPdb(appid);loadMods(appid);loadRhiReshade(appid);loadRhiShaderPacks(appid);
 }
 
 async function loadDLSS(appid){
@@ -2050,6 +2064,62 @@ $("#rhiRefRemoveBtn").addEventListener("click",async()=>{
   try{
     await post("/api/rhi/refwork/remove",{appid:current.appid});
     toast("Removed");loadRhiReshade(current.appid);
+  }catch(e){toast(e.message,true)}
+});
+
+/* ---------- RHI: shader packs ---------- */
+let rhiShaderCatalog=null;   // fetched once, static data
+const RHI_SHADER_CATEGORY_LABELS={essential:"Essential",recommended:"Recommended",extra:"Extra"};
+async function loadRhiShaderPacks(appid){
+  const box=$("#rhiShaderCategories");
+  try{
+    if(!rhiShaderCatalog){
+      const d=await api("/api/rhi/shader_packs");
+      rhiShaderCatalog=d.packs;
+    }
+    const sel=await api(`/api/game/${appid}/rhi/shaders`);
+    const selected=new Set(sel.selection||[]);
+    const byCat={};
+    rhiShaderCatalog.forEach(p=>{(byCat[p.category]=byCat[p.category]||[]).push(p)});
+    box.innerHTML=["essential","recommended","extra"].filter(c=>byCat[c]).map(cat=>`
+      <details ${cat==="essential"?"open":""} style="margin-top:8px">
+        <summary style="cursor:pointer;font-weight:600">${RHI_SHADER_CATEGORY_LABELS[cat]} (${byCat[cat].length})</summary>
+        ${byCat[cat].map(p=>`
+          <label class="row rhiShaderRow" data-search="${esc((p.name+" "+p.description).toLowerCase())}"
+            style="align-items:flex-start;gap:8px;margin-top:8px;cursor:pointer">
+            <input type="checkbox" class="rhiShaderCheck" data-id="${esc(p.id)}" ${selected.has(p.id)?"checked":""} style="margin-top:3px">
+            <span><b>${esc(p.name)}</b>${p.cached?'<span class="chip m" style="margin-left:6px">cached</span>':""}
+              <span class="note" style="display:block">${esc(p.description)}</span></span>
+          </label>`).join("")}
+      </details>`).join("");
+  }catch(e){box.innerHTML=`<p class="note">${esc(e.message)}</p>`}
+}
+$("#rhiShaderSearch").addEventListener("input",e=>{
+  const q=e.target.value.toLowerCase().trim();
+  document.querySelectorAll(".rhiShaderRow").forEach(row=>{
+    row.style.display=(!q||row.dataset.search.includes(q))?"":"none";
+  });
+});
+$("#rhiShaderDeployBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  const packIds=[...document.querySelectorAll(".rhiShaderCheck:checked")].map(c=>c.dataset.id);
+  if(!packIds.length)return toast("Select at least one pack first",true);
+  const btn=$("#rhiShaderDeployBtn");btn.disabled=true;
+  try{
+    const {task}=await post("/api/rhi/shaders/deploy",{appid:current.appid,pack_ids:packIds});
+    trackTask(task,"#rhiShaderBar",(t)=>{
+      btn.disabled=false;
+      if(t.result)toast(`Deployed ${t.result.deployed} files from ${t.result.packs.length} pack(s)`);
+      loadRhiShaderPacks(current.appid);
+    },"#rhiShaderDetail");
+  }catch(e){toast(e.message,true);btn.disabled=false}
+});
+$("#rhiShaderRemoveBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  if(!await pccConfirm(`Remove all deployed shader packs from ${current.name}?`,{yes:"Remove",danger:true}))return;
+  try{
+    await post("/api/rhi/shaders/remove",{appid:current.appid});
+    toast("Removed");loadRhiShaderPacks(current.appid);
   }catch(e){toast(e.message,true)}
 });
 

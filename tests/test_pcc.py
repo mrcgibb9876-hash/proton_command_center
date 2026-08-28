@@ -117,6 +117,8 @@ class PCCTests(unittest.TestCase):
         pcc.RESHADE_NIGHTLY_STAGING_DIR = pcc.RHI_DATA_DIR / "reshade-nightly"
         pcc.RESHADE_LEGACY_STAGING_DIR = pcc.RHI_DATA_DIR / "reshade-legacy"
         pcc.RESHADE_CUSTOM_DIR = pcc.RHI_DATA_DIR / "reshade-custom"
+        pcc.RESHADE_SHADERS_STAGE_DIR = pcc.RHI_DATA_DIR / "shaders" / "Shaders"
+        pcc.RESHADE_TEXTURES_STAGE_DIR = pcc.RHI_DATA_DIR / "shaders" / "Textures"
         for d in (pcc.DLL_LIBRARY, pcc.BACKUP_DIR, pcc.ART_DIR):
             d.mkdir(parents=True, exist_ok=True)
         pcc.steam_running = lambda: False
@@ -1198,6 +1200,152 @@ class PCCTests(unittest.TestCase):
         self.assertFalse(target.exists())
         with self.assertRaises(RuntimeError):
             pcc.remove_re_framework("12345")
+
+    # ---- RHI: shader packs ----
+    def test_expand_pack_dependencies_pulls_in_requires(self):
+        expanded = pcc._expand_pack_dependencies(["Azen"])
+        self.assertIn("Azen", expanded)
+        self.assertIn("SmolbbsoopShaders", expanded)  # Azen's declared dependency
+
+    def test_expand_pack_dependencies_handles_cycles_and_unknown_ids(self):
+        # must not infinite-loop, and silently drops unknown pack ids
+        expanded = pcc._expand_pack_dependencies(["Azen", "bogus-pack-id"])
+        self.assertNotIn("bogus-pack-id", expanded)
+
+    def test_shader_pack_catalog_matches_ported_data(self):
+        catalog = pcc.get_shader_pack_catalog()
+        self.assertGreaterEqual(len(catalog), 40)   # ~46 packs per RHI's README
+        ids = {p["id"] for p in catalog}
+        self.assertIn("Lilium", ids)
+        self.assertIn("CrosireMaster", ids)
+        lilium = next(p for p in catalog if p["id"] == "Lilium")
+        self.assertEqual(lilium["category"], "essential")
+        self.assertFalse(lilium["cached"])   # nothing downloaded yet in this test
+
+    def _fake_shader_zip(self, root_folder, files):
+        import zipfile, io as _io
+        buf = _io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            for rel, content in files.items():
+                zf.writestr(f"{root_folder}/{rel}" if root_folder else rel, content)
+        return buf.getvalue()
+
+    def test_ensure_shader_pack_extracts_shaders_and_textures(self):
+        zip_bytes = self._fake_shader_zip("reshade-shaders-main", {
+            "Shaders/HDR.fx": b"fx content",
+            "Shaders/ReShade.fxh": b"framework header",
+            "Textures/noise.png": b"texture bytes",
+            "README.md": b"not a shader, must be skipped",
+        })
+        real = pcc._gh_bytes
+        pcc._gh_bytes = lambda url, task=None: zip_bytes
+        try:
+            files = pcc.ensure_shader_pack("CrosireMaster")
+        finally:
+            pcc._gh_bytes = real
+        self.assertIn("Shaders/CrosireMaster/HDR.fx", files)
+        self.assertIn("Textures/CrosireMaster/noise.png", files)
+        self.assertTrue((pcc.RHI_DATA_DIR / "shaders" / "Shaders/CrosireMaster/HDR.fx").is_file())
+        # shared framework header copied to the staging root too
+        self.assertTrue((pcc.RESHADE_SHADERS_STAGE_DIR / "ReShade.fxh").is_file())
+        self.assertFalse(any("README" in f for f in files))
+        # second call is served from the recorded file list, no re-download
+        pcc._gh_bytes = lambda url, task=None: (_ for _ in ()).throw(
+            RuntimeError("should not re-download"))
+        try:
+            files2 = pcc.ensure_shader_pack("CrosireMaster")
+        finally:
+            pcc._gh_bytes = real
+        self.assertEqual(files, files2)
+
+    def test_ensure_shader_pack_excludes_known_bad_files(self):
+        zip_bytes = self._fake_shader_zip("pack-main", {
+            "Shaders/Good.fx": b"fine",
+            "Shaders/NTSCCustom.fx": b"known broken",
+        })
+        real = pcc._gh_bytes
+        pcc._gh_bytes = lambda url, task=None: zip_bytes
+        try:
+            files = pcc.ensure_shader_pack("CrosireMaster")
+        finally:
+            pcc._gh_bytes = real
+        self.assertTrue(any("Good.fx" in f for f in files))
+        self.assertFalse(any("NTSCCustom.fx" in f for f in files))
+
+    def test_ensure_shader_pack_unknown_id_raises(self):
+        with self.assertRaises(RuntimeError):
+            pcc.ensure_shader_pack("NotARealPack")
+
+    def test_deploy_shader_packs_full_flow_and_remove(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        zip_bytes = self._fake_shader_zip("pack-main", {"Shaders/HDR.fx": b"fx"})
+        real = pcc._gh_bytes
+        pcc._gh_bytes = lambda url, task=None: zip_bytes
+        try:
+            r = pcc.deploy_shader_packs(str(d), ["CrosireMaster"])
+        finally:
+            pcc._gh_bytes = real
+
+        self.assertEqual(r["deployed"], 1)
+        deployed_file = d / "reshade-shaders/Shaders/CrosireMaster/HDR.fx"
+        self.assertTrue(deployed_file.is_file())
+        marker = d / "reshade-shaders" / pcc.RESHADE_SHADERS_MANAGED_MARKER
+        self.assertTrue(marker.is_file())
+
+        rm = pcc.remove_reshade_shaders(str(d))
+        self.assertTrue(rm["removed"])
+        self.assertFalse((d / "reshade-shaders").exists())
+
+    def test_deploy_shader_packs_preserves_preexisting_user_folder(self):
+        d = self.root / "steamapps/common/TestGame"
+        (d / "reshade-shaders").mkdir(parents=True)
+        (d / "reshade-shaders" / "MyOwnShader.fx").write_bytes(b"user's own file")
+        zip_bytes = self._fake_shader_zip("pack-main", {"Shaders/HDR.fx": b"fx"})
+        real = pcc._gh_bytes
+        pcc._gh_bytes = lambda url, task=None: zip_bytes
+        try:
+            pcc.deploy_shader_packs(str(d), ["CrosireMaster"])
+        finally:
+            pcc._gh_bytes = real
+
+        original = d / "reshade-shaders-original"
+        self.assertTrue(original.is_dir())
+        self.assertEqual((original / "MyOwnShader.fx").read_bytes(), b"user's own file")
+
+        pcc.remove_reshade_shaders(str(d))
+        # the user's original folder must come back once PCC's managed one is gone
+        self.assertTrue((d / "reshade-shaders" / "MyOwnShader.fx").is_file())
+        self.assertFalse(original.exists())
+
+    def test_deploy_shader_packs_prunes_deselected_pack_files(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        zip_a = self._fake_shader_zip("a-main", {"Shaders/A.fx": b"a"})
+        zip_b = self._fake_shader_zip("b-main", {"Shaders/B.fx": b"b"})
+        real = pcc._gh_bytes
+
+        pcc._gh_bytes = lambda url, task=None: zip_a
+        try:
+            pcc.deploy_shader_packs(str(d), ["CrosireMaster"])
+        finally:
+            pcc._gh_bytes = real
+        self.assertTrue((d / "reshade-shaders/Shaders/CrosireMaster/A.fx").is_file())
+
+        pcc._gh_bytes = lambda url, task=None: zip_b
+        try:
+            pcc.deploy_shader_packs(str(d), ["SweetFX"])
+        finally:
+            pcc._gh_bytes = real
+        self.assertFalse((d / "reshade-shaders/Shaders/CrosireMaster/A.fx").exists())
+        self.assertTrue((d / "reshade-shaders/Shaders/SweetFX/B.fx").is_file())
+
+    def test_game_shader_selection_get_set(self):
+        self.assertEqual(pcc.get_game_shader_selection("12345"), [])
+        pcc.set_game_shader_selection("12345", ["Lilium", "SweetFX"])
+        self.assertEqual(pcc.get_game_shader_selection("12345"), ["Lilium", "SweetFX"])
+        pcc.set_game_shader_selection("12345", [])
+        self.assertEqual(pcc.get_game_shader_selection("12345"), [])
 
     # ---- compile state ----
     def test_sgdb_fetch_and_cache(self):
