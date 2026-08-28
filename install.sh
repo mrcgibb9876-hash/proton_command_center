@@ -84,10 +84,11 @@ if [ -d "$APP_DIR" ]; then
         rm -rf -- "$APP_DIR"
     fi
 fi
-mkdir -p "$APP_DIR" "$BIN_DIR" "$DESKTOP_DIR"
+mkdir -p "$APP_DIR" "$BIN_DIR" "$DESKTOP_DIR" "$APP_DIR/optiscaler_inis"
 install -m 644 "$SRC_DIR/pcc.py"     "$APP_DIR/pcc.py"
 install -m 644 "$SRC_DIR/index.html" "$APP_DIR/index.html"
 install -m 644 "$SRC_DIR/README.md"  "$APP_DIR/README.md"
+install -m 644 "$SRC_DIR"/optiscaler_inis/*.ini "$APP_DIR/optiscaler_inis/"
 c_ok "app files -> $APP_DIR"
 
 # systemd user service: keeps the backend running permanently
