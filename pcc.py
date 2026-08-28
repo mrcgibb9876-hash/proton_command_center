@@ -2600,11 +2600,20 @@ def detect_game_graphics_api(exe_path) -> dict:
 # --------------------------------------------------------------------------
 RHI_DATA_DIR = DATA_DIR / "rhi"
 RESHADE_STAGING_DIR = RHI_DATA_DIR / "reshade"
+RESHADE_NORMAL_STAGING_DIR = RHI_DATA_DIR / "reshade-normal"     # No Addons channel
+RESHADE_NIGHTLY_STAGING_DIR = RHI_DATA_DIR / "reshade-nightly"
+RESHADE_LEGACY_STAGING_DIR = RHI_DATA_DIR / "reshade-legacy"
+RESHADE_CUSTOM_DIR = RHI_DATA_DIR / "reshade-custom"             # user drops DLLs here
 RESHADE_DOWNLOADS_PAGE = "https://reshade.me/"
+RESHADE_NIGHTLY_URLS = {
+    64: "https://nightly.link/crosire/reshade/workflows/build/main/ReShade%20(64-bit).zip",
+    32: "https://nightly.link/crosire/reshade/workflows/build/main/ReShade%20(32-bit).zip",
+}
 RE_FRAMEWORK_ZIP_URL = ("https://github.com/praydog/REFramework-nightly/"
                         "releases/latest/download/REFramework.zip")
 RE_FRAMEWORK_RELEASES_API = "https://api.github.com/repos/praydog/REFramework-nightly/releases"
 _RESHADE_MIN_SIZE = 1_000_000   # below this, treat a staged/installed DLL as corrupt
+RESHADE_CHANNELS = ("stable", "no_addons", "nightly", "legacy", "custom")
 
 
 def reshade_latest() -> dict:
@@ -2631,25 +2640,23 @@ def reshade_latest() -> dict:
     return data
 
 
-def ensure_reshade_engine(version, url=None, task_id=None) -> Path:
-    """Downloads the ReShade Stable setup .exe and pulls ReShade32.dll/
-    ReShade64.dll straight out of it. The installer is a plain zip with a
-    stub exe prepended - stdlib zipfile finds the end-of-central-directory
-    record by scanning back from EOF, no extra tooling needed (matches
-    RHI's own approach - it uses SharpCompress/7z for the same trick, but
-    Python's zipfile already does this natively). Cached per version so
-    repeat installs across games don't re-download."""
-    import zipfile, io
-    engine_dir = RESHADE_STAGING_DIR / version
+def _reshade_engine_cached(engine_dir) -> bool:
     dll64, dll32 = engine_dir / "ReShade64.dll", engine_dir / "ReShade32.dll"
-    if (dll64.is_file() and dll64.stat().st_size >= _RESHADE_MIN_SIZE
-            and dll32.is_file() and dll32.stat().st_size >= _RESHADE_MIN_SIZE):
-        return engine_dir
-    if not url:
-        url = reshade_latest()["url"]
+    return (dll64.is_file() and dll64.stat().st_size >= _RESHADE_MIN_SIZE
+            and dll32.is_file() and dll32.stat().st_size >= _RESHADE_MIN_SIZE)
+
+
+def _download_and_extract_reshade_exe(url, engine_dir, task_id=None, label="ReShade") -> Path:
+    """Shared by Stable/No-Addons/Legacy: downloads a reshade.me setup .exe
+    and pulls ReShade32.dll/ReShade64.dll straight out of it. The installer
+    is a plain zip with a stub exe prepended - stdlib zipfile finds the
+    end-of-central-directory record by scanning back from EOF, no extra
+    tooling needed (matches RHI's own approach - it uses SharpCompress/7z
+    for the same trick, but Python's zipfile already does this natively)."""
+    import zipfile, io
     if task_id:
         TASKS[task_id] = {"status": "running", "progress": 10,
-                          "detail": f"Downloading ReShade {version}"}
+                          "detail": f"Downloading {label}"}
     data = _gh_bytes(url, task_id)
     if len(data) < 500_000 or data[:2] != b"MZ":
         raise RuntimeError("Download from reshade.me didn't look like a real "
@@ -2666,6 +2673,110 @@ def ensure_reshade_engine(version, url=None, task_id=None) -> Path:
         for dll in ("ReShade32.dll", "ReShade64.dll"):
             (engine_dir / dll).write_bytes(zf.read(dll))
     return engine_dir
+
+
+def ensure_reshade_engine(version, url=None, task_id=None) -> Path:
+    """Stable (Addon-capable) channel. Cached per version so repeat installs
+    across games don't re-download."""
+    engine_dir = RESHADE_STAGING_DIR / version
+    if _reshade_engine_cached(engine_dir):
+        return engine_dir
+    if not url:
+        url = reshade_latest()["url"]
+    return _download_and_extract_reshade_exe(url, engine_dir, task_id,
+                                             label=f"ReShade {version}")
+
+
+def reshade_no_addons_latest() -> dict:
+    """Scrapes reshade.me for the current No-Addons (plain) build - same
+    page as the Stable scrape, but the filename pattern naturally excludes
+    the Addon build: 'ReShade_Setup_X.Y.Z.exe' can't match inside
+    'ReShade_Setup_X.Y.Z_Addon.exe' since '.exe' isn't what immediately
+    follows the version there. Port of RHI's NormalReShadeUpdateService."""
+    state = load_state()
+    cache = state.get("reshade_no_addons_latest")
+    now = time.time()
+    if cache and now - cache.get("ts", 0) < 21600:
+        return cache["data"]
+    req = urllib.request.Request(RESHADE_DOWNLOADS_PAGE,
+                                 headers={"User-Agent": "Mozilla/5.0 pcc"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        html = r.read().decode("utf-8", "replace")
+    m = re.search(r"downloads/ReShade_Setup_([\d.]+)\.exe", html)
+    if not m:
+        raise RuntimeError("Couldn't find a current No-Addons ReShade build on reshade.me")
+    version = m.group(1)
+    data = {"version": version,
+            "url": f"https://reshade.me/downloads/ReShade_Setup_{version}.exe"}
+    state["reshade_no_addons_latest"] = {"ts": now, "data": data}
+    save_state(state)
+    return data
+
+
+def ensure_reshade_no_addons_engine(version, url=None, task_id=None) -> Path:
+    engine_dir = RESHADE_NORMAL_STAGING_DIR / version
+    if _reshade_engine_cached(engine_dir):
+        return engine_dir
+    if not url:
+        url = reshade_no_addons_latest()["url"]
+    return _download_and_extract_reshade_exe(url, engine_dir, task_id,
+                                             label=f"ReShade {version} (No Addons)")
+
+
+def ensure_reshade_legacy_engine(version, task_id=None) -> Path:
+    """Pin to a specific older Stable version (>=6.0.0, the first
+    addon-DLL-capable release) via the same reshade.me URL pattern with an
+    explicit version - no scrape needed, the URL is deterministic. Excluded
+    from update checks by design elsewhere (that's the point of pinning)."""
+    engine_dir = RESHADE_LEGACY_STAGING_DIR / version
+    if _reshade_engine_cached(engine_dir):
+        return engine_dir
+    url = f"https://reshade.me/downloads/ReShade_Setup_{version}_Addon.exe"
+    return _download_and_extract_reshade_exe(url, engine_dir, task_id,
+                                             label=f"ReShade {version} (Legacy)")
+
+
+def ensure_reshade_nightly_engine(task_id=None) -> dict:
+    """Latest main-branch CI build from nightly.link (a real zip, no stub
+    exe to work around). No reliable version number exists here - track by
+    comparing the downloaded zip's byte size against the last-known size,
+    matching RHI's own approach, rather than inventing a fake version
+    scheme. Returns {"dir": Path, "changed": bool} - "changed" tells the
+    caller whether this was actually a new build vs. an already-cached one."""
+    import zipfile, io
+    state = load_state()
+    last_sizes = state.get("reshade_nightly_sizes", {})
+    changed = False
+    for bitness, url in RESHADE_NIGHTLY_URLS.items():
+        if task_id:
+            TASKS[task_id] = {"status": "running", "progress": 10,
+                              "detail": f"Downloading Nightly ReShade ({bitness}-bit)"}
+        data = _gh_bytes(url, task_id)
+        if len(data) < 10_000 or data[:2] != b"PK":
+            raise RuntimeError("Download from nightly.link didn't look like a "
+                               "real zip - the CI build may be temporarily unavailable.")
+        if last_sizes.get(str(bitness)) != len(data):
+            changed = True
+        last_sizes[str(bitness)] = len(data)
+        dll_name = f"ReShade{bitness}.dll"
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            match = next((n for n in zf.namelist() if n.endswith(dll_name)), None)
+            if not match:
+                raise RuntimeError(f"Nightly build didn't contain {dll_name} "
+                                   "(its format may have changed)")
+            RESHADE_NIGHTLY_STAGING_DIR.mkdir(parents=True, exist_ok=True)
+            (RESHADE_NIGHTLY_STAGING_DIR / dll_name).write_bytes(zf.read(match))
+    state["reshade_nightly_sizes"] = last_sizes
+    save_state(state)
+    return {"dir": RESHADE_NIGHTLY_STAGING_DIR, "changed": changed}
+
+
+def list_custom_reshade_files() -> list:
+    """Files the user has manually dropped into the Custom-channel folder,
+    for the per-game 'which one' picker."""
+    if not RESHADE_CUSTOM_DIR.is_dir():
+        return []
+    return sorted(p.name for p in RESHADE_CUSTOM_DIR.glob("*.dll"))
 
 
 def _identify_dxgi_file(path) -> str:
@@ -2686,10 +2797,15 @@ def _identify_dxgi_file(path) -> str:
         return "unknown"
     if b"ReShade" in data and (b"reshade.me" in data or b"crosire" in data):
         return "reshade"
-    for engine_dir in RESHADE_STAGING_DIR.glob("*"):
-        for dll in ("ReShade64.dll", "ReShade32.dll"):
-            staged = engine_dir / dll
-            if staged.is_file() and staged.stat().st_size == size:
+    search_dirs = ([RESHADE_NIGHTLY_STAGING_DIR, RESHADE_CUSTOM_DIR]
+                   + list(RESHADE_STAGING_DIR.glob("*"))
+                   + list(RESHADE_NORMAL_STAGING_DIR.glob("*"))
+                   + list(RESHADE_LEGACY_STAGING_DIR.glob("*")))
+    for d in search_dirs:
+        if not d.is_dir():
+            continue
+        for staged in d.glob("*.dll"):
+            if staged.stat().st_size == size:
                 return "reshade"
     return "unknown"
 
@@ -2717,13 +2833,53 @@ def _restore_foreign_dll(path) -> None:
         backup.rename(path)
 
 
+def get_staged_reshade_path(channel, bitness, legacy_version=None,
+                            custom_filename=None, task_id=None) -> tuple:
+    """Resolves (source_path, version_label) for the requested channel/
+    bitness, downloading/extracting as needed. version_label is what gets
+    recorded in state and shown in the UI - a real version for Stable/
+    No Addons/Legacy, a date-stamped tag for Nightly (no reliable version
+    number exists there), or the filename itself for Custom."""
+    dll_name = f"ReShade{bitness}.dll"
+    if channel == "stable":
+        info = reshade_latest()
+        engine_dir = ensure_reshade_engine(info["version"], info["url"], task_id=task_id)
+        return engine_dir / dll_name, info["version"]
+    if channel == "no_addons":
+        info = reshade_no_addons_latest()
+        engine_dir = ensure_reshade_no_addons_engine(info["version"], info["url"], task_id=task_id)
+        return engine_dir / dll_name, info["version"]
+    if channel == "legacy":
+        if not legacy_version:
+            raise RuntimeError("Pick a Legacy version first.")
+        engine_dir = ensure_reshade_legacy_engine(legacy_version, task_id=task_id)
+        return engine_dir / dll_name, legacy_version
+    if channel == "nightly":
+        result = ensure_reshade_nightly_engine(task_id=task_id)
+        return result["dir"] / dll_name, time.strftime("nightly-%Y-%m-%d", time.gmtime())
+    if channel == "custom":
+        if not custom_filename:
+            files = list_custom_reshade_files()
+            if not files:
+                raise RuntimeError(f"No files in the Custom ReShade folder "
+                                   f"({RESHADE_CUSTOM_DIR}) - drop a .dll there first.")
+            custom_filename = files[0]
+        p = RESHADE_CUSTOM_DIR / custom_filename
+        if not p.is_file():
+            raise RuntimeError(f"Custom ReShade file not found: {custom_filename}")
+        return p, custom_filename
+    raise RuntimeError(f"Unknown ReShade channel: {channel}")
+
+
 def scan_game_reshade(appid, install_path, exe_path=None) -> dict:
     """ReShade status for one game: detected graphics API/bitness (from the
     best-guess exe, or the exe an existing install actually used - so the
     status display doesn't keep pointing at the wrong exe forever after a
     manual exe-override install corrected it), whatever PCC has on record,
     and whether an update is available (installed file's size no longer
-    matches what's staged)."""
+    matches what's staged - Stable/No-Addons only; Legacy/Custom are
+    pinned/user-managed by design, and Nightly's check would require a
+    network fetch on every status poll, too expensive to do here)."""
     state = load_state()
     rec = state.get("rhi_reshade_installs", {}).get(str(appid))
     if not exe_path and rec and rec.get("exe"):
@@ -2732,16 +2888,19 @@ def scan_game_reshade(appid, install_path, exe_path=None) -> dict:
     detected = detect_game_graphics_api(exe) if exe else {"bitness": None, "api": None}
     result = {"exe": str(exe) if exe else None, "detected_api": detected["api"],
              "detected_bitness": detected["bitness"], "installed": False,
-             "update_available": False}
+             "update_available": False,
+             "custom_files": list_custom_reshade_files()}
     if rec:
         p = Path(rec["path"])
+        channel = rec.get("channel", "stable")
         result.update({"installed": p.is_file(), "path": rec["path"],
-                       "channel": rec.get("channel", "stable"),
-                       "version": rec.get("version")})
-        if p.is_file() and rec.get("channel", "stable") == "stable":
+                       "channel": channel, "version": rec.get("version")})
+        if p.is_file() and channel in ("stable", "no_addons"):
             try:
-                latest = reshade_latest()
-                engine_dir = RESHADE_STAGING_DIR / latest["version"]
+                latest = (reshade_latest() if channel == "stable"
+                         else reshade_no_addons_latest())
+                staging = RESHADE_STAGING_DIR if channel == "stable" else RESHADE_NORMAL_STAGING_DIR
+                engine_dir = staging / latest["version"]
                 staged64 = engine_dir / "ReShade64.dll"
                 staged32 = engine_dir / "ReShade32.dll"
                 sz = p.stat().st_size
@@ -2752,12 +2911,15 @@ def scan_game_reshade(appid, install_path, exe_path=None) -> dict:
     return result
 
 
-def install_reshade(appid, install_path, exe_override=None, task_id=None) -> dict:
-    """Installs ReShade (Stable channel) for one game: detects the exe/
-    graphics API/bitness, always installs as dxgi.dll (matches RHI's actual
-    behavior - ReShade's own runtime auto-hooks the right D3D/GL interface
-    once loaded there; no per-API proxy-name mapping needed), refuses to
-    overwrite a foreign dxgi.dll (backs it up as .original instead)."""
+def install_reshade(appid, install_path, exe_override=None, channel="stable",
+                    legacy_version=None, custom_filename=None, task_id=None) -> dict:
+    """Installs ReShade for one game: detects the exe/graphics API/bitness,
+    always installs as dxgi.dll (matches RHI's actual behavior - ReShade's
+    own runtime auto-hooks the right D3D/GL interface once loaded there;
+    no per-API proxy-name mapping needed), refuses to overwrite a foreign
+    dxgi.dll (backs it up as .original instead)."""
+    if channel not in RESHADE_CHANNELS:
+        raise RuntimeError(f"Unknown ReShade channel: {channel}")
     exe = Path(exe_override).expanduser() if exe_override else _find_game_exe(install_path)
     if not exe or not exe.is_file():
         raise RuntimeError("Couldn't find the game's .exe under its install folder — "
@@ -2770,31 +2932,34 @@ def install_reshade(appid, install_path, exe_override=None, task_id=None) -> dic
     bitness = detected["bitness"] or 64
     target = exe.parent / "dxgi.dll"
 
-    info = reshade_latest()
-    engine_dir = ensure_reshade_engine(info["version"], info["url"], task_id=task_id)
-    src_dll = engine_dir / ("ReShade64.dll" if bitness == 64 else "ReShade32.dll")
+    src_dll, version = get_staged_reshade_path(
+        channel, bitness, legacy_version=legacy_version,
+        custom_filename=custom_filename, task_id=task_id)
 
     _backup_foreign_dll(target)
     shutil.copy2(src_dll, target)
 
     state = load_state()
     installs = state.setdefault("rhi_reshade_installs", {})
-    installs[str(appid)] = {"path": str(target), "channel": "stable",
-                            "version": info["version"], "bitness": bitness,
+    installs[str(appid)] = {"path": str(target), "channel": channel,
+                            "version": version, "bitness": bitness,
                             "exe": str(exe),
                             "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     save_state(state)
     if task_id:
         TASKS[task_id] = {"status": "done", "progress": 100,
-                          "detail": f"Installed ReShade {info['version']}",
-                          "result": {"version": info["version"]}}
-    return {"installed": True, "path": str(target), "version": info["version"],
+                          "detail": f"Installed ReShade {version}",
+                          "result": {"version": version}}
+    return {"installed": True, "path": str(target), "version": version,
             "api": detected["api"], "bitness": bitness}
 
 
-def _install_reshade_task(task_id, appid, install_path, exe) -> None:
+def _install_reshade_task(task_id, appid, install_path, exe, channel="stable",
+                          legacy_version=None, custom_filename=None) -> None:
     try:
-        install_reshade(appid, install_path, exe_override=exe, task_id=task_id)
+        install_reshade(appid, install_path, exe_override=exe, channel=channel,
+                        legacy_version=legacy_version, custom_filename=custom_filename,
+                        task_id=task_id)
     except Exception as e:
         TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
 
@@ -4475,7 +4640,9 @@ class Handler(BaseHTTPRequestHandler):
                 tid = str(uuid.uuid4())
                 TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
                 threading.Thread(target=_install_reshade_task,
-                                 args=(tid, appid, g["install_path"], body.get("exe")),
+                                 args=(tid, appid, g["install_path"], body.get("exe"),
+                                       body.get("channel", "stable"),
+                                       body.get("legacy_version"), body.get("custom_filename")),
                                  daemon=True).start()
                 self._json({"task": tid})
             elif self.path == "/api/rhi/reshade/remove":

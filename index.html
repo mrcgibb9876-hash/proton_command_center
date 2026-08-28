@@ -661,6 +661,19 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
     <div class="section">
       <h3>ReShade</h3>
       <div id="rhiReshadeStatus"><p class="note">Checking…</p></div>
+      <div class="row" style="margin-top:10px;align-items:center;gap:10px">
+        <label class="note" for="rhiChannel" style="margin:0">Channel</label>
+        <select id="rhiChannel">
+          <option value="stable">Stable</option>
+          <option value="no_addons">No Addons</option>
+          <option value="nightly">Nightly</option>
+          <option value="legacy">Legacy</option>
+          <option value="custom">Custom</option>
+        </select>
+        <input type="text" id="rhiLegacyVersion" hidden placeholder="Version, e.g. 5.9.2" style="width:140px">
+        <select id="rhiCustomFile" hidden style="flex:1"></select>
+      </div>
+      <p class="note" id="rhiChannelNote" style="margin-top:6px"></p>
       <div class="row" style="margin-top:10px">
         <input type="text" id="rhiExePath" placeholder="Auto-detected .exe — override only if it picked the wrong one" style="flex:1">
       </div>
@@ -670,9 +683,10 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
       </div>
       <div class="bar" id="rhiBar"><i></i></div>
       <p class="note" id="rhiDetail"></p>
-      <p class="note">Stable channel only for now - Nightly/Legacy/Custom/No-Addons land in a
-        follow-up pass. Always installs as <code>dxgi.dll</code>; refuses to overwrite a foreign one
-        (backs it up as <code>.original</code> instead).</p>
+      <p class="note">Always installs as <code>dxgi.dll</code>; refuses to overwrite a foreign one
+        (backs it up as <code>.original</code> instead). Drop your own build into
+        <code class="mono">~/.local/share/proton-command-center/rhi/reshade-custom/</code> to use it
+        via the Custom channel.</p>
     </div>
     <div class="section" id="rhiRefSection" hidden>
       <h3>RE Framework</h3>
@@ -1932,6 +1946,20 @@ async function loadRhiRefFramework(appid){
     return d;
   }catch(e){sec.hidden=true;return {installed:true,is_re_engine:false}}
 }
+const RHI_CHANNEL_NOTES={
+  stable:"Stable channel — the current addon-capable ReShade release.",
+  no_addons:"No Addons — plain ReShade, no third-party addon support.",
+  nightly:"Nightly — latest main-branch CI build. No version numbers here, so update checks are skipped; reinstall manually to pick up a new build.",
+  legacy:"Legacy — pin to a specific older Stable version (6.0.0+). Excluded from update checks by design.",
+  custom:"Custom — pick a DLL you've dropped into the Custom ReShade folder yourself.",
+};
+function applyRhiChannelUI(){
+  const ch=$("#rhiChannel").value;
+  $("#rhiLegacyVersion").hidden=ch!=="legacy";
+  $("#rhiCustomFile").hidden=ch!=="custom";
+  $("#rhiChannelNote").textContent=RHI_CHANNEL_NOTES[ch]||"";
+}
+$("#rhiChannel").addEventListener("change",applyRhiChannelUI);
 async function loadRhiReshade(appid){
   const box=$("#rhiReshadeStatus");
   box.innerHTML='<p class="note">Scanning game folder…</p>';
@@ -1942,6 +1970,11 @@ async function loadRhiReshade(appid){
     window._rhiReshadeState=d;
     $("#rhiExePath").value="";
     $("#rhiExePath").placeholder=d.exe?`Auto-detected: ${d.exe}`:"No .exe auto-detected — point PCC at it manually";
+    $("#rhiChannel").value=d.channel||"stable";
+    $("#rhiCustomFile").innerHTML=(d.custom_files||[]).length
+      ?d.custom_files.map(f=>`<option value="${esc(f)}">${esc(f)}</option>`).join("")
+      :'<option value="">— drop a .dll in the Custom folder first —</option>';
+    applyRhiChannelUI();
     const blockedByRef=ref.is_re_engine&&!ref.installed;
     $("#rhiInstallBtn").disabled=blockedByRef;
     $("#rhiInstallBtn").textContent=blockedByRef?"⚠ RE Framework required first"
@@ -1951,6 +1984,7 @@ async function loadRhiReshade(appid){
         <div class="item">
           <div class="top"><b>dxgi.dll</b>
             <span class="chip g">v${esc(d.version||"?")}</span>
+            <span class="chip m">${esc(d.channel||"stable")}</span>
             ${d.detected_api?`<span class="chip a">${esc(d.detected_api.toUpperCase())}</span>`:""}
             ${d.update_available?'<span class="chip a">update available</span>':""}</div>
           <div class="path mono">${esc(d.path)}</div>
@@ -1969,8 +2003,19 @@ $("#rhiInstallBtn").addEventListener("click",async()=>{
   const btn=$("#rhiInstallBtn");
   btn.disabled=true;
   try{
-    const body={appid:current.appid};
+    const channel=$("#rhiChannel").value;
+    const body={appid:current.appid,channel};
     if($("#rhiExePath").value.trim())body.exe=$("#rhiExePath").value.trim();
+    if(channel==="legacy"){
+      const v=$("#rhiLegacyVersion").value.trim();
+      if(!v){toast("Enter a Legacy version first",true);btn.disabled=false;return}
+      body.legacy_version=v;
+    }
+    if(channel==="custom"){
+      const f=$("#rhiCustomFile").value;
+      if(!f){toast("Drop a .dll into the Custom folder first",true);btn.disabled=false;return}
+      body.custom_filename=f;
+    }
     const {task}=await post("/api/rhi/reshade/install",body);
     trackTask(task,"#rhiBar",(t)=>{
       if(t.result)toast(`Installed ReShade ${t.result.version}`);

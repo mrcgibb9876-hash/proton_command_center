@@ -113,6 +113,10 @@ class PCCTests(unittest.TestCase):
         pcc.ART_DIR = pcc.DATA_DIR / "art"
         pcc.RHI_DATA_DIR = pcc.DATA_DIR / "rhi"
         pcc.RESHADE_STAGING_DIR = pcc.RHI_DATA_DIR / "reshade"
+        pcc.RESHADE_NORMAL_STAGING_DIR = pcc.RHI_DATA_DIR / "reshade-normal"
+        pcc.RESHADE_NIGHTLY_STAGING_DIR = pcc.RHI_DATA_DIR / "reshade-nightly"
+        pcc.RESHADE_LEGACY_STAGING_DIR = pcc.RHI_DATA_DIR / "reshade-legacy"
+        pcc.RESHADE_CUSTOM_DIR = pcc.RHI_DATA_DIR / "reshade-custom"
         for d in (pcc.DLL_LIBRARY, pcc.BACKUP_DIR, pcc.ART_DIR):
             d.mkdir(parents=True, exist_ok=True)
         pcc.steam_running = lambda: False
@@ -1051,6 +1055,98 @@ class PCCTests(unittest.TestCase):
         d, exe = self._fake_game_exe(dlls=["vulkan-1.dll"])
         with self.assertRaises(RuntimeError):
             pcc.install_reshade("12345", str(d), exe_override=str(exe))
+
+    # ---- RHI: ReShade channels (No Addons / Legacy / Nightly / Custom) ----
+    def test_reshade_no_addons_regex_excludes_addon_build(self):
+        html = ('<a href="downloads/ReShade_Setup_6.8.0_Addon.exe">Addon</a>'
+                '<a href="downloads/ReShade_Setup_6.8.0.exe">Standard</a>')
+        m = pcc.re.search(r"downloads/ReShade_Setup_([\d.]+)\.exe", html)
+        self.assertEqual(m.group(1), "6.8.0")
+        self.assertNotIn("_Addon", m.group(0))
+
+    def test_install_reshade_no_addons_channel(self):
+        d, exe = self._fake_game_exe()
+        engine_dir = pcc.RESHADE_NORMAL_STAGING_DIR / "6.8.0"
+        engine_dir.mkdir(parents=True)
+        (engine_dir / "ReShade64.dll").write_bytes(b"N" * 1_100_000)
+        (engine_dir / "ReShade32.dll").write_bytes(b"n" * 1_100_000)
+        real_latest, real_engine = pcc.reshade_no_addons_latest, pcc.ensure_reshade_no_addons_engine
+        pcc.reshade_no_addons_latest = lambda: {"version": "6.8.0", "url": "http://x"}
+        pcc.ensure_reshade_no_addons_engine = lambda version, url=None, task_id=None: engine_dir
+        try:
+            r = pcc.install_reshade("12345", str(d), exe_override=str(exe),
+                                    channel="no_addons")
+        finally:
+            pcc.reshade_no_addons_latest = real_latest
+            pcc.ensure_reshade_no_addons_engine = real_engine
+        self.assertTrue(r["installed"])
+        self.assertEqual((d / "dxgi.dll").read_bytes(), b"N" * 1_100_000)
+        rec = pcc.load_state()["rhi_reshade_installs"]["12345"]
+        self.assertEqual(rec["channel"], "no_addons")
+
+    def test_install_reshade_legacy_channel_pinned_version(self):
+        d, exe = self._fake_game_exe()
+        engine_dir = pcc.RESHADE_LEGACY_STAGING_DIR / "5.9.2"
+        engine_dir.mkdir(parents=True)
+        (engine_dir / "ReShade64.dll").write_bytes(b"L" * 1_100_000)
+        (engine_dir / "ReShade32.dll").write_bytes(b"l" * 1_100_000)
+        real = pcc.ensure_reshade_legacy_engine
+        pcc.ensure_reshade_legacy_engine = lambda version, task_id=None: engine_dir
+        try:
+            r = pcc.install_reshade("12345", str(d), exe_override=str(exe),
+                                    channel="legacy", legacy_version="5.9.2")
+        finally:
+            pcc.ensure_reshade_legacy_engine = real
+        self.assertEqual(r["version"], "5.9.2")
+        self.assertEqual((d / "dxgi.dll").read_bytes(), b"L" * 1_100_000)
+
+    def test_install_reshade_legacy_requires_version(self):
+        d, exe = self._fake_game_exe()
+        with self.assertRaises(RuntimeError):
+            pcc.install_reshade("12345", str(d), exe_override=str(exe), channel="legacy")
+
+    def test_ensure_reshade_nightly_engine_downloads_and_tracks_size(self):
+        import zipfile, io as _io
+        def fake_zip(dll_name, content):
+            buf = _io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                zf.writestr(dll_name, content)
+            return buf.getvalue()
+        payloads = {64: fake_zip("ReShade64.dll", b"N64" * 500_000),
+                   32: fake_zip("ReShade32.dll", b"n32" * 500_000)}
+        real_bytes = pcc._gh_bytes
+        pcc._gh_bytes = lambda url, task=None: (
+            payloads[64] if "64" in url else payloads[32])
+        try:
+            r1 = pcc.ensure_reshade_nightly_engine()
+            self.assertTrue(r1["changed"])
+            self.assertTrue((pcc.RESHADE_NIGHTLY_STAGING_DIR / "ReShade64.dll").is_file())
+            self.assertTrue((pcc.RESHADE_NIGHTLY_STAGING_DIR / "ReShade32.dll").is_file())
+            # same content again -> no change
+            r2 = pcc.ensure_reshade_nightly_engine()
+            self.assertFalse(r2["changed"])
+        finally:
+            pcc._gh_bytes = real_bytes
+
+    def test_install_reshade_custom_channel_picks_dropped_file(self):
+        d, exe = self._fake_game_exe()
+        pcc.RESHADE_CUSTOM_DIR.mkdir(parents=True, exist_ok=True)
+        self.assertEqual(pcc.list_custom_reshade_files(), [])
+        (pcc.RESHADE_CUSTOM_DIR / "MyCustomReShade64.dll").write_bytes(b"C" * 2000)
+        self.assertEqual(pcc.list_custom_reshade_files(), ["MyCustomReShade64.dll"])
+        r = pcc.install_reshade("12345", str(d), exe_override=str(exe),
+                                channel="custom", custom_filename="MyCustomReShade64.dll")
+        self.assertEqual(r["version"], "MyCustomReShade64.dll")
+        self.assertEqual((d / "dxgi.dll").read_bytes(), b"C" * 2000)
+
+    def test_install_reshade_custom_channel_no_files_raises(self):
+        d, exe = self._fake_game_exe()
+        with self.assertRaises(RuntimeError):
+            pcc.install_reshade("12345", str(d), exe_override=str(exe), channel="custom")
+
+    def test_get_staged_reshade_path_unknown_channel_raises(self):
+        with self.assertRaises(RuntimeError):
+            pcc.get_staged_reshade_path("bogus", 64)
 
     def test_identify_dxgi_file_by_string_scan(self):
         d, _ = self._fake_game_exe()
