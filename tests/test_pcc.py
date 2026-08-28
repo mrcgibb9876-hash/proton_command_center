@@ -119,6 +119,7 @@ class PCCTests(unittest.TestCase):
         pcc.RESHADE_CUSTOM_DIR = pcc.RHI_DATA_DIR / "reshade-custom"
         pcc.RESHADE_SHADERS_STAGE_DIR = pcc.RHI_DATA_DIR / "shaders" / "Shaders"
         pcc.RESHADE_TEXTURES_STAGE_DIR = pcc.RHI_DATA_DIR / "shaders" / "Textures"
+        pcc.RESHADE_ADDONS_CACHE_FILE = pcc.RHI_DATA_DIR / "addons_cache.ini"
         for d in (pcc.DLL_LIBRARY, pcc.BACKUP_DIR, pcc.ART_DIR):
             d.mkdir(parents=True, exist_ok=True)
         pcc.steam_running = lambda: False
@@ -1346,6 +1347,117 @@ class PCCTests(unittest.TestCase):
         self.assertEqual(pcc.get_game_shader_selection("12345"), ["Lilium", "SweetFX"])
         pcc.set_game_shader_selection("12345", [])
         self.assertEqual(pcc.get_game_shader_selection("12345"), [])
+
+    # ---- RHI: ReShade addons ----
+    def test_parse_addons_ini_skips_disabled_sections(self):
+        content = (
+            "[00]\n"
+            "PackageName=Swap chain override by crosire\n"
+            "PackageDescription=Force windowed/fullscreen\n"
+            "DownloadUrl32=http://x/swapchain.addon32\n"
+            "DownloadUrl64=http://x/swapchain.addon64\n"
+            "RepositoryUrl=http://repo\n"
+            "\n"
+            "# [00]\n"
+            "# PackageName=Framerate Limiter by crosire\n"
+            "# PackageDescription=disabled entry, must be skipped\n"
+            "\n"
+            "[01]\n"
+            "PackageName=FreePIE by crosire\n"
+            "DownloadUrl32=http://x/freepie.addon32\n"
+            "DownloadUrl64=http://x/freepie.addon64\n"
+        )
+        parsed = pcc._parse_addons_ini(content)
+        names = [a["PackageName"] for a in parsed]
+        self.assertIn("Swap chain override by crosire", names)
+        self.assertIn("FreePIE by crosire", names)
+        self.assertNotIn("Framerate Limiter by crosire", names)
+        self.assertEqual(len(parsed), 2)
+
+    def test_slugify_addon_name(self):
+        self.assertEqual(pcc._slugify_addon_name("Swap chain override by crosire"),
+                         "swap-chain-override-by-crosire")
+
+    def test_reshade_addons_catalog_fetches_and_caches(self):
+        ini_text = ("[00]\nPackageName=Test Addon\n"
+                   "PackageDescription=desc\n"
+                   "DownloadUrl32=http://x/a.addon32\n"
+                   "DownloadUrl64=http://x/a.addon64\n")
+
+        class FakeResp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return ini_text.encode()
+        real_urlopen = pcc.urllib.request.urlopen
+        pcc.urllib.request.urlopen = lambda req, timeout=30: FakeResp()
+        try:
+            catalog = pcc.reshade_addons_catalog()
+        finally:
+            pcc.urllib.request.urlopen = real_urlopen
+        self.assertEqual(len(catalog), 1)
+        self.assertEqual(catalog[0]["id"], "test-addon")
+        self.assertEqual(catalog[0]["download_url64"], "http://x/a.addon64")
+        # second call is served from the 6h cache, no network needed
+        pcc.urllib.request.urlopen = lambda req, timeout=30: (_ for _ in ()).throw(
+            RuntimeError("should not fetch again"))
+        try:
+            catalog2 = pcc.reshade_addons_catalog()
+        finally:
+            pcc.urllib.request.urlopen = real_urlopen
+        self.assertEqual(catalog2, catalog)
+
+    def test_deploy_reshade_addons_full_flow_and_remove(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        state = pcc.load_state()
+        state["reshade_addons_catalog"] = {"ts": pcc.time.time(), "data": [
+            {"id": "test-addon", "name": "Test Addon", "description": "",
+             "download_url32": "http://x/a.addon32", "download_url64": "http://x/a.addon64",
+             "repository_url": ""}]}
+        pcc.save_state(state)
+        real = pcc._gh_bytes
+        pcc._gh_bytes = lambda url, task=None: b"fake addon binary"
+        try:
+            r = pcc.deploy_reshade_addons(str(d), ["test-addon"], 64)
+        finally:
+            pcc._gh_bytes = real
+        self.assertEqual(r["deployed"], 1)
+        target = d / "test-addon.addon64"
+        self.assertEqual(target.read_bytes(), b"fake addon binary")
+
+        rm = pcc.remove_reshade_addons(str(d))
+        self.assertEqual(rm["removed"], 1)
+        self.assertFalse(target.exists())
+
+    def test_deploy_reshade_addons_prunes_deselected(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        state = pcc.load_state()
+        state["reshade_addons_catalog"] = {"ts": pcc.time.time(), "data": [
+            {"id": "addon-a", "name": "A", "description": "",
+             "download_url32": "http://x/a.addon32", "download_url64": "http://x/a.addon64",
+             "repository_url": ""},
+            {"id": "addon-b", "name": "B", "description": "",
+             "download_url32": "http://x/b.addon32", "download_url64": "http://x/b.addon64",
+             "repository_url": ""},
+        ]}
+        pcc.save_state(state)
+        real = pcc._gh_bytes
+        pcc._gh_bytes = lambda url, task=None: b"binary"
+        try:
+            pcc.deploy_reshade_addons(str(d), ["addon-a", "addon-b"], 64)
+            self.assertTrue((d / "addon-a.addon64").is_file())
+            self.assertTrue((d / "addon-b.addon64").is_file())
+            pcc.deploy_reshade_addons(str(d), ["addon-b"], 64)
+        finally:
+            pcc._gh_bytes = real
+        self.assertFalse((d / "addon-a.addon64").exists())
+        self.assertTrue((d / "addon-b.addon64").is_file())
+
+    def test_game_addon_selection_get_set(self):
+        self.assertEqual(pcc.get_game_addon_selection("12345"), [])
+        pcc.set_game_addon_selection("12345", ["addon-a"])
+        self.assertEqual(pcc.get_game_addon_selection("12345"), ["addon-a"])
 
     # ---- compile state ----
     def test_sgdb_fetch_and_cache(self):

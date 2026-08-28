@@ -713,9 +713,20 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
       <div class="bar" id="rhiShaderBar"><i></i></div>
       <p class="note" id="rhiShaderDetail"></p>
     </div>
+    <div class="section">
+      <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:0 0 10px">Addons</h3>
+      <p class="note" style="margin:0 0 10px">From ReShade's own community addon directory. Placed directly next to
+        the ReShade DLL - only appears here once ReShade is installed.</p>
+      <div id="rhiAddonsList"></div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn green" id="rhiAddonsDeployBtn">Deploy selected</button>
+        <button class="btn danger" id="rhiAddonsRemoveBtn">Remove all</button>
+      </div>
+      <div class="bar" id="rhiAddonsBar"><i></i></div>
+      <p class="note" id="rhiAddonsDetail"></p>
+    </div>
     <p class="note" style="margin-top:10px">Ported from <a href="https://github.com/RankFTW/RHI"
-      target="_blank" rel="noopener noreferrer" style="color:var(--compiled)">RHI</a> - addons land in a
-      follow-up pass.</p>
+      target="_blank" rel="noopener noreferrer" style="color:var(--compiled)">RHI</a>.</p>
   </div>
 </aside>
 
@@ -1693,7 +1704,7 @@ async function openGame(appid){
   }catch(e){loadStringIntoUI("")}
   loadUltraPlus(appid);
   refreshCapabilities();
-  loadLibrary().then(()=>loadDLSS(appid));loadCompat(appid);loadCachedPdb(appid);loadMods(appid);loadRhiReshade(appid);loadRhiShaderPacks(appid);
+  loadLibrary().then(()=>loadDLSS(appid));loadCompat(appid);loadCachedPdb(appid);loadMods(appid);loadRhiReshade(appid).then(()=>loadRhiAddons(appid));loadRhiShaderPacks(appid);
 }
 
 async function loadDLSS(appid){
@@ -2033,7 +2044,7 @@ $("#rhiInstallBtn").addEventListener("click",async()=>{
     const {task}=await post("/api/rhi/reshade/install",body);
     trackTask(task,"#rhiBar",(t)=>{
       if(t.result)toast(`Installed ReShade ${t.result.version}`);
-      loadRhiReshade(current.appid);
+      loadRhiReshade(current.appid).then(()=>loadRhiAddons(current.appid));
     },"#rhiDetail");
   }catch(e){toast(e.message,true);btn.disabled=false}
 });
@@ -2042,7 +2053,7 @@ $("#rhiRemoveBtn").addEventListener("click",async()=>{
   if(!await pccConfirm(`Remove ReShade from ${current.name}?`,{yes:"Remove",danger:true}))return;
   try{
     await post("/api/rhi/reshade/remove",{appid:current.appid});
-    toast("Removed");loadRhiReshade(current.appid);
+    toast("Removed");loadRhiReshade(current.appid).then(()=>loadRhiAddons(current.appid));
   }catch(e){toast(e.message,true)}
 });
 $("#rhiRefInstallBtn").addEventListener("click",async()=>{
@@ -2120,6 +2131,50 @@ $("#rhiShaderRemoveBtn").addEventListener("click",async()=>{
   try{
     await post("/api/rhi/shaders/remove",{appid:current.appid});
     toast("Removed");loadRhiShaderPacks(current.appid);
+  }catch(e){toast(e.message,true)}
+});
+
+/* ---------- RHI: addons ---------- */
+let rhiAddonCatalog=null;
+async function loadRhiAddons(appid){
+  const box=$("#rhiAddonsList");
+  const installed=window._rhiReshadeState&&window._rhiReshadeState.installed;
+  if(!installed){box.innerHTML='<p class="note">Install ReShade first.</p>';return}
+  try{
+    if(!rhiAddonCatalog){
+      const d=await api("/api/rhi/addons");
+      rhiAddonCatalog=d.addons;
+    }
+    const sel=await api(`/api/game/${appid}/rhi/addons`);
+    const selected=new Set(sel.selection||[]);
+    box.innerHTML=rhiAddonCatalog.length?rhiAddonCatalog.map(a=>`
+      <label class="row" style="align-items:flex-start;gap:8px;margin-top:8px;cursor:pointer">
+        <input type="checkbox" class="rhiAddonCheck" data-id="${esc(a.id)}" ${selected.has(a.id)?"checked":""} style="margin-top:3px">
+        <span><b>${esc(a.name)}</b>
+          <span class="note" style="display:block">${esc(a.description)}</span></span>
+      </label>`).join(""):'<p class="note">Couldn\'t load the addon directory.</p>';
+  }catch(e){box.innerHTML=`<p class="note">${esc(e.message)}</p>`}
+}
+$("#rhiAddonsDeployBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  const addonIds=[...document.querySelectorAll(".rhiAddonCheck:checked")].map(c=>c.dataset.id);
+  if(!addonIds.length)return toast("Select at least one addon first",true);
+  const btn=$("#rhiAddonsDeployBtn");btn.disabled=true;
+  try{
+    const {task}=await post("/api/rhi/addons/deploy",{appid:current.appid,addon_ids:addonIds});
+    trackTask(task,"#rhiAddonsBar",(t)=>{
+      btn.disabled=false;
+      if(t.result)toast(`Deployed ${t.result.deployed} addon(s)`);
+      loadRhiAddons(current.appid);
+    },"#rhiAddonsDetail");
+  }catch(e){toast(e.message,true);btn.disabled=false}
+});
+$("#rhiAddonsRemoveBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  if(!await pccConfirm(`Remove all deployed addons from ${current.name}?`,{yes:"Remove",danger:true}))return;
+  try{
+    await post("/api/rhi/addons/remove",{appid:current.appid});
+    toast("Removed");loadRhiAddons(current.appid);
   }catch(e){toast(e.message,true)}
 });
 

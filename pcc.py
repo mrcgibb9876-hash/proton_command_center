@@ -3447,6 +3447,158 @@ def _deploy_shader_packs_task(task_id, install_path, pack_ids) -> None:
 
 
 # --------------------------------------------------------------------------
+# RHI port: ReShade addon management
+# --------------------------------------------------------------------------
+# ReShade's own community addon directory (crosire/reshade-shaders' `list`
+# branch) - the same source RHI fetches from. Deliberately does NOT include
+# RHI's 2 hardcoded RenoDX-specific addon entries (renodx-devkit,
+# renodx-dlssfix): their exact download filenames weren't verified against
+# real source during this port's research, and fabricating a URL that might
+# 404 is worse than just not offering them - can be added later once
+# confirmed against the real clshortfuse/renodx releases page.
+RESHADE_ADDONS_INI_URL = "https://raw.githubusercontent.com/crosire/reshade-shaders/list/Addons.ini"
+RESHADE_ADDONS_CACHE_FILE = RHI_DATA_DIR / "addons_cache.ini"
+
+
+def _slugify_addon_name(name) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def _parse_addons_ini(content) -> list:
+    """Parses ReShade's Addons.ini format: blank-line-separated blocks, each
+    starting with `[NN]` (active) or `# [NN]`/`;[NN]` (disabled - skipped),
+    followed by `Key=Value` lines. Port of RHI's AddonsIniParser."""
+    addons = []
+    current = None
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line:
+            if current and current.get("PackageName"):
+                addons.append(current)
+            current = None
+            continue
+        if line.startswith("#") or line.startswith(";"):
+            continue   # disabled section or comment
+        if line.startswith("[") and line.endswith("]"):
+            current = {}
+            continue
+        if current is not None and "=" in line:
+            key, _, value = line.partition("=")
+            current[key.strip()] = value.strip()
+    if current and current.get("PackageName"):
+        addons.append(current)
+    return addons
+
+
+def reshade_addons_catalog() -> list:
+    """Fetches+parses the community Addons.ini, 6h cached in state (like
+    every other RHI-port catalog here), with a disk-file fallback if the
+    fetch fails and nothing is cached yet."""
+    state = load_state()
+    cache = state.get("reshade_addons_catalog")
+    now = time.time()
+    if cache and now - cache.get("ts", 0) < 21600:
+        return cache["data"]
+    try:
+        req = urllib.request.Request(RESHADE_ADDONS_INI_URL,
+                                     headers={"User-Agent": "Mozilla/5.0 pcc"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            text = r.read().decode("utf-8", "replace")
+        RHI_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        RESHADE_ADDONS_CACHE_FILE.write_text(text)
+    except Exception:
+        if RESHADE_ADDONS_CACHE_FILE.is_file():
+            text = RESHADE_ADDONS_CACHE_FILE.read_text(errors="replace")
+        else:
+            raise
+    parsed = _parse_addons_ini(text)
+    data = [{"id": _slugify_addon_name(a["PackageName"]), "name": a["PackageName"],
+            "description": a.get("PackageDescription", ""),
+            "download_url32": a.get("DownloadUrl32") or a.get("DownloadUrl"),
+            "download_url64": a.get("DownloadUrl64") or a.get("DownloadUrl"),
+            "repository_url": a.get("RepositoryUrl", "")}
+           for a in parsed]
+    state["reshade_addons_catalog"] = {"ts": now, "data": data}
+    save_state(state)
+    return data
+
+
+def deploy_reshade_addons(install_path, addon_ids, bitness, task_id=None) -> dict:
+    """Downloads the selected addons' .addon32/.addon64 (by bitness) and
+    copies them directly into the game's install root, next to the ReShade
+    DLL - ReShade only auto-loads addon binaries sitting beside itself, so
+    unlike shaders these are never placed in the reshade-shaders/ subfolder.
+    Prunes files from addons no longer selected; never touches a file not
+    in PCC's own deployment record (same non-destructive pattern as
+    everywhere else in this port)."""
+    install_path = Path(install_path)
+    catalog = {a["id"]: a for a in reshade_addons_catalog()}
+    url_key = "download_url64" if bitness == 64 else "download_url32"
+    ext = "addon64" if bitness == 64 else "addon32"
+
+    state = load_state()
+    deployments = state.setdefault("rhi_addon_deployments", {})
+    prev = set(deployments.get(str(install_path), []))
+    new_files = set()
+
+    for aid in addon_ids:
+        addon = catalog.get(aid)
+        if not addon or not addon.get(url_key):
+            continue
+        if task_id:
+            TASKS[task_id] = {"status": "running", "progress": 10,
+                              "detail": f"Downloading {addon['name']}"}
+        data = _gh_bytes(addon[url_key], task_id)
+        fname = f"{aid}.{ext}"
+        (install_path / fname).write_bytes(data)
+        new_files.add(fname)
+
+    for stale in prev - new_files:
+        (install_path / stale).unlink(missing_ok=True)
+
+    deployments[str(install_path)] = sorted(new_files)
+    save_state(state)
+    if task_id:
+        TASKS[task_id] = {"status": "done", "progress": 100,
+                          "detail": f"{len(new_files)} addon(s) deployed",
+                          "result": {"deployed": len(new_files)}}
+    return {"deployed": len(new_files)}
+
+
+def remove_reshade_addons(install_path) -> dict:
+    install_path = Path(install_path)
+    state = load_state()
+    deployments = state.get("rhi_addon_deployments", {})
+    files = deployments.pop(str(install_path), [])
+    for f in files:
+        (install_path / f).unlink(missing_ok=True)
+    save_state(state)
+    return {"removed": len(files)}
+
+
+def get_game_addon_selection(appid) -> list:
+    return load_state().get("rhi_addon_selection", {}).get(str(appid), [])
+
+
+def set_game_addon_selection(appid, addon_ids) -> dict:
+    state = load_state()
+    sel = state.setdefault("rhi_addon_selection", {})
+    if addon_ids:
+        sel[str(appid)] = list(addon_ids)
+    else:
+        sel.pop(str(appid), None)
+    save_state(state)
+    return {"selection": addon_ids}
+
+
+def _deploy_reshade_addons_task(task_id, install_path, addon_ids, bitness) -> None:
+    try:
+        deploy_reshade_addons(install_path, addon_ids, bitness, task_id=task_id)
+    except Exception as e:
+        TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
+
+
+# --------------------------------------------------------------------------
 # Owned library (community profile XML - no API key needed)
 # --------------------------------------------------------------------------
 
@@ -4823,6 +4975,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"packs": get_shader_pack_catalog()})
             elif m := re.match(r"^/api/game/(\d+)/rhi/shaders$", self.path):
                 self._json({"selection": get_game_shader_selection(m.group(1))})
+            elif self.path == "/api/rhi/addons":
+                self._json({"addons": reshade_addons_catalog()})
+            elif m := re.match(r"^/api/game/(\d+)/rhi/addons$", self.path):
+                self._json({"selection": get_game_addon_selection(m.group(1))})
             elif self.path == "/api/progress":
                 self._json({"games": install_progress(root)})
             elif self.path == "/api/owned_games":
@@ -5057,6 +5213,32 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({"error": "unknown appid"}, 404); return
                 set_game_shader_selection(appid, [])
                 self._json(remove_reshade_shaders(g["install_path"]))
+            elif self.path == "/api/rhi/addons/deploy":
+                appid = body["appid"]
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(appid)
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                addon_ids = body.get("addon_ids") or []
+                rec = load_state().get("rhi_reshade_installs", {}).get(appid)
+                if not rec:
+                    self._json({"error": "Install ReShade first - addons only "
+                                        "make sense once it's there"}, 400); return
+                bitness = rec.get("bitness") or 64
+                addon_dir = str(Path(rec["path"]).parent)   # next to dxgi.dll, not the Steam install root
+                set_game_addon_selection(appid, addon_ids)
+                tid = str(uuid.uuid4())
+                TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
+                threading.Thread(target=_deploy_reshade_addons_task,
+                                 args=(tid, addon_dir, addon_ids, bitness),
+                                 daemon=True).start()
+                self._json({"task": tid})
+            elif self.path == "/api/rhi/addons/remove":
+                appid = body["appid"]
+                rec = load_state().get("rhi_reshade_installs", {}).get(appid)
+                set_game_addon_selection(appid, [])
+                self._json(remove_reshade_addons(str(Path(rec["path"]).parent)) if rec
+                          else {"removed": 0})
             elif self.path == "/api/proton/install":
                 tid = str(uuid.uuid4())
                 threading.Thread(target=install_ge_proton,
