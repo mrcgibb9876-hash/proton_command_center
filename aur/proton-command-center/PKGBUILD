@@ -15,7 +15,7 @@ optdepends=(
     '7zip: OptiScaler install/update and DXVK Lilium HDR variant (both ship as .7z)'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('5eb1895d79b24cf1d0a9b716473ac4e6df91ecea85a528a01e2f48353568d63d')
 
 package() {
     cd "$srcdir/$_repo-$pkgver"
