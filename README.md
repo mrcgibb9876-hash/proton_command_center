@@ -7,7 +7,7 @@ mean a separate Windows app running under Wine, if it runs at all.
 
 This puts all of it in one place, in your browser, on your machine.
 
-![Your Steam library, with status rails showing what's configured](assets/screenshots/library.png)
+![Your Steam library, with status rails showing what's configured](assets/screenshots/library.jpg)
 
 ```
 http://localhost:8686
@@ -80,7 +80,7 @@ server-side. Skip them and everything else still works.
 
 ### Launch tab
 
-![Launch options built from toggles, with unsupported ones greyed out](assets/screenshots/launch.png)
+![Launch options built from toggles, with unsupported ones greyed out](assets/screenshots/launch.jpg)
 
 Toggle list covers the common cases (DXVK, HDR, Wayland, MangoHud, Reflex,
 DLSS auto-updater, VKD3D descriptor-heap, FSR4 upgrade) plus the
@@ -91,7 +91,7 @@ Steam cleanly, saves, and offers a one-click restart.
 
 ### DLSS tab
 
-![Every DLSS DLL in the game with its version, ready to swap or roll back](assets/screenshots/dlss.png)
+![Every DLSS DLL in the game with its version, ready to swap or roll back](assets/screenshots/dlss.jpg)
 
 Every DLSS DLL in the game, ready to swap or roll back. The Launch tab's
 DLSS section covers Super Resolution preset, Frame Generation (2x-6x), and
@@ -101,13 +101,15 @@ silently doing nothing.
 
 ### Ultra+ tab
 
+![A mod already installed, with its settings editor open](assets/screenshots/ultraplus.jpg)
+
 Installs, updates, and removes [Ultra+](https://theultraplace.com) mods
 directly. Reinstalling over an existing copy updates it while merging your
 config edits into the new file; mod presets show up as one-click apply.
 
 ### RHI tab
 
-![Shader pack browser with category groups and search](assets/screenshots/shaders.png)
+![ReShade installed, with the shader pack browser open below it](assets/screenshots/reshade-shaders.jpg)
 
 A native port of [RHI](https://github.com/RankFTW/RHI)'s mod-management
 tools - everything below runs as a direct file install, no separate Windows
@@ -122,6 +124,8 @@ app or Wine-hosted process:
 - **DXVK** - Development, Stable, or Lilium HDR variant, per game. Coexists
   with ReShade and OptiScaler automatically (conflicting DLLs route through
   `OptiScaler/plugins/`, or ReShade gets renamed aside).
+
+![OptiScaler and DXVK both installed on the same game, coexisting](assets/screenshots/optiscaler-dxvk.jpg)
 
 Vulkan games don't get ReShade (the Windows implicit-layer mechanism doesn't
 work under Wine); OptiScaler still works there via its `winmm.dll` path.
