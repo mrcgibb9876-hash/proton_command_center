@@ -132,6 +132,7 @@ class PCCTests(unittest.TestCase):
         pcc.DXVK_STABLE_DIR = pcc.DXVK_DATA_DIR / "stable"
         pcc.DXVK_LILIUM_DIR = pcc.DXVK_DATA_DIR / "lilium"
         pcc.DLSSNR_CACHE_DIR = pcc.RHI_DATA_DIR / "dlssnr"
+        pcc.STREAMLINE_DATA_DIR = pcc.RHI_DATA_DIR / "streamline"
         for d in (pcc.DLL_LIBRARY, pcc.BACKUP_DIR, pcc.ART_DIR):
             d.mkdir(parents=True, exist_ok=True)
         pcc.steam_running = lambda: False
@@ -1790,6 +1791,84 @@ class PCCTests(unittest.TestCase):
             pcc._rhi_dlss_manifest = real_manifest
         self.assertEqual(p2, p)
 
+    def test_find_dlssnr_target_dir_prefers_sr_then_fg_then_rr(self):
+        import struct as _s
+        def mk(a, b, c, d):
+            data = b"MZ" + b"\x00" * 64 + _s.pack("<I", 0xFEEF04BD)
+            data += _s.pack("<I", 0x00010000)
+            data += _s.pack("<II", (a << 16) | b, (c << 16) | d) + b"\x00" * 32
+            return data
+        game = Path(self.tmp.name) / "GameNR"
+        sr_dir = game / "Engine" / "DLSS"
+        sr_dir.mkdir(parents=True)
+        (sr_dir / "nvngx_dlss.dll").write_bytes(mk(310, 7, 0, 0))
+        fg_dir = game / "Engine" / "Streamline"
+        fg_dir.mkdir(parents=True)
+        (fg_dir / "nvngx_dlssg.dll").write_bytes(mk(310, 7, 0, 0))
+        target = pcc.find_dlssnr_target_dir(str(game))
+        self.assertEqual(target, sr_dir)
+
+    def test_find_dlssnr_target_dir_none_without_other_dlss(self):
+        game = Path(self.tmp.name) / "GameNoDLSS"
+        game.mkdir()
+        # block the climb from wandering into the mock library's TestGame
+        # fixture, which does have a DLSS DLL of its own
+        other = str(self.root / "steamapps/common/TestGame")
+        self.assertIsNone(pcc.find_dlssnr_target_dir(str(game), other_roots=[other]))
+
+    def test_deploy_dlssnr_to_game_copies_into_sr_dir(self):
+        game = Path(self.tmp.name) / "GameDeployNR"
+        sr_dir = game / "Binaries"
+        sr_dir.mkdir(parents=True)
+        import struct as _s
+        data = b"MZ" + b"\x00" * 64 + _s.pack("<I", 0xFEEF04BD)
+        data += _s.pack("<I", 0x00010000)
+        data += _s.pack("<II", (310 << 16) | 7, 0) + b"\x00" * 32
+        (sr_dir / "nvngx_dlss.dll").write_bytes(data)
+
+        nr_src = Path(self.tmp.name) / "cached_nr.dll"
+        nr_src.write_bytes(b"fake nr dll v310.8.0")
+        real_ensure = pcc.ensure_dlssnr_cached
+        pcc.ensure_dlssnr_cached = lambda: nr_src
+        try:
+            r = pcc.deploy_dlssnr_to_game(str(game))
+        finally:
+            pcc.ensure_dlssnr_cached = real_ensure
+        self.assertTrue(r["deployed"])
+        dest = sr_dir / "nvngx_dlssnr.dll"
+        self.assertEqual(dest.read_bytes(), b"fake nr dll v310.8.0")
+
+    def test_deploy_dlssnr_to_game_backs_up_existing_before_overwrite(self):
+        game = Path(self.tmp.name) / "GameRedeployNR"
+        sr_dir = game / "Binaries"
+        sr_dir.mkdir(parents=True)
+        import struct as _s
+        data = b"MZ" + b"\x00" * 64 + _s.pack("<I", 0xFEEF04BD)
+        data += _s.pack("<I", 0x00010000)
+        data += _s.pack("<II", (310 << 16) | 7, 0) + b"\x00" * 32
+        (sr_dir / "nvngx_dlss.dll").write_bytes(data)
+        (sr_dir / "nvngx_dlssnr.dll").write_bytes(b"user's own existing NR copy")
+
+        nr_src = Path(self.tmp.name) / "cached_nr.dll"
+        nr_src.write_bytes(b"new nr dll")
+        real_ensure = pcc.ensure_dlssnr_cached
+        pcc.ensure_dlssnr_cached = lambda: nr_src
+        try:
+            pcc.deploy_dlssnr_to_game(str(game))
+        finally:
+            pcc.ensure_dlssnr_cached = real_ensure
+        dest = sr_dir / "nvngx_dlssnr.dll"
+        self.assertEqual(dest.read_bytes(), b"new nr dll")
+        bak = pcc._backup_path(dest)
+        self.assertEqual(bak.read_bytes(), b"user's own existing NR copy")
+
+    def test_deploy_dlssnr_to_game_raises_without_other_dlss(self):
+        game = Path(self.tmp.name) / "GameNoDLSSDeploy"
+        game.mkdir()
+        other = str(self.root / "steamapps/common/TestGame")
+        with self.assertRaises(RuntimeError):
+            pcc.deploy_dlssnr_to_game(str(game), other_roots=[other])
+
     def test_game_addon_selection_get_set(self):
         self.assertEqual(pcc.get_game_addon_selection("12345"), [])
         pcc.set_game_addon_selection("12345", ["addon-a"])
@@ -2848,6 +2927,124 @@ class PCCTests(unittest.TestCase):
         self.assertEqual(version, "310.5.2.0")   # highest version_number wins
         self.assertTrue(data.startswith(b"MZ"))
 
+    def test_rhi_manifest_section_mapping(self):
+        self.assertEqual(pcc.RHI_DLSS_MANIFEST_SECTION["sr"], "dlss")
+        self.assertEqual(pcc.RHI_DLSS_MANIFEST_SECTION["fg"], "dlssg")
+        self.assertEqual(pcc.RHI_DLSS_MANIFEST_SECTION["rr"], "dlssd")
+
+    def test_rhi_manifest_latest_picks_highest_version(self):
+        import io, zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("nvngx_dlss.dll", b"MZ" + b"\x00" * 100)
+        zip_bytes = buf.getvalue()
+        real_manifest, real_bytes = pcc._rhi_dlss_manifest, pcc._gh_bytes
+        pcc._rhi_dlss_manifest = lambda: {"dlss": [
+            {"version": "310.7.129", "url": "http://x/old.zip"},
+            {"version": "310.8.0", "url": "http://x/new.zip"},
+        ]}
+        pcc._gh_bytes = lambda url, task=None: zip_bytes
+        pcc.TASKS["t"] = {"status": "running", "progress": 0, "detail": ""}
+        try:
+            got = pcc._rhi_manifest_latest("sr", "t")
+        finally:
+            pcc._rhi_dlss_manifest, pcc._gh_bytes = real_manifest, real_bytes
+        self.assertIsNotNone(got)
+        version, data = got
+        self.assertEqual(version, "310.8.0")
+        self.assertTrue(data.startswith(b"MZ"))
+
+    def test_download_dlss_prefers_higher_of_the_two_manifests(self):
+        """Regression: the DLSS Swapper community manifest lagged RHI's own
+        manifest by a full build (310.7.129 vs 310.8.0) at least once in
+        practice. download_dlss() must check both and import whichever is
+        actually newer, not always trust one source. Both fakes return a
+        real version-bearing PE blob (not just raw bytes) - download_dlss()
+        gates on pe_version() succeeding before importing, and a blob that
+        fails that gate falls through to the real NVIDIA-repo network path,
+        which a unit test must never hit."""
+        import struct as _s
+        def mk(a, b, c, d):
+            data = b"MZ" + b"\x00" * 64 + _s.pack("<I", 0xFEEF04BD)
+            data += _s.pack("<I", 0x00010000)
+            data += _s.pack("<II", (a << 16) | b, (c << 16) | d) + b"\x00" * 32
+            return data
+        old_blob = mk(310, 7, 129, 0)
+        new_blob = mk(310, 8, 0, 0)
+
+        real_manifest_latest = pcc._manifest_latest
+        real_rhi_latest = pcc._rhi_manifest_latest
+        real_import = pcc.import_dll
+        pcc._manifest_latest = lambda kind, tid: ("310.7.129", old_blob)
+        pcc._rhi_manifest_latest = lambda kind, tid: ("310.8.0", new_blob)
+        imported = {}
+        def fake_import(p):
+            imported["bytes"] = Path(p).read_bytes()
+            return {"kind": "sr", "version": "310.8.0"}
+        pcc.import_dll = fake_import
+        try:
+            pcc.download_dlss("t2", "sr")
+        finally:
+            pcc._manifest_latest = real_manifest_latest
+            pcc._rhi_manifest_latest = real_rhi_latest
+            pcc.import_dll = real_import
+        self.assertEqual(pcc.TASKS["t2"]["status"], "done")
+        self.assertEqual(imported["bytes"], new_blob)
+
+    def test_streamline_sdk_latest_picks_highest_version(self):
+        real_manifest = pcc._rhi_dlss_manifest
+        pcc._rhi_dlss_manifest = lambda: {"streamline": [
+            {"version": "2.12.129.0", "url": "http://x/old.zip"},
+            {"version": "2.13.0.0", "url": "http://x/new.zip"},
+        ]}
+        try:
+            latest = pcc.streamline_sdk_latest()
+        finally:
+            pcc._rhi_dlss_manifest = real_manifest
+        self.assertEqual(latest, {"version": "2.13.0.0", "url": "http://x/new.zip"})
+
+    def test_streamline_sdk_latest_none_without_url(self):
+        real_manifest = pcc._rhi_dlss_manifest
+        pcc._rhi_dlss_manifest = lambda: {"streamline": [{"version": "2.13.0.0"}]}
+        try:
+            self.assertIsNone(pcc.streamline_sdk_latest())
+        finally:
+            pcc._rhi_dlss_manifest = real_manifest
+
+    def test_download_streamline_sdk_extracts_flattened_and_is_idempotent(self):
+        import io, zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("streamline/sl.interposer.dll", b"interposer bytes")
+            z.writestr("streamline/sl.dlss_nr.dll", b"nr plugin bytes")
+        real_manifest, real_bytes = pcc._rhi_dlss_manifest, pcc._gh_bytes
+        pcc._rhi_dlss_manifest = lambda: {"streamline": [
+            {"version": "2.13.0.0", "url": "http://x/sl.zip"}]}
+        pcc._gh_bytes = lambda url, task=None: buf.getvalue()
+        try:
+            pcc.download_streamline_sdk("t3")
+        finally:
+            pcc._rhi_dlss_manifest, pcc._gh_bytes = real_manifest, real_bytes
+        self.assertEqual(pcc.TASKS["t3"]["status"], "done")
+        version_dir = pcc.STREAMLINE_DATA_DIR / "2.13.0.0"
+        self.assertEqual((version_dir / "sl.interposer.dll").read_bytes(), b"interposer bytes")
+        self.assertEqual((version_dir / "sl.dlss_nr.dll").read_bytes(), b"nr plugin bytes")
+        lib = pcc.streamline_sdk_library()
+        self.assertEqual(len(lib), 1)
+        self.assertEqual(lib[0]["version"], "2.13.0.0")
+        self.assertCountEqual(lib[0]["files"], ["sl.interposer.dll", "sl.dlss_nr.dll"])
+
+        # second call is a no-op - no network needed
+        pcc._rhi_dlss_manifest = lambda: {"streamline": [
+            {"version": "2.13.0.0", "url": "http://x/sl.zip"}]}
+        pcc._gh_bytes = lambda url, task=None: (_ for _ in ()).throw(RuntimeError("should not fetch again"))
+        try:
+            pcc.download_streamline_sdk("t4")
+        finally:
+            pcc._rhi_dlss_manifest, pcc._gh_bytes = real_manifest, real_bytes
+        self.assertEqual(pcc.TASKS["t4"]["status"], "done")
+        self.assertIn("already cached", pcc.TASKS["t4"]["detail"])
+
     def test_pe_version_skips_false_signature(self):
         """Regression: a coincidental 0xFEEF04BD before the real version block
         produced garbage like 46863.0.46863.4696. Parser must validate the
@@ -2952,6 +3149,34 @@ class PCCTests(unittest.TestCase):
         (tree.parents[4] / "nvngx_dlss.dll").write_bytes(mk(310, 7, 0, 0))
         found = pcc.scan_game_dlss(str(tree))
         self.assertEqual(found, [])
+
+    def test_dlss_scan_climb_refuses_a_directory_home_to_another_game(self):
+        """Regression: a game with no DLSS of its own (e.g. an older title)
+        would climb straight into a Steam library's shared common/ folder -
+        or a custom multi-game root - and misattribute a sibling game's DLLs
+        as its own. other_roots must block that climb once it would step
+        into a directory another known game's install_path lives under."""
+        import struct as _s
+        def mk(a, b, c, d):
+            data = b"MZ" + b"\x00" * 64 + _s.pack("<I", 0xFEEF04BD)
+            data += _s.pack("<I", 0x00010000)
+            data += _s.pack("<II", (a << 16) | b, (c << 16) | d) + b"\x00" * 32
+            return data
+        common = Path(self.tmp.name) / "steamapps" / "common"
+        game_a = common / "Alien Isolation"   # has no DLSS of its own
+        game_a.mkdir(parents=True)
+        game_b = common / "The Witcher 3"     # sibling game that DOES
+        game_b.mkdir(parents=True)
+        (game_b / "nvngx_dlss.dll").write_bytes(mk(310, 7, 0, 0))
+
+        # without other_roots, the old unguarded climb wanders in
+        self.assertEqual(len(pcc.scan_game_dlss(str(game_a))), 1)
+        # with other_roots naming the sibling, the climb is refused
+        found = pcc.scan_game_dlss(str(game_a), other_roots=[str(game_b)])
+        self.assertEqual(found, [])
+        # the sibling's own scan is unaffected
+        found_b = pcc.scan_game_dlss(str(game_b), other_roots=[str(game_a)])
+        self.assertEqual(len(found_b), 1)
 
     def test_backup_export_and_restore(self):
         import tarfile
