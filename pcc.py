@@ -4540,15 +4540,55 @@ def _parse_addons_ini(content) -> list:
     return addons
 
 
+RESHADE_CUSTOM_ADDONS_DIR = RHI_DATA_DIR / "addons-custom"   # user drops .addon32/.addon64 here
+
+
+def custom_addons_catalog() -> list:
+    """Addon entries built from files manually dropped into the Custom
+    Addons folder, grouped by base filename - an addon may ship a .addon64
+    only, a .addon32 only, or both, matching the same "{name}.addon64"/
+    "{name}.addon32" pairing every catalog addon uses. For one-off dev/test
+    builds with no stable download URL PCC could otherwise track (e.g. a
+    build shared in a Discord test channel) - same manual-drop pattern as
+    RESHADE_CUSTOM_DIR for ReShade builds themselves. Deliberately NOT
+    cached like reshade_addons_catalog() - it's a cheap local directory
+    listing, and should reflect a dropped/removed file immediately rather
+    than up to 6h stale."""
+    if not RESHADE_CUSTOM_ADDONS_DIR.is_dir():
+        return []
+    bases = {}
+    for p in sorted(RESHADE_CUSTOM_ADDONS_DIR.iterdir()):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() == ".addon64":
+            bases.setdefault(p.stem, {})["path64"] = str(p)
+        elif p.suffix.lower() == ".addon32":
+            bases.setdefault(p.stem, {})["path32"] = str(p)
+    out = []
+    for base, paths in sorted(bases.items()):
+        builds = " + ".join(b for b in ("64-bit" if "path64" in paths else None,
+                                        "32-bit" if "path32" in paths else None) if b)
+        out.append({
+            "id": f"custom-{base}", "name": f"{base} (custom)",
+            "description": f"Manually dropped into the Custom Addons folder ({builds}).",
+            "download_url32": None, "download_url64": None,
+            "custom_path32": paths.get("path32"), "custom_path64": paths.get("path64"),
+            "repository_url": "", "is_custom": True,
+        })
+    return out
+
+
 def reshade_addons_catalog() -> list:
     """Fetches+parses the community Addons.ini, 6h cached in state (like
     every other RHI-port catalog here), with a disk-file fallback if the
-    fetch fails and nothing is cached yet."""
+    fetch fails and nothing is cached yet. Custom (manually-dropped) addons
+    are appended live on every call, cached path or not - see
+    custom_addons_catalog()."""
     state = load_state()
     cache = state.get("reshade_addons_catalog")
     now = time.time()
     if cache and now - cache.get("ts", 0) < 21600:
-        return cache["data"]
+        return cache["data"] + custom_addons_catalog()
     try:
         req = urllib.request.Request(RESHADE_ADDONS_INI_URL,
                                      headers={"User-Agent": "Mozilla/5.0 pcc"})
@@ -4605,7 +4645,7 @@ def reshade_addons_catalog() -> list:
     })
     state["reshade_addons_catalog"] = {"ts": now, "data": data}
     save_state(state)
-    return data
+    return data + custom_addons_catalog()
 
 
 def deploy_reshade_addons(install_path, addon_ids, bitness, task_id=None) -> dict:
@@ -4613,12 +4653,15 @@ def deploy_reshade_addons(install_path, addon_ids, bitness, task_id=None) -> dic
     copies them directly into the game's install root, next to the ReShade
     DLL - ReShade only auto-loads addon binaries sitting beside itself, so
     unlike shaders these are never placed in the reshade-shaders/ subfolder.
-    Prunes files from addons no longer selected; never touches a file not
-    in PCC's own deployment record (same non-destructive pattern as
+    A custom (manually-dropped) addon is copied straight from its local
+    file in RESHADE_CUSTOM_ADDONS_DIR instead of fetched over HTTP. Prunes
+    files from addons no longer selected; never touches a file not in
+    PCC's own deployment record (same non-destructive pattern as
     everywhere else in this port)."""
     install_path = Path(install_path)
     catalog = {a["id"]: a for a in reshade_addons_catalog()}
     url_key = "download_url64" if bitness == 64 else "download_url32"
+    custom_path_key = "custom_path64" if bitness == 64 else "custom_path32"
     ext = "addon64" if bitness == 64 else "addon32"
 
     state = load_state()
@@ -4632,21 +4675,31 @@ def deploy_reshade_addons(install_path, addon_ids, bitness, task_id=None) -> dic
         if not addon:
             skipped.append(f"{aid} (not in catalog)")
             continue
-        if not addon.get(url_key):
-            skipped.append(f"{addon['name']} (no {bitness}-bit build available)")
-            continue
-        if task_id:
-            TASKS[task_id] = {"status": "running", "progress": 10,
-                              "detail": f"Downloading {addon['name']}"}
-        data = _gh_bytes(addon[url_key], task_id)
-        zip_member = addon.get("zip_member")
-        if zip_member:
-            import zipfile, io
-            with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                names = [n for n in zf.namelist() if n.lower().endswith(zip_member.lower())]
-                if not names:
-                    continue
-                data = zf.read(names[0])
+        if addon.get("is_custom"):
+            custom_path = addon.get(custom_path_key)
+            if not custom_path or not Path(custom_path).is_file():
+                skipped.append(f"{addon['name']} (no {bitness}-bit build available)")
+                continue
+            if task_id:
+                TASKS[task_id] = {"status": "running", "progress": 10,
+                                  "detail": f"Copying {addon['name']}"}
+            data = Path(custom_path).read_bytes()
+        else:
+            if not addon.get(url_key):
+                skipped.append(f"{addon['name']} (no {bitness}-bit build available)")
+                continue
+            if task_id:
+                TASKS[task_id] = {"status": "running", "progress": 10,
+                                  "detail": f"Downloading {addon['name']}"}
+            data = _gh_bytes(addon[url_key], task_id)
+            zip_member = addon.get("zip_member")
+            if zip_member:
+                import zipfile, io
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    names = [n for n in zf.namelist() if n.lower().endswith(zip_member.lower())]
+                    if not names:
+                        continue
+                    data = zf.read(names[0])
         fname = f"{aid}.{ext}"
         (install_path / fname).write_bytes(data)
         new_files.add(fname)

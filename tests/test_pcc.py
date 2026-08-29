@@ -118,6 +118,7 @@ class PCCTests(unittest.TestCase):
         pcc.RESHADE_NIGHTLY_STAGING_DIR = pcc.RHI_DATA_DIR / "reshade-nightly"
         pcc.RESHADE_LEGACY_STAGING_DIR = pcc.RHI_DATA_DIR / "reshade-legacy"
         pcc.RESHADE_CUSTOM_DIR = pcc.RHI_DATA_DIR / "reshade-custom"
+        pcc.RESHADE_CUSTOM_ADDONS_DIR = pcc.RHI_DATA_DIR / "addons-custom"
         pcc.RESHADE_SHADERS_STAGE_DIR = pcc.RHI_DATA_DIR / "shaders" / "Shaders"
         pcc.RESHADE_TEXTURES_STAGE_DIR = pcc.RHI_DATA_DIR / "shaders" / "Textures"
         pcc.RESHADE_ADDONS_CACHE_FILE = pcc.RHI_DATA_DIR / "addons_cache.ini"
@@ -2020,6 +2021,75 @@ class PCCTests(unittest.TestCase):
         rm = pcc.remove_reshade_addons(str(d))
         self.assertEqual(rm["removed"], 1)
         self.assertFalse(target.exists())
+
+    def test_custom_addons_catalog_groups_by_base_name(self):
+        pcc.RESHADE_CUSTOM_ADDONS_DIR.mkdir(parents=True, exist_ok=True)
+        (pcc.RESHADE_CUSTOM_ADDONS_DIR / "renodx-dlss5.addon64").write_bytes(b"64-bit build")
+        (pcc.RESHADE_CUSTOM_ADDONS_DIR / "onlyone.addon32").write_bytes(b"32-bit only")
+        (pcc.RESHADE_CUSTOM_ADDONS_DIR / "not-an-addon.txt").write_bytes(b"ignored")
+        catalog = {a["id"]: a for a in pcc.custom_addons_catalog()}
+        self.assertEqual(set(catalog), {"custom-renodx-dlss5", "custom-onlyone"})
+        dlss5 = catalog["custom-renodx-dlss5"]
+        self.assertTrue(dlss5["is_custom"])
+        self.assertEqual(dlss5["custom_path64"],
+                         str(pcc.RESHADE_CUSTOM_ADDONS_DIR / "renodx-dlss5.addon64"))
+        self.assertIsNone(dlss5["custom_path32"])
+        self.assertIsNone(catalog["custom-onlyone"]["custom_path64"])
+
+    def test_custom_addons_catalog_empty_when_no_dir(self):
+        self.assertEqual(pcc.custom_addons_catalog(), [])
+
+    def test_reshade_addons_catalog_includes_custom_addons_live_not_cached(self):
+        state = pcc.load_state()
+        state["reshade_addons_catalog"] = {"ts": pcc.time.time(), "data": [
+            {"id": "test-addon", "name": "Test Addon", "description": "",
+             "download_url32": None, "download_url64": "http://x/a.addon64",
+             "repository_url": ""}]}
+        pcc.save_state(state)
+        pcc.RESHADE_CUSTOM_ADDONS_DIR.mkdir(parents=True, exist_ok=True)
+        (pcc.RESHADE_CUSTOM_ADDONS_DIR / "mytest.addon64").write_bytes(b"x")
+        catalog = pcc.reshade_addons_catalog()
+        ids = {a["id"] for a in catalog}
+        self.assertIn("test-addon", ids)
+        self.assertIn("custom-mytest", ids)
+        # dropping a second file shows up immediately, without waiting on
+        # the 6h cache (unlike the rest of the catalog, which is cached)
+        (pcc.RESHADE_CUSTOM_ADDONS_DIR / "mytest2.addon64").write_bytes(b"y")
+        catalog2 = pcc.reshade_addons_catalog()
+        self.assertIn("custom-mytest2", {a["id"] for a in catalog2})
+        # and the underlying cache itself was never polluted with it
+        self.assertNotIn("custom-mytest2",
+                         {a["id"] for a in pcc.load_state()["reshade_addons_catalog"]["data"]})
+
+    def test_deploy_reshade_addons_custom_addon_from_local_file(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        pcc.RESHADE_CUSTOM_ADDONS_DIR.mkdir(parents=True, exist_ok=True)
+        (pcc.RESHADE_CUSTOM_ADDONS_DIR / "devbuild.addon64").write_bytes(b"dev build content")
+        state = pcc.load_state()
+        state["reshade_addons_catalog"] = {"ts": pcc.time.time(), "data": []}
+        pcc.save_state(state)
+        real = pcc._gh_bytes
+        pcc._gh_bytes = lambda url, task=None: (_ for _ in ()).throw(
+            RuntimeError("custom addons must not hit the network"))
+        try:
+            r = pcc.deploy_reshade_addons(str(d), ["custom-devbuild"], 64)
+        finally:
+            pcc._gh_bytes = real
+        self.assertEqual(r["deployed"], 1)
+        self.assertEqual((d / "custom-devbuild.addon64").read_bytes(), b"dev build content")
+
+    def test_deploy_reshade_addons_custom_addon_skips_missing_bitness(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        pcc.RESHADE_CUSTOM_ADDONS_DIR.mkdir(parents=True, exist_ok=True)
+        (pcc.RESHADE_CUSTOM_ADDONS_DIR / "devbuild.addon64").write_bytes(b"64-bit only")
+        state = pcc.load_state()
+        state["reshade_addons_catalog"] = {"ts": pcc.time.time(), "data": []}
+        pcc.save_state(state)
+        r = pcc.deploy_reshade_addons(str(d), ["custom-devbuild"], 32)
+        self.assertEqual(r["deployed"], 0)
+        self.assertIn("no 32-bit build available", r["skipped"][0])
 
     def test_deploy_reshade_addons_prunes_deselected(self):
         d = self.root / "steamapps/common/TestGame"

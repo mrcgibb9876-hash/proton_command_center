@@ -748,11 +748,14 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
     <div class="section">
       <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:0 0 10px">Addons</h3>
       <p class="note" style="margin:0 0 10px">From ReShade's own community addon directory. Placed directly next to
-        the ReShade DLL - only appears here once ReShade is installed.</p>
+        the ReShade DLL - only appears here once ReShade is installed. Drop your own
+        <code>.addon32</code>/<code>.addon64</code> build (e.g. a dev/test build) into
+        <code class="mono">~/.local/share/proton-command-center/rhi/addons-custom/</code> to add it here too.</p>
       <div id="rhiAddonsList"></div>
       <div class="row" style="margin-top:10px">
         <button class="btn green" id="rhiAddonsDeployBtn">Deploy selected</button>
         <button class="btn danger" id="rhiAddonsRemoveBtn">Remove all</button>
+        <button class="btn small" id="rhiAddonsRefreshBtn" title="Re-scan the Custom Addons folder for newly dropped/removed files">Refresh list</button>
       </div>
       <div class="bar" id="rhiAddonsBar"><i></i></div>
       <p class="note" id="rhiAddonsDetail"></p>
@@ -2369,7 +2372,7 @@ async function loadRhiAddons(appid){
     box.innerHTML=rhiAddonCatalog.length?rhiAddonCatalog.map(a=>`
       <label class="row" style="align-items:flex-start;gap:8px;margin-top:8px;cursor:pointer">
         <input type="checkbox" class="rhiAddonCheck" data-id="${esc(a.id)}" ${selected.has(a.id)?"checked":""} style="margin-top:3px">
-        <span><b>${esc(a.name)}</b>
+        <span><b>${esc(a.name)}</b>${a.is_custom?'<span class="chip m" style="margin-left:6px">custom</span>':""}
           <span class="note" style="display:block">${esc(a.description)}</span></span>
       </label>`).join(""):'<p class="note">Couldn\'t load the addon directory.</p>';
   }catch(e){box.innerHTML=`<p class="note">${esc(e.message)}</p>`}
@@ -2400,6 +2403,11 @@ $("#rhiAddonsRemoveBtn").addEventListener("click",async()=>{
     await post("/api/rhi/addons/remove",{appid:current.appid});
     toast("Removed");loadRhiAddons(current.appid);
   }catch(e){toast(e.message,true)}
+});
+$("#rhiAddonsRefreshBtn").addEventListener("click",()=>{
+  if(!current)return;
+  rhiAddonCatalog=null;   // force a fresh /api/rhi/addons fetch, picking up Custom Addons folder changes
+  loadRhiAddons(current.appid);
 });
 
 /* ---------- RHI: OptiScaler ---------- */
