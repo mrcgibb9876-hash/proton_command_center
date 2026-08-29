@@ -2693,26 +2693,74 @@ def pe_imports(path):
 
 def detect_graphics_api(dll_names, delay_names=None) -> str | None:
     """Highest-priority graphics API among a PE's imported DLLs. Checks the
-    regular import table first; only falls back to the delay-load import
-    table (data-directory index 13) if nothing >= DX11 priority was found
-    there, since engines like UE4/5 often delay-load d3d12.dll as an
-    optional path while explicitly importing their real default API
-    (typically d3d11.dll) in the regular table - promoting on delay-load
-    alone would misdetect those as DX12. A DX12 game that creates its
-    device through dxgi.dll alone (no d3d12.dll import at all, common in
-    modern engines) is inferred as DX12 when nothing higher-priority was
-    found either way - port of RHI's GraphicsApiDetector."""
+    regular import table first. If dxgi.dll was regular-imported and nothing
+    >= DX11 priority was found there, returns DX12 immediately WITHOUT
+    consulting delay-loads - a DX12 game that creates its device through
+    dxgi.dll alone (no d3d12.dll import, common in modern engines) is
+    unambiguous. Only when dxgi.dll wasn't regular-imported (or a >=DX11
+    match already was) does it fall back to the delay-load import table
+    (data-directory index 13), since engines like UE4/5 often delay-load
+    d3d12.dll as an optional path while explicitly importing their real
+    default API (typically d3d11.dll) in the regular table - promoting on
+    delay-load alone would misdetect those as DX12. Port of RHI's
+    GraphicsApiDetector.Detect - this ordering (dxgi short-circuit BEFORE
+    delay-load scan) matches it exactly; scanning delay-loads first, as an
+    earlier version of this function did, could misclassify a game that
+    regular-imports only dxgi.dll but delay-loads d3d11.dll as DX11 instead
+    of DX12."""
     best, best_pri = None, 0
     for dll, api, pri in _GRAPHICS_DLL_PRIORITY:
         if dll in dll_names and pri > best_pri:
             best, best_pri = api, pri
+    if "dxgi.dll" in dll_names and best_pri < 5:
+        return "d3d12"
     if best_pri < 5 and delay_names:
         for dll, api, pri in _GRAPHICS_DLL_PRIORITY:
             if dll in delay_names and pri > best_pri:
                 best, best_pri = api, pri
-    if "dxgi.dll" in dll_names and best_pri < 5:
-        return "d3d12"
     return best
+
+
+_EXPLICIT_DX_APIS = {"d3d8", "d3d9", "d3d10", "d3d11", "d3d12"}
+
+
+def _detect_all_graphics_apis(dll_names, delay_names=None) -> set:
+    """ALL graphics APIs present among a PE's imports (regular + delay-load,
+    unconditionally - unlike detect_graphics_api's single best-match, which
+    only consults delay-loads when nothing >=DX11 was found in the regular
+    table). Includes the dxgi-only DX12 inference. Port of RHI's
+    GraphicsApiDetector.DetectAllApis - used to pick ReShade's default
+    install filename, where (unlike generic API detection) a legacy d3d9.dll
+    import must be seen even on a game whose PRIMARY api is DX11/12."""
+    apis = set()
+    has_explicit_dx = False
+    for dll, api, _pri in _GRAPHICS_DLL_PRIORITY:
+        if dll in dll_names or (delay_names and dll in delay_names):
+            apis.add(api)
+            if api in _EXPLICIT_DX_APIS:
+                has_explicit_dx = True
+    if "dxgi.dll" in dll_names and not has_explicit_dx:
+        apis.add("d3d12")
+    return apis
+
+
+def resolve_auto_reshade_filename(apis) -> str:
+    """ReShade's default install filename for a game's detected graphics
+    APIs (as returned by _detect_all_graphics_apis). DX11/DX12 take
+    precedence over everything else - many games import d3d9.dll for legacy
+    reasons even though they primarily render DX11/12. OpenGL only applies
+    when it's the ONLY api detected (some engines statically link
+    opengl32.dll as an unused fallback while actually rendering DirectX).
+    Port of RHI's ResolveAutoReShadeFilename (MainViewModel.Install.Luma.cs)."""
+    if "d3d11" in apis or "d3d12" in apis:
+        return "dxgi.dll"
+    if "d3d9" in apis:
+        return "d3d9.dll"
+    if "d3d8" in apis:
+        return "d3d8.dll"
+    if apis == {"opengl"}:
+        return "opengl32.dll"
+    return "dxgi.dll"
 
 
 def _detect_unity_api(exe_path):
@@ -2769,6 +2817,48 @@ def detect_game_graphics_api(exe_path) -> dict:
 # RHI port: ReShade install (Stable channel) + RE Framework companion
 # --------------------------------------------------------------------------
 RHI_DATA_DIR = DATA_DIR / "rhi"
+# RHI's own manifest.json - overrides/warnings/blacklists layered on top of
+# the mostly-static catalogs the rest of this file uses (shader packs,
+# addons, dlssPresets, etc.), fetched live so this port doesn't silently
+# drift as upstream's manifest changes. Not every field here is consumed
+# yet - dxvkBlacklist (anti-cheat titles where DXVK risks a ban) is the
+# safety-relevant one wired in so far; see rhi_manifest()/is_dxvk_blacklisted.
+RHI_MANIFEST_URL = "https://raw.githubusercontent.com/RankFTW/RHI/main/manifest.json"
+
+
+def rhi_manifest() -> dict:
+    """Fetches+caches RHI's manifest.json, 6h cached like every other
+    RHI-port catalog here. Returns {} (not raising) on fetch failure so
+    every consumer degrades to "no override data" rather than breaking -
+    this manifest is a layer of polish/safety data on top of catalogs that
+    otherwise work fine without it."""
+    state = load_state()
+    cache = state.get("rhi_manifest")
+    now = time.time()
+    if cache and now - cache.get("ts", 0) < 21600:
+        return cache["data"]
+    try:
+        data = _fetch_json(RHI_MANIFEST_URL)
+    except Exception:
+        return cache["data"] if cache else {}
+    state["rhi_manifest"] = {"ts": now, "data": data}
+    save_state(state)
+    return data
+
+
+def is_dxvk_blacklisted(game_name) -> bool:
+    """True if this game's exact display name (case-insensitive) is on
+    RHI manifest.json's dxvkBlacklist - titles where DXVK risks an
+    anti-cheat ban. Port of GameInitializationService's blacklistSet.Contains
+    check. Never raises - a manifest fetch failure means "unknown", not
+    "blacklisted", so it doesn't itself block installs it can't verify."""
+    if not game_name:
+        return False
+    try:
+        blacklist = rhi_manifest().get("dxvkBlacklist") or []
+    except Exception:
+        return False
+    return game_name.strip().lower() in {b.strip().lower() for b in blacklist}
 RESHADE_STAGING_DIR = RHI_DATA_DIR / "reshade"
 RESHADE_NORMAL_STAGING_DIR = RHI_DATA_DIR / "reshade-normal"     # No Addons channel
 RESHADE_NIGHTLY_STAGING_DIR = RHI_DATA_DIR / "reshade-nightly"
@@ -2949,6 +3039,62 @@ def list_custom_reshade_files() -> list:
     return sorted(p.name for p in RESHADE_CUSTOM_DIR.glob("*.dll"))
 
 
+def _sha256_file(path) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def check_custom_reshade_updates() -> dict:
+    """Detects when a file in the Custom ReShade folder has changed since
+    it was last hashed (the user dropped in a newer build over the same
+    filename) and redeploys it to every game currently installed from that
+    exact file - matched by rhi_reshade_installs' 'version' field, which
+    for channel=='custom' IS the source filename (see install_reshade /
+    get_staged_reshade_path). No per-game action needed, unlike every other
+    channel here. Port of CustomReShadeHashService.CheckAndRedeploy, minus
+    its Vulkan-layer branch (Vulkan ReShade isn't supported on this port at
+    all - see install_reshade's Vulkan refusal)."""
+    if not RESHADE_CUSTOM_DIR.is_dir():
+        return {"changed": [], "redeployed": 0}
+    current = {f.name: _sha256_file(f) for f in RESHADE_CUSTOM_DIR.glob("*.dll")}
+    state = load_state()
+    first_run = "rhi_custom_reshade_hashes" not in state
+    stored = state.get("rhi_custom_reshade_hashes", {})
+    # The very first check ever just establishes the baseline (matches
+    # upstream's separate EnsureInitialized step) - otherwise every file
+    # that predates this feature would look "changed" the first time this
+    # runs and trigger a pointless (if harmless) redeploy of identical
+    # content to every custom-channel game.
+    changed = set() if first_run else {name for name, h in current.items() if stored.get(name) != h}
+    redeployed = 0
+    if changed:
+        for rec in state.get("rhi_reshade_installs", {}).values():
+            if rec.get("channel") != "custom":
+                continue
+            fname = rec.get("version")
+            if fname not in changed:
+                continue
+            src = RESHADE_CUSTOM_DIR / fname
+            dest = Path(rec["path"])
+            if not src.is_file() or not dest.parent.is_dir():
+                continue
+            try:
+                shutil.copy2(src, dest)
+                redeployed += 1
+            except OSError:
+                pass
+    # Always saved, even on a partial redeploy failure - the files on disk
+    # in the Custom folder ARE the new version regardless of whether every
+    # game got updated, so re-comparing against the old hash next time
+    # would be wrong.
+    state["rhi_custom_reshade_hashes"] = current
+    save_state(state)
+    return {"changed": sorted(changed), "redeployed": redeployed}
+
+
 def _identify_dxgi_file(path) -> str:
     """Is an existing dxgi.dll ours (ReShade/OptiScaler/DXVK), or something
     foreign? Positive evidence only, never guessed from size alone - port
@@ -2989,18 +3135,23 @@ def _identify_dxgi_file(path) -> str:
 
 
 def _backup_foreign_dll(path) -> None:
-    """If an existing dxgi.dll isn't ours, rename it aside instead of
-    overwriting it - port of RHI's BackupForeignDll."""
+    """If an existing DLL at this target isn't ours - not ReShade, and (for
+    a DXVK-managed filename like d3d9.dll/d3d11.dll, which ReShade can also
+    be installed as on DX9/DX8-only games) not DXVK either, since the two
+    coexist there rather than one backing up the other - rename it aside as
+    '.original' instead of overwriting it. Refreshes an existing backup with
+    the current file rather than discarding it: the foreign DLL may have
+    been updated (e.g. a game patch) since the last time this ran, and the
+    old backup would otherwise silently go stale. Port of RHI's
+    BackupForeignDll."""
     path = Path(path)
     if not path.is_file():
         return
-    if _identify_dxgi_file(path) == "reshade":
+    if _identify_dxgi_file(path) in ("reshade", "dxvk"):
         return
     backup = path.with_name(path.name + ".original")
-    if not backup.exists():
-        path.rename(backup)
-    else:
-        path.unlink()
+    backup.unlink(missing_ok=True)
+    path.rename(backup)
 
 
 def _restore_foreign_dll(path) -> None:
@@ -3095,10 +3246,12 @@ def scan_game_reshade(appid, install_path, exe_path=None) -> dict:
 def install_reshade(appid, install_path, exe_override=None, channel="stable",
                     legacy_version=None, custom_filename=None, task_id=None) -> dict:
     """Installs ReShade for one game: detects the exe/graphics API/bitness,
-    always installs as dxgi.dll (matches RHI's actual behavior - ReShade's
-    own runtime auto-hooks the right D3D/GL interface once loaded there;
-    no per-API proxy-name mapping needed), refuses to overwrite a foreign
-    dxgi.dll (backs it up as .original instead)."""
+    and installs under the API-correct filename - dxgi.dll for DX11/12 (the
+    common case), but d3d9.dll/d3d8.dll/opengl32.dll for DX9/DX8/OpenGL-only
+    games, where ReShade never gets a chance to hook via dxgi.dll at all
+    since those games don't load it. Refuses to overwrite a foreign DLL at
+    that target (backs it up as .original instead). Port of RHI's
+    ResolveAutoReShadeFilename + AuxInstallService install flow."""
     if channel not in RESHADE_CHANNELS:
         raise RuntimeError(f"Unknown ReShade channel: {channel}")
     exe = Path(exe_override).expanduser() if exe_override else _find_game_exe(install_path)
@@ -3111,7 +3264,9 @@ def install_reshade(appid, install_path, exe_override=None, channel="stable",
                            "this needs Proton-prefix-specific work, not just a "
                            "file copy. DX9-12 games work normally.")
     bitness = detected["bitness"] or 64
-    target = exe.parent / "dxgi.dll"
+    _, regular, delay = pe_imports(exe)
+    rs_filename = resolve_auto_reshade_filename(_detect_all_graphics_apis(regular, delay))
+    target = exe.parent / rs_filename
 
     src_dll, version = get_staged_reshade_path(
         channel, bitness, legacy_version=legacy_version,
@@ -3146,8 +3301,9 @@ def _install_reshade_task(task_id, appid, install_path, exe, channel="stable",
 
 
 def remove_reshade(appid) -> dict:
-    """Deletes the dxgi.dll ReShade install tracked for this game and
-    restores whatever foreign dxgi.dll it backed up, if any."""
+    """Deletes the ReShade install tracked for this game (whichever
+    API-correct filename it was installed under) and restores whatever
+    foreign DLL it backed up at that target, if any."""
     state = load_state()
     installs = state.get("rhi_reshade_installs", {})
     rec = installs.pop(str(appid), None)
@@ -3240,20 +3396,128 @@ def remove_re_framework(appid) -> dict:
     rec = installs.pop(str(appid), None)
     if not rec:
         raise RuntimeError("No RE Framework install tracked for this game.")
-    Path(rec["path"]).unlink(missing_ok=True)
+    dll_path = Path(rec["path"])
+    backup_path = dll_path.with_name(dll_path.name + PD_UPSCALER_BACKUP_SUFFIX)
+    if rec.get("version") == "PD-Upscaler" and backup_path.is_file():
+        # Removing a PD-Upscaler build directly (not via OptiScaler removal)
+        # must still restore the standard build it replaced, not just
+        # delete and orphan the backup.
+        dll_path.unlink(missing_ok=True)
+        backup_path.rename(dll_path)
+    else:
+        dll_path.unlink(missing_ok=True)
     save_state(state)
     return {"removed": True}
+
+
+PD_UPSCALER_DOWNLOAD_BASE = ("https://nightly.link/praydog/REFramework/"
+                             "workflows/dev-release/pd-upscaler/")
+PD_UPSCALER_BACKUP_SUFFIX = ".rhi_standard_backup"
+
+
+def pd_upscaler_artifact_for_game(game_name) -> str | None:
+    """The PD-Upscaler REFramework build name for this game (e.g. "RE2"),
+    for the small set of RE Engine titles that have a dedicated
+    OptiScaler-compatible REFramework build - from RHI's manifest.json's
+    pdUpscalerGames map. None for every other game."""
+    if not game_name:
+        return None
+    try:
+        games = rhi_manifest().get("pdUpscalerGames") or {}
+    except Exception:
+        return None
+    return games.get(game_name)
+
+
+def install_pd_upscaler_re_framework(appid, install_path, artifact_name, task_id=None) -> dict:
+    """Swaps in the PD-Upscaler build of RE Framework: a special
+    OptiScaler-compatible dinput8.dll build for a small set of RE Engine
+    games (RE2/RE3/RE4/RE7/RE8, per manifest.json's pdUpscalerGames).
+    Backs up the standard dinput8.dll first (a no-op if a backup already
+    exists - matches upstream's overwrite:false first-backup-wins
+    semantics), then installs the pd-upscaler build in its place. The real
+    download is a nested zip: an outer nightly.link wrapper containing an
+    inner {artifact_name}.zip containing dinput8.dll. Port of
+    REFrameworkService.InstallPdUpscalerAsync."""
+    import zipfile, io
+    install_path = Path(install_path)
+    dest_dll = install_path / "dinput8.dll"
+    backup_path = dest_dll.with_name(dest_dll.name + PD_UPSCALER_BACKUP_SUFFIX)
+    url = f"{PD_UPSCALER_DOWNLOAD_BASE}{artifact_name}.zip"
+    outer = _gh_bytes(url, task_id)
+    with zipfile.ZipFile(io.BytesIO(outer)) as outer_zf:
+        inner_name = next((n for n in outer_zf.namelist()
+                           if n.lower() == f"{artifact_name.lower()}.zip"), None)
+        inner_name = inner_name or next((n for n in outer_zf.namelist()
+                                         if n.lower().endswith(".zip")), None)
+        if not inner_name:
+            raise RuntimeError(f"PD-Upscaler download for {artifact_name} had no inner zip "
+                               "(its format may have changed)")
+        inner_bytes = outer_zf.read(inner_name)
+    with zipfile.ZipFile(io.BytesIO(inner_bytes)) as inner_zf:
+        member = next((n for n in inner_zf.namelist()
+                       if n.lower().endswith("dinput8.dll")), None)
+        if not member:
+            raise RuntimeError(f"PD-Upscaler build for {artifact_name} didn't contain "
+                               "dinput8.dll (its format may have changed)")
+        dll_bytes = inner_zf.read(member)
+
+    if dest_dll.is_file() and not backup_path.is_file():
+        shutil.copy2(dest_dll, backup_path)
+    dest_dll.write_bytes(dll_bytes)
+
+    state = load_state()
+    rec = state.setdefault("rhi_reframework_installs", {}).setdefault(str(appid), {})
+    rec.update({"path": str(dest_dll), "version": "PD-Upscaler",
+               "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+    save_state(state)
+    return {"installed": True, "version": "PD-Upscaler"}
+
+
+def restore_standard_re_framework(appid, install_path) -> dict:
+    """Reverses install_pd_upscaler_re_framework: restores the backed-up
+    standard dinput8.dll, if one exists, and un-marks the tracked install's
+    version as PD-Upscaler. Port of
+    REFrameworkService.RestoreStandardREFramework."""
+    install_path = Path(install_path)
+    dest_dll = install_path / "dinput8.dll"
+    backup_path = dest_dll.with_name(dest_dll.name + PD_UPSCALER_BACKUP_SUFFIX)
+    if not backup_path.is_file():
+        return {"restored": False}
+    dest_dll.unlink(missing_ok=True)
+    backup_path.rename(dest_dll)
+    state = load_state()
+    rec = state.get("rhi_reframework_installs", {}).get(str(appid))
+    if rec:
+        try:
+            rec["version"] = re_framework_latest().get("version", "unknown")
+        except Exception:
+            rec["version"] = "unknown"
+        save_state(state)
+    return {"restored": True}
 
 
 def scan_re_framework(appid, install_path) -> dict:
     is_re_engine = is_re_engine_game(install_path)
     state = load_state()
     rec = state.get("rhi_reframework_installs", {}).get(str(appid))
-    result = {"is_re_engine": is_re_engine, "installed": False}
+    result = {"is_re_engine": is_re_engine, "installed": False, "update_available": False}
     if rec:
         p = Path(rec["path"])
         result.update({"installed": p.is_file(), "path": rec["path"],
-                       "version": rec.get("version")})
+                       "version": rec.get("version"),
+                       "pd_upscaler": rec.get("version") == "PD-Upscaler"})
+        # A PD-Upscaler build isn't on the nightly version scheme at all -
+        # comparing it against re_framework_latest() would always show
+        # "update available" (a false positive), and reinstalling standard
+        # RE Framework over it would silently discard the OptiScaler-
+        # compatible build without restoring it properly. No update check
+        # for this case.
+        if p.is_file() and rec.get("version") != "PD-Upscaler":
+            try:
+                result["update_available"] = re_framework_latest()["version"] != rec.get("version")
+            except Exception:
+                pass
     return result
 
 
@@ -3451,12 +3715,87 @@ def _expand_pack_dependencies(pack_ids) -> list:
     return seen
 
 
-def ensure_shader_pack(pack_id, task_id=None) -> list:
+_SHADER_PACK_BRANCH_URL_RE = re.compile(
+    r"^https://github\.com/([^/]+)/([^/]+)/archive/refs/heads/(.+)\.zip$")
+
+
+def _shader_pack_latest_signal(pack, release=None) -> str | None:
+    """A cheap 'has this pack changed upstream' signal: the release tag for
+    a gh_release pack (pass the already-fetched release dict to avoid a
+    second API call when ensure_shader_pack just fetched it), or the latest
+    commit SHA of the tracked branch for a direct_url github
+    archive/refs/heads/<branch>.zip pack (GitHub's commits API returns one
+    small JSON object, not the whole archive - cheap to poll). Returns None
+    when no such signal can be determined (e.g. a non-GitHub direct_url) -
+    meaning "can't check", not "no update"."""
+    if pack["kind"] == "gh_release":
+        try:
+            release = release if release is not None else _gh_json(pack["url"])
+        except Exception:
+            return None
+        return release.get("tag_name") or release.get("published_at")
+    if pack["kind"] == "direct_url":
+        m = _SHADER_PACK_BRANCH_URL_RE.match(pack["url"])
+        if not m:
+            return None
+        owner, repo, branch = m.groups()
+        try:
+            commit = _gh_json(f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}")
+        except Exception:
+            return None
+        return commit.get("sha")
+    return None
+
+
+def check_shader_pack_update(pack_id, force=False) -> bool:
+    """Whether pack_id has a newer version available than what's cached, 6h
+    cached like every other update check in this file - checking on every
+    catalog fetch would burn through GitHub's API rate limit fast across a
+    40+ pack catalog. False (not just "unknown") for a pack that isn't
+    cached yet - nothing to compare against.
+
+    The signal isn't fetched at download time (ensure_shader_pack's normal
+    path stays purely local-disk-check, no extra network call on every
+    install/deploy) - the first time a downloaded pack is checked here, the
+    live signal becomes its baseline and this reports no update yet, since
+    there's nothing to compare that first read against. Later checks then
+    compare against that stored baseline; the baseline only moves forward
+    when the pack is actually re-fetched (ensure_shader_pack(force=True))."""
+    pack = RESHADE_SHADER_PACKS_BY_ID.get(pack_id)
+    if not pack:
+        return False
+    state = load_state()
+    cache = state.get("rhi_shader_packs", {}).get(pack_id)
+    if not cache:
+        return False
+    check_cache = state.setdefault("rhi_shader_pack_update_checks", {})
+    entry = check_cache.get(pack_id)
+    now = time.time()
+    if not force and entry and now - entry.get("ts", 0) < 21600:
+        return entry.get("update_available", False)
+    latest = _shader_pack_latest_signal(pack)
+    baseline = cache.get("signal")
+    if baseline is None:
+        cache["signal"] = latest
+        update_available = False
+    else:
+        update_available = bool(latest and latest != baseline)
+    check_cache[pack_id] = {"ts": now, "update_available": update_available}
+    save_state(state)
+    return update_available
+
+
+def ensure_shader_pack(pack_id, task_id=None, force=False) -> list:
     """Downloads/extracts one shader pack into its own ID-named subfolder of
     the shared staging tree, recording every extracted file's staging-
-    relative path in state (source of truth for later pruning). Skips the
-    download if the recorded files are all still present on disk. Returns
-    the list of staging-relative paths (e.g. "Shaders/Lilium/HDR.fx")."""
+    relative path in state (source of truth for later pruning) plus a
+    version "signal" (see _shader_pack_latest_signal) used by
+    check_shader_pack_update. Skips the download if the recorded files are
+    all still present on disk and force isn't set - force=True (an explicit
+    user-triggered update, not the normal deploy path) always re-fetches
+    and prunes any previously-extracted file the new archive no longer
+    contains, in case files were renamed/removed upstream. Returns the list
+    of staging-relative paths (e.g. "Shaders/Lilium/HDR.fx")."""
     import zipfile, io
     pack = RESHADE_SHADER_PACKS_BY_ID.get(pack_id)
     if not pack:
@@ -3464,13 +3803,15 @@ def ensure_shader_pack(pack_id, task_id=None) -> list:
     state = load_state()
     cache = state.setdefault("rhi_shader_packs", {})
     entry = cache.get(pack_id)
-    if entry and entry.get("files"):
+    if not force and entry and entry.get("files"):
         if all((RHI_DATA_DIR / "shaders" / f).is_file() for f in entry["files"]):
             return entry["files"]
+    previous_files = set(entry["files"]) if entry and entry.get("files") else set()
 
     if task_id:
         TASKS[task_id] = {"status": "running", "progress": 10,
                           "detail": f"Downloading {pack['name']}"}
+    release = None
     if pack["kind"] == "gh_release":
         release = _gh_json(pack["url"])
         asset = next((a for a in release.get("assets", [])
@@ -3563,8 +3904,34 @@ def ensure_shader_pack(pack_id, task_id=None) -> list:
     if not files:
         raise RuntimeError(f"{pack['name']}'s archive didn't contain any usable "
                            "shader files (its layout may have changed)")
+    # Prune anything the PREVIOUS extraction staged that this one didn't -
+    # only reachable on a forced update (previous_files is empty otherwise),
+    # since a renamed/removed upstream file would otherwise linger in the
+    # shared staging tree (and in turn stay deployed to every game using it)
+    # forever.
+    for stale in previous_files - set(files):
+        (RHI_DATA_DIR / "shaders" / stale).unlink(missing_ok=True)
+    # gh_release packs get their signal for free (release was already
+    # fetched above to find the download asset) either way. direct_url
+    # packs only pay for the extra commits-API call on a forced update -
+    # the normal download path leaves signal unset and lets
+    # check_shader_pack_update establish it lazily on first check, so
+    # installing/deploying a pack never makes an extra network call beyond
+    # what downloading it already needed.
+    signal = (_shader_pack_latest_signal(pack, release=release)
+             if force or pack["kind"] == "gh_release" else None)
     cache[pack_id] = {"files": files, "fetched_at": time.strftime(
-        "%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "signal": signal}
+    if signal is not None:
+        # A real baseline was just established (or re-established, on a
+        # forced update) - record "no update pending" so
+        # check_shader_pack_update doesn't immediately re-fetch it and
+        # treat this fresh baseline as itself being "newer than itself".
+        # When signal is None (the common direct_url non-force case), leave
+        # no entry here at all - check_shader_pack_update's own lazy-
+        # baseline path handles that case on first real check.
+        state.setdefault("rhi_shader_pack_update_checks", {})[pack_id] = {
+            "ts": time.time(), "update_available": False}
     save_state(state)
     if task_id:
         TASKS[task_id] = {"status": "done", "progress": 100,
@@ -3577,7 +3944,8 @@ def get_shader_pack_catalog() -> list:
     cache = state.get("rhi_shader_packs", {})
     return [{"id": p["id"], "name": p["name"], "category": p["category"],
             "description": p["description"], "requires": p.get("requires") or [],
-            "cached": p["id"] in cache}
+            "cached": p["id"] in cache,
+            "update_available": check_shader_pack_update(p["id"]) if p["id"] in cache else False}
            for p in RESHADE_SHADER_PACKS]
 
 
@@ -3697,6 +4065,109 @@ def _deploy_shader_packs_task(task_id, install_path, pack_ids) -> None:
         TASKS[task_id] = {"status": "done", "progress": 100,
                           "detail": f"{result['deployed']} files deployed",
                           "result": result}
+    except Exception as e:
+        TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
+
+
+def _update_shader_pack_task(task_id, pack_id) -> None:
+    """Re-fetches one shader pack's staging copy (force=True), updating
+    whichever games already have it deployed the next time they're
+    re-deployed via the existing 'Deploy selected' flow - deploy_shader_packs
+    already re-copies any staged file whose size changed, so this doesn't
+    need to push into every game itself."""
+    try:
+        files = ensure_shader_pack(pack_id, task_id=task_id, force=True)
+        TASKS[task_id] = {"status": "done", "progress": 100,
+                          "detail": f"Updated: {len(files)} files",
+                          "result": {"files": len(files)}}
+    except Exception as e:
+        TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
+
+
+def _extract_fx_files(techniques_value) -> set:
+    """Parses one ReShade preset 'Techniques=' value: comma-separated
+    entries of the form 'TechniqueName@file.fx', extracting the deduped
+    set of .fx filenames after each '@'. Port of
+    TechniquesParser.ExtractFxFiles."""
+    files = set()
+    for entry in (techniques_value or "").split(","):
+        entry = entry.strip()
+        if "@" not in entry:
+            continue
+        fx = entry.split("@", 1)[1].strip()
+        if fx:
+            files.add(fx)
+    return files
+
+
+def _extract_fx_files_from_preset(preset_text) -> set:
+    """Scans every 'Techniques=' line in a whole preset .ini's content (a
+    preset can carry more than one - PCC doesn't need to care why) and
+    unions the required .fx files across all of them."""
+    files = set()
+    for line in (preset_text or "").splitlines():
+        stripped = line.strip()
+        low = stripped.lower()
+        if low.startswith("techniques=") or low.startswith("techniques ="):
+            _, _, value = stripped.partition("=")
+            files |= _extract_fx_files(value)
+    return files
+
+
+def resolve_preset_shader_packs(fx_files, task_id=None) -> dict:
+    """Ensures every catalog pack is downloaded (needed to know which pack
+    owns which .fx file - port of upstream's own "download packs missing a
+    file list" step; a pack failing to download just can't be matched
+    against, doesn't block resolving against the rest), then matches each
+    required .fx filename (by basename, case-insensitive) against every
+    pack's recorded file list. Port of ShaderResolver.Resolve."""
+    for pack in RESHADE_SHADER_PACKS:
+        try:
+            ensure_shader_pack(pack["id"], task_id=task_id)
+        except Exception:
+            pass
+    state = load_state()
+    pack_files = state.get("rhi_shader_packs", {})
+    fx_files_lower = {fx.lower() for fx in fx_files}
+    matched = set()
+    resolved_lower = set()
+    for pack_id, entry in pack_files.items():
+        names = {Path(f).name.lower() for f in entry.get("files", [])}
+        hit = names & fx_files_lower
+        if hit:
+            matched.add(pack_id)
+            resolved_lower |= hit
+    unresolved = {fx for fx in fx_files if fx.lower() not in resolved_lower}
+    return {"matched": sorted(matched), "unresolved": sorted(unresolved)}
+
+
+def apply_preset_shader_packs(appid, install_path, preset_text, task_id=None) -> dict:
+    """Full pipeline for one dropped ReShade preset: extract required .fx
+    files, resolve+download the packs that provide them, union with this
+    game's existing selection (dependency expansion happens inside
+    deploy_shader_packs itself, same as manual selection), persist, and
+    deploy. Port of MainViewModel.ApplyPresetShadersAsync."""
+    fx_files = _extract_fx_files_from_preset(preset_text)
+    if not fx_files:
+        return {"matched": [], "unresolved": [], "deployed": 0}
+    resolved = resolve_preset_shader_packs(fx_files, task_id=task_id)
+    if not resolved["matched"]:
+        return {**resolved, "deployed": 0}
+    existing = set(get_game_shader_selection(appid))
+    merged = sorted(existing | set(resolved["matched"]))
+    set_game_shader_selection(appid, merged)
+    deploy_result = deploy_shader_packs(install_path, merged, task_id=task_id)
+    return {"matched": resolved["matched"], "unresolved": resolved["unresolved"],
+           "deployed": deploy_result["deployed"]}
+
+
+def _apply_preset_shader_packs_task(task_id, appid, install_path, preset_text) -> None:
+    try:
+        result = apply_preset_shader_packs(appid, install_path, preset_text, task_id=task_id)
+        detail = (f"{len(result['matched'])} pack(s) applied, {result['deployed']} files deployed"
+                  + (f" - {len(result['unresolved'])} shader(s) not found in any pack"
+                     if result["unresolved"] else ""))
+        TASKS[task_id] = {"status": "done", "progress": 100, "detail": detail, "result": result}
     except Exception as e:
         TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
 
@@ -3898,6 +4369,56 @@ def download_streamline_sdk(task_id) -> None:
         TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
 
 
+STREAMLINE_GAME_SUBDIR = "OptiScaler/Streamline"
+
+
+def deploy_streamline_to_game(install_path, version=None) -> dict:
+    """Copies every .dll from one cached Streamline SDK version subfolder
+    into <install_path>/OptiScaler/Streamline/ - the interposer+plugin
+    bundle OptiScaler's FrameGen chainloads from there when FGOutput=dlssg
+    is selected. Plain overwrite copy, no .original backups (these are
+    RHI-managed files, not game originals - matches upstream exactly).
+    Falls back to the newest cached version if the requested one isn't
+    available. Port of OptiScalerService.DeployStreamlineToGame."""
+    library = streamline_sdk_library()
+    if not library:
+        raise RuntimeError("No Streamline SDK cached yet - download one from the "
+                           "OptiScaler section first.")
+    entry = next((e for e in library if e["version"] == version), None) if version else None
+    entry = entry or library[0]   # streamline_sdk_library() sorts newest first
+    src_dir = Path(entry["path"])
+    dest_dir = Path(install_path) / STREAMLINE_GAME_SUBDIR
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for f in src_dir.glob("*.dll"):
+        shutil.copy2(f, dest_dir / f.name)
+        copied += 1
+    return {"deployed": copied, "version": entry["version"], "path": str(dest_dir)}
+
+
+def remove_streamline_from_game(install_path) -> dict:
+    """Deletes <install_path>/OptiScaler/Streamline/ entirely. Port of
+    OptiScalerService.RemoveStreamlineFromGame. (remove_optiscaler() already
+    rmtree's the whole OptiScaler/ subfolder on OptiScaler removal, which
+    takes this with it - this is for toggling Streamline off on its own,
+    independent of removing OptiScaler itself.)"""
+    dest_dir = Path(install_path) / STREAMLINE_GAME_SUBDIR
+    removed = dest_dir.is_dir()
+    if removed:
+        shutil.rmtree(dest_dir)
+    return {"removed": removed}
+
+
+def scan_streamline_for_game(install_path) -> dict:
+    """Whether a Streamline bundle is currently deployed for this game (any
+    .dll present in its OptiScaler/Streamline/ folder), plus the cached SDK
+    library so the UI can offer a version picker."""
+    dest_dir = Path(install_path) / STREAMLINE_GAME_SUBDIR
+    deployed_files = sorted(f.name for f in dest_dir.glob("*.dll")) if dest_dir.is_dir() else []
+    return {"deployed": bool(deployed_files), "files": deployed_files,
+           "library": streamline_sdk_library()}
+
+
 def ensure_dlssnr_cached() -> Path | None:
     """Downloads+caches the latest nvngx_dlssnr.dll from RHI's own curated
     manifest - the required companion for the RenoDX DLSS5 addon."""
@@ -3981,28 +4502,40 @@ def _slugify_addon_name(name) -> str:
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
+_ADDONS_INI_EXCLUDED_SECTIONS = {"00", "21", "26"}
+
+
 def _parse_addons_ini(content) -> list:
     """Parses ReShade's Addons.ini format: blank-line-separated blocks, each
     starting with `[NN]` (active) or `# [NN]`/`;[NN]` (disabled - skipped),
-    followed by `Key=Value` lines. Port of RHI's AddonsIniParser."""
+    followed by `Key=Value` lines. Sections whose id is in
+    _ADDONS_INI_EXCLUDED_SECTIONS are skipped too, regardless of
+    commented-out status - they're managed by RHI itself or not applicable
+    (e.g. "00" is crosire's swapchain-override addon, which duplicates what
+    RHI's own DXVK/OptiScaler coexistence logic already handles). Port of
+    RHI's AddonsIniParser.ExcludedSections."""
     addons = []
     current = None
+    excluded = False
     for raw in content.splitlines():
         line = raw.strip()
         if not line:
-            if current and current.get("PackageName"):
+            if current and current.get("PackageName") and not excluded:
                 addons.append(current)
             current = None
+            excluded = False
             continue
         if line.startswith("#") or line.startswith(";"):
             continue   # disabled section or comment
         if line.startswith("[") and line.endswith("]"):
+            section_id = line[1:-1].strip()
+            excluded = section_id in _ADDONS_INI_EXCLUDED_SECTIONS
             current = {}
             continue
         if current is not None and "=" in line:
             key, _, value = line.partition("=")
             current[key.strip()] = value.strip()
-    if current and current.get("PackageName"):
+    if current and current.get("PackageName") and not excluded:
         addons.append(current)
     return addons
 
@@ -4048,6 +4581,28 @@ def reshade_addons_catalog() -> list:
             "zip_member": RENODX_DLSS5_ADDON_FILE,
             "repository_url": "https://github.com/RankFTW/rhi-repo",
         })
+    # RenoDX DevKit + DLSS Fix: hardcoded, non-versioned "snapshot" release
+    # assets RHI injects into its catalog alongside the Addons.ini entries
+    # (AddonPackService.cs's RenoDxDevKitEntry/DlssFixEntry) rather than
+    # sourcing them from Addons.ini. DLSS Fix has no 32-bit build upstream.
+    data.append({
+        "id": "renodx-devkit", "name": "RenoDX DevKit",
+        "description": "RenoDX development tools addon for ReShade.",
+        "download_url32": "https://github.com/clshortfuse/renodx/releases/"
+                          "download/snapshot/renodx-devkit.addon32",
+        "download_url64": "https://github.com/clshortfuse/renodx/releases/"
+                          "download/snapshot/renodx-devkit.addon64",
+        "repository_url": "https://github.com/clshortfuse/renodx",
+    })
+    data.append({
+        "id": "renodx-dlssfix", "name": "DLSS Fix",
+        "description": "Makes ReShade draw on native game frames instead of frame gen "
+                       "frames. Also hides DLSS upscaling from ReShade.",
+        "download_url32": None,
+        "download_url64": "https://github.com/clshortfuse/renodx/releases/"
+                          "download/snapshot/renodx-dlssfix.addon64",
+        "repository_url": "https://github.com/clshortfuse/renodx/wiki/Mods#unreal-engine-",
+    })
     state["reshade_addons_catalog"] = {"ts": now, "data": data}
     save_state(state)
     return data
@@ -4653,16 +5208,15 @@ def ensure_optipatcher_staged(task_id=None) -> Path:
 
 def _resolve_reshade_reclaim_name(rs_rec, optiscaler_rec) -> str:
     """Which filename ReShade should go back to once OptiScaler is removed
-    - simplified port of ResolveReShadeFilename (Coexist.cs:14-43): pcc.py
-    has no DLL-override service, so this falls back straight to the
-    detected graphics API, defaulting to dxgi.dll."""
+    - same API-correct resolution install_reshade uses (pcc.py has no
+    DLL-override service, so unlike RHI's ResolveReShadeFilename this can't
+    consult a user override first, but otherwise matches it exactly).
+    Simplified port of Coexist.cs:14-43."""
     exe = rs_rec.get("exe") or optiscaler_rec.get("exe")
-    api = detect_game_graphics_api(exe)["api"] if exe else None
-    if api == "d3d9":
-        return "d3d9.dll"
-    if api == "opengl":
-        return "opengl32.dll"
-    return "dxgi.dll"
+    if not exe:
+        return "dxgi.dll"
+    _, regular, delay = pe_imports(exe)
+    return resolve_auto_reshade_filename(_detect_all_graphics_apis(regular, delay))
 
 
 def scan_game_optiscaler(appid, install_path, exe_path=None) -> dict:
@@ -4697,12 +5251,16 @@ def scan_game_optiscaler(appid, install_path, exe_path=None) -> dict:
 
 def install_optiscaler(appid, install_path, exe_override=None, gpu_type=None,
                        dlss_inputs=True, variant="stable", hotkey=None,
-                       task_id=None) -> dict:
+                       task_id=None, game_name=None) -> dict:
     """Installs OptiScaler for one game: resolves the effective DLL name
     from the detected graphics API (dxgi.dll, or winmm.dll for Vulkan),
     renames an already-installed ReShade out of the way first if its
     filename would otherwise collide, deploys the staged release + INI +
-    any cached DLSS DLLs, and (for AMD/Intel) OptiPatcher."""
+    any cached DLSS DLLs, and (for AMD/Intel) OptiPatcher. For the handful
+    of RE Engine games with a dedicated OptiScaler-compatible REFramework
+    build (manifest.json's pdUpscalerGames), also swaps that in over an
+    already-installed standard REFramework - non-fatal on failure, since
+    OptiScaler itself is already successfully installed by that point."""
     nightly = variant == "nightly"
     exe = Path(exe_override).expanduser() if exe_override else _find_game_exe(install_path)
     if not exe or not exe.is_file():
@@ -4743,7 +5301,13 @@ def install_optiscaler(appid, install_path, exe_override=None, gpu_type=None,
     # BEFORE the deploy loop below, so the plain _backup_original_if_exists
     # step never mistakes DXVK's own file for a game original (it doesn't
     # do identity checks - it backs up whatever is already there). Port of
-    # the reverse direction of Part 3's _resolve_dxvk_dll_targets.
+    # the reverse direction of Part 3's _resolve_dxvk_dll_targets. Confirms
+    # the file at that path is STILL actually DXVK (IsDxvkFileStatic-style
+    # content check, port of DxvkService.IsDxvkFileStatic) before relocating
+    # it - the state record could be stale (e.g. the user manually swapped
+    # in a different DLL, or a previous operation left it inconsistent), and
+    # relocating an untracked/foreign file into OptiScaler/plugins/ would
+    # both lose it from its expected location and wrongly mark it as DXVK's.
     dxvk_rec = state.get("rhi_dxvk_installs", {}).get(str(appid))
     if dxvk_rec and Path(dxvk_rec["install_path"]) == target_dir:
         installed_dlls = list(dxvk_rec.get("installed_dlls", []))
@@ -4753,7 +5317,7 @@ def install_optiscaler(appid, install_path, exe_override=None, gpu_type=None,
             plugins_dir.mkdir(parents=True, exist_ok=True)
             for dll in conflicting:
                 src = target_dir / dll
-                if src.is_file():
+                if src.is_file() and _is_dxvk_file(src):
                     dest = plugins_dir / dll
                     dest.unlink(missing_ok=True)
                     src.rename(dest)
@@ -4848,20 +5412,37 @@ def install_optiscaler(appid, install_path, exe_override=None, gpu_type=None,
             if task_id and task_id in TASKS:
                 TASKS[task_id]["detail"] = f"OptiPatcher deploy skipped: {e}"
 
+    # PD-Upscaler REFramework swap - see docstring. Only when standard
+    # REFramework is already installed here (a dinput8.dll exists) - this
+    # never installs REFramework on its own, only swaps an existing one.
+    pd_upscaler_installed = False
+    if game_name and (target_dir / "dinput8.dll").is_file():
+        artifact = pd_upscaler_artifact_for_game(game_name)
+        if artifact:
+            try:
+                if task_id and task_id in TASKS:
+                    TASKS[task_id]["detail"] = "Installing PD-Upscaler REFramework"
+                install_pd_upscaler_re_framework(appid, target_dir, artifact, task_id=task_id)
+                pd_upscaler_installed = True
+            except Exception as e:
+                if task_id and task_id in TASKS:
+                    TASKS[task_id]["detail"] = f"PD-Upscaler REFramework skipped: {e}"
+
     if task_id:
         TASKS[task_id] = {"status": "done", "progress": 100,
                           "detail": f"Installed OptiScaler {version}",
                           "result": {"version": version, "installed_as": effective_dll_name}}
     return {"installed": True, "installed_as": effective_dll_name, "version": version,
-            "api": detected["api"], "gpu_type": gpu_type}
+            "api": detected["api"], "gpu_type": gpu_type,
+            "pd_upscaler_installed": pd_upscaler_installed}
 
 
 def _install_optiscaler_task(task_id, appid, install_path, exe, gpu_type,
-                             dlss_inputs, variant, hotkey) -> None:
+                             dlss_inputs, variant, hotkey, game_name=None) -> None:
     try:
         install_optiscaler(appid, install_path, exe_override=exe, gpu_type=gpu_type,
                            dlss_inputs=dlss_inputs, variant=variant, hotkey=hotkey,
-                           task_id=task_id)
+                           task_id=task_id, game_name=game_name)
     except Exception as e:
         TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
 
@@ -4880,6 +5461,21 @@ def remove_optiscaler(appid) -> dict:
         raise RuntimeError("No OptiScaler install tracked for this game.")
     target_dir = Path(rec["install_path"])
     installed_dll = rec["installed_as"]
+
+    # Restore standard REFramework first if PD-Upscaler was swapped in for
+    # this game - matches RHI's own ordering (UninstallOptiScaler does this
+    # before touching OptiScaler's own files). restore_standard_re_framework
+    # persists its own change independently, so its result is folded back
+    # into THIS function's `state` (rather than reassigning `state`
+    # wholesale) - the save_state(state) at the end of this function is a
+    # full-dict overwrite that would otherwise clobber it with a stale copy,
+    # along with silently undoing the installs.pop() a few lines up.
+    ref_rec = state.get("rhi_reframework_installs", {}).get(str(appid))
+    if ref_rec and ref_rec.get("version") == "PD-Upscaler":
+        restore_standard_re_framework(appid, target_dir)
+        fresh_ref = load_state().get("rhi_reframework_installs", {}).get(str(appid))
+        if fresh_ref:
+            state.setdefault("rhi_reframework_installs", {})[str(appid)] = fresh_ref
 
     rs_rec = state.get("rhi_reshade_installs", {}).get(str(appid))
     rs_reclaim_name = None
@@ -5558,10 +6154,11 @@ def _resolve_dxvk_dll_targets(required_dlls, install_path) -> tuple:
     return root_dlls, plugin_dlls
 
 
-def scan_game_dxvk(appid, install_path, exe_path=None) -> dict:
+def scan_game_dxvk(appid, install_path, exe_path=None, game_name=None) -> dict:
     """DXVK status for one game - detected graphics API (reused from Part
-    1a), whatever PCC has on record, and whether a newer release is staged
-    than what's installed."""
+    1a), whatever PCC has on record, whether a newer release is staged than
+    what's installed, and whether this game is on the anti-cheat DXVK
+    blacklist (so the UI can warn/disable before the user even tries)."""
     state = load_state()
     rec = state.get("rhi_dxvk_installs", {}).get(str(appid))
     if not exe_path and rec and rec.get("exe"):
@@ -5572,7 +6169,8 @@ def scan_game_dxvk(appid, install_path, exe_path=None) -> dict:
     result = {"exe": str(exe) if exe else None, "detected_api": detected["api"],
              "detected_api_display": display["label"], "detected_api_inferred": display["inferred"],
              "detected_bitness": detected["bitness"], "installed": False,
-             "update_available": False}
+             "update_available": False,
+             "blacklisted": is_dxvk_blacklisted(game_name)}
     if rec:
         p = Path(rec["install_path"])
         installed = all((p / dll).is_file() or (p / "OptiScaler" / "plugins" / dll).is_file()
@@ -5589,14 +6187,22 @@ def scan_game_dxvk(appid, install_path, exe_path=None) -> dict:
 
 
 def install_dxvk(appid, install_path, variant, exe_override=None, lilium_preset=0,
-                 task_id=None) -> dict:
+                 task_id=None, game_name=None) -> dict:
     """Installs DXVK for one game: resolves the required DLLs from the
     detected graphics API, routes any DLL that collides with an installed
     OptiScaler's filename to OptiScaler/plugins/, renames a same-directory
     ReShade out of the way first if it would otherwise collide, deploys
-    the staged build + dxvk.conf."""
+    the staged build + dxvk.conf. Refuses outright (no override) for a game
+    on manifest.json's dxvkBlacklist - titles with anti-cheat software that
+    can flag or ban DXVK's presence, matching RHI's own toggle-disable
+    behavior for these games (GameCardViewModel.Dxvk.cs's IsDxvkBlacklisted)."""
     if variant not in DXVK_VARIANTS:
         raise RuntimeError(f"Unknown DXVK variant: {variant}")
+    if is_dxvk_blacklisted(game_name):
+        raise RuntimeError(
+            f"DXVK is blocked for {game_name} - this game's anti-cheat software "
+            "can flag or ban players for DXVK's presence, even unused. This isn't "
+            "overridable from here.")
     exe = Path(exe_override).expanduser() if exe_override else _find_game_exe(install_path)
     if not exe or not exe.is_file():
         raise RuntimeError("Couldn't find the game's .exe under its install folder — "
@@ -5618,7 +6224,16 @@ def install_dxvk(appid, install_path, variant, exe_override=None, lilium_preset=
     root_dlls, plugin_dlls = _resolve_dxvk_dll_targets(required_dlls, str(target_dir))
 
     # ReShade coexistence - same directory-scoped rename pattern as
-    # Part 2's OptiScaler+ReShade fix, not RHI's Vulkan-layer switch.
+    # Part 2's OptiScaler+ReShade fix, not RHI's Vulkan-layer switch (that
+    # needs a global Windows Vulkan implicit-layer registration, which has
+    # no Wine/Proton equivalent - see OPTISCALER_DLSS_MANIFEST_URL area for
+    # the coexistence design notes). Renaming ReShade to ReShade64.dll only
+    # actually keeps it working if something in this same folder chainloads
+    # that filename - today that's OptiScaler alone (see
+    # _resolve_reshade_reclaim_name's docstring). Without OptiScaler
+    # present, renaming would silently orphan a working ReShade install
+    # (nothing loads ReShade64.dll), so this refuses instead - install
+    # OptiScaler too (which DOES chainload it), or remove ReShade first.
     state = load_state()
     rs_rec = state.get("rhi_reshade_installs", {}).get(str(appid))
     reshade_renamed = False
@@ -5627,6 +6242,16 @@ def install_dxvk(appid, install_path, variant, exe_override=None, lilium_preset=
         if (rs_path.is_file() and rs_path.parent == target_dir
                 and rs_path.name.lower() in {d.lower() for d in root_dlls}
                 and rs_path.name.lower() != "reshade64.dll"):
+            os_rec = state.get("rhi_optiscaler_installs", {}).get(str(appid))
+            os_installed = bool(os_rec and Path(os_rec.get("install_path", "")) == target_dir
+                                and (target_dir / os_rec.get("installed_as", "")).is_file())
+            if not os_installed:
+                raise RuntimeError(
+                    f"DXVK needs {rs_path.name} for this game, which is where ReShade is "
+                    "currently installed. Nothing would load ReShade if it got renamed "
+                    "aside here (that only works when OptiScaler is also installed, since "
+                    "OptiScaler is what chainloads a renamed ReShade64.dll) - install "
+                    "OptiScaler for this game first, or remove ReShade, then retry.")
             rs_dest = target_dir / "ReShade64.dll"
             if rs_dest.exists():
                 rs_dest.unlink()
@@ -5684,10 +6309,11 @@ def install_dxvk(appid, install_path, variant, exe_override=None, lilium_preset=
             "installed_dlls": root_dlls, "plugin_dlls": plugin_dlls}
 
 
-def _install_dxvk_task(task_id, appid, install_path, variant, exe, lilium_preset) -> None:
+def _install_dxvk_task(task_id, appid, install_path, variant, exe, lilium_preset,
+                       game_name=None) -> None:
     try:
         install_dxvk(appid, install_path, variant, exe_override=exe,
-                    lilium_preset=lilium_preset, task_id=task_id)
+                    lilium_preset=lilium_preset, task_id=task_id, game_name=game_name)
     except Exception as e:
         TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
 
@@ -5793,6 +6419,23 @@ def _update_dxvk_task(task_id, appid) -> None:
         update_dxvk(appid, task_id=task_id)
     except Exception as e:
         TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
+
+
+def reset_dxvk_conf(appid) -> dict:
+    """Rewrites dxvk.conf back to PCC's default template for this game's
+    tracked variant/API/preset, discarding any manual edits - the same
+    content update_dxvk() would write, without re-downloading or
+    redeploying any DLLs."""
+    state = load_state()
+    rec = state.get("rhi_dxvk_installs", {}).get(str(appid))
+    if not rec:
+        raise RuntimeError("No DXVK install tracked for this game.")
+    target_dir = Path(rec["install_path"])
+    variant = rec.get("variant", "stable")
+    conf_content = (get_dxvk_lilium_conf(rec.get("api"), rec.get("lilium_preset") or 0)
+                    if variant == "lilium" else DXVK_DEFAULT_CONF)
+    (target_dir / "dxvk.conf").write_text(conf_content)
+    return {"reset": True}
 
 
 # --------------------------------------------------------------------------
@@ -6254,6 +6897,47 @@ def compute_shortcut_id(exe: str, appname: str):
     return top32, signed
 
 
+def _dir_size_bytes(path, max_files=200_000) -> int:
+    """Total size of every file under path. Steam tracks SizeOnDisk itself
+    for real games (just a VDF field read, no disk I/O) - a non-Steam
+    shortcut has no such record since Steam didn't install it, so this has
+    to actually walk the folder. Capped at max_files entries as a sanity
+    bound against a pathological tree (network mount, symlink loop, etc.) -
+    returns whatever's been summed so far rather than hanging indefinitely."""
+    total = 0
+    count = 0
+    try:
+        for entry in Path(path).rglob("*"):
+            if entry.is_file():
+                try:
+                    total += entry.stat().st_size
+                except OSError:
+                    pass
+                count += 1
+                if count >= max_files:
+                    break
+    except OSError:
+        pass
+    return total
+
+
+def _shortcut_size_bytes(appid, start_dir) -> int:
+    """Cached (1h) on-disk size for a non-Steam shortcut's install folder -
+    walking a whole game folder on every /api/games poll would be far too
+    slow for a large library, so this is recomputed at most hourly per
+    appid rather than on every call."""
+    state = load_state()
+    cache = state.setdefault("shortcut_size_cache", {})
+    entry = cache.get(str(appid))
+    now = time.time()
+    if entry and now - entry.get("ts", 0) < 3600:
+        return entry.get("size", 0)
+    size = _dir_size_bytes(start_dir)
+    cache[str(appid)] = {"ts": now, "size": size}
+    save_state(state)
+    return size
+
+
 def list_shortcuts(root: Path) -> list:
     """Every non-Steam shortcut Steam knows about, already in Command
     Center's game shape (appid/name/install_path/library/...) so it merges
@@ -6282,7 +6966,7 @@ def list_shortcuts(root: Path) -> list:
             "installed": True,
             "fully_installed": True,
             "download_pct": None,
-            "size_bytes": 0,
+            "size_bytes": _shortcut_size_bytes(top32, start_dir),
             "library": str(root / "steamapps"),
             "custom": True,
             "exe": exe_unquoted,
@@ -7081,6 +7765,15 @@ class Handler(BaseHTTPRequestHandler):
                     ultraplus_cat = ultraplus_catalog()
                 except Exception:
                     ultraplus_cat = {"games": {}}  # offline/CDN hiccup - just skip the tag
+                # RHI (ReShade/OptiScaler/DXVK/RE Framework) install records
+                # are already tracked per-appid on install/remove, so "has
+                # RHI" needs no live scan or separate "seen" cache like
+                # Ultra+'s - just membership in any of these state dicts.
+                rhi_installed_appids = (set(state.get("rhi_reshade_installs", {}))
+                                        | set(state.get("rhi_optiscaler_installs", {}))
+                                        | set(state.get("rhi_dxvk_installs", {}))
+                                        | set(state.get("rhi_reframework_installs", {})))
+                rhi_supported_seen = state.get("rhi_supported_seen", {})
                 for g in games:
                     # Shortcuts carry their own LaunchOptions field (surfaced by
                     # list_shortcuts as launch_options_shortcut) rather than living
@@ -7093,6 +7786,8 @@ class Handler(BaseHTTPRequestHandler):
                     match = match_ultraplus_catalog(g["name"], ultraplus_cat)
                     g["ultraplus_supported"] = match is not None
                     g["ultraplus_url"] = match[1]["url"] if match else ""
+                    g["has_rhi"] = g["appid"] in rhi_installed_appids
+                    g["rhi_supported"] = bool(rhi_supported_seen.get(g["appid"]))
                 self._json({"games": games})
             elif m := re.match(r"^/api/game/(\d+)/launch_options$", self.path):
                 self._json(get_launch_options(root, m.group(1)))
@@ -7163,7 +7858,19 @@ class Handler(BaseHTTPRequestHandler):
                 g = games.get(m.group(1))
                 if not g:
                     self._json({"error": "unknown appid"}, 404); return
-                self._json(scan_game_reshade(m.group(1), g["install_path"]))
+                result = scan_game_reshade(m.group(1), g["install_path"])
+                # A detectable graphics API means ReShade/OptiScaler/DXVK
+                # could work here - same "supported" signal all three RHI
+                # subsystems key off of. Detecting this for real needs a
+                # directory walk + PE scan (_find_game_exe), too slow to do
+                # for every game on every /api/games poll, so it's recorded
+                # here as a side effect of the per-game scan already run
+                # when the user opens this game's RHI tab - same lazily-
+                # populated "_seen" cache shape as dlss_seen/ultraplus_seen.
+                state = load_state()
+                state.setdefault("rhi_supported_seen", {})[m.group(1)] = bool(result.get("detected_api"))
+                save_state(state)
+                self._json(result)
             elif m := re.match(r"^/api/game/(\d+)/rhi/builds$", self.path):
                 games = {g["appid"]: g for g in all_games(root)}
                 g = games.get(m.group(1))
@@ -7195,7 +7902,7 @@ class Handler(BaseHTTPRequestHandler):
                 g = games.get(m.group(1))
                 if not g:
                     self._json({"error": "unknown appid"}, 404); return
-                self._json(scan_game_dxvk(m.group(1), g["install_path"]))
+                self._json(scan_game_dxvk(m.group(1), g["install_path"], game_name=g["name"]))
             elif self.path == "/api/progress":
                 self._json({"games": install_progress(root)})
             elif self.path == "/api/owned_games":
@@ -7237,6 +7944,12 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/streamline/latest":
                 self._json({"latest": streamline_sdk_latest(),
                             "cached": streamline_sdk_library()})
+            elif m := re.match(r"^/api/game/(\d+)/rhi/streamline$", self.path):
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(m.group(1))
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                self._json(scan_streamline_for_game(g["install_path"]))
             elif m := re.match(r"^/api/art_debug/(\d+)(?:\?(.*))?$", self.path):
                 qs = urllib.parse.parse_qs(m.group(2) or "")
                 gname = (qs.get("name") or [None])[0]
@@ -7411,6 +8124,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"task": tid})
             elif self.path == "/api/rhi/refwork/remove":
                 self._json(remove_re_framework(body["appid"]))
+            elif self.path == "/api/rhi/reshade/check_custom_updates":
+                self._json(check_custom_reshade_updates())
             elif self.path == "/api/rhi/shaders/deploy":
                 appid = body["appid"]
                 games = {g["appid"]: g for g in all_games(root)}
@@ -7424,6 +8139,27 @@ class Handler(BaseHTTPRequestHandler):
                 TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
                 threading.Thread(target=_deploy_shader_packs_task,
                                  args=(tid, target_dir, pack_ids),
+                                 daemon=True).start()
+                self._json({"task": tid})
+            elif self.path == "/api/rhi/shader_packs/update":
+                pack_id = body["pack_id"]
+                tid = str(uuid.uuid4())
+                TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
+                threading.Thread(target=_update_shader_pack_task,
+                                 args=(tid, pack_id), daemon=True).start()
+                self._json({"task": tid})
+            elif self.path == "/api/rhi/shaders/apply_preset":
+                appid = body["appid"]
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(appid)
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                preset_text = body.get("preset_text", "")
+                target_dir = str(resolve_rhi_target_dir(appid, g["install_path"]))
+                tid = str(uuid.uuid4())
+                TASKS[tid] = {"status": "running", "progress": 0, "detail": "Reading preset"}
+                threading.Thread(target=_apply_preset_shader_packs_task,
+                                 args=(tid, appid, target_dir, preset_text),
                                  daemon=True).start()
                 self._json({"task": tid})
             elif self.path == "/api/rhi/shaders/remove":
@@ -7472,7 +8208,8 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=_install_optiscaler_task,
                                  args=(tid, appid, g["install_path"], body.get("exe"),
                                        body.get("gpu_type"), body.get("dlss_inputs", True),
-                                       body.get("variant", "stable"), body.get("hotkey")),
+                                       body.get("variant", "stable"), body.get("hotkey"),
+                                       g["name"]),
                                  daemon=True).start()
                 self._json({"task": tid})
             elif self.path == "/api/rhi/optiscaler/remove":
@@ -7503,11 +8240,13 @@ class Handler(BaseHTTPRequestHandler):
                 TASKS[tid] = {"status": "running", "progress": 0, "detail": "Starting"}
                 threading.Thread(target=_install_dxvk_task,
                                  args=(tid, appid, g["install_path"], body.get("variant", "stable"),
-                                       body.get("exe"), body.get("lilium_preset", 0)),
+                                       body.get("exe"), body.get("lilium_preset", 0), g["name"]),
                                  daemon=True).start()
                 self._json({"task": tid})
             elif self.path == "/api/rhi/dxvk/remove":
                 self._json(remove_dxvk(body["appid"]))
+            elif self.path == "/api/rhi/dxvk/reset_conf":
+                self._json(reset_dxvk_conf(body["appid"]))
             elif self.path == "/api/rhi/dxvk/update":
                 appid = body["appid"]
                 tid = str(uuid.uuid4())
@@ -7595,6 +8334,20 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=download_streamline_sdk, args=(tid,),
                                  daemon=True).start()
                 self._json({"task": tid})
+            elif self.path == "/api/rhi/streamline/deploy":
+                appid = body["appid"]
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(appid)
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                self._json(deploy_streamline_to_game(g["install_path"], body.get("version")))
+            elif self.path == "/api/rhi/streamline/remove":
+                appid = body["appid"]
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(appid)
+                if not g:
+                    self._json({"error": "unknown appid"}, 404); return
+                self._json(remove_streamline_from_game(g["install_path"]))
             else:
                 self._json({"error": "not found"}, 404)
         except RuntimeError as e:

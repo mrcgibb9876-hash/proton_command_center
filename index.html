@@ -140,6 +140,14 @@ body.gp-active .card.gp-focus .playbtn{opacity:1}
 .ultraplusbadge.dim img{opacity:.55}
 .ultraplusbadge.dim:hover{border-color:var(--compiled);color:var(--compiled)}
 .ultraplusbadge.dim:hover img{opacity:1}
+.rhibadge{flex:none;display:inline-flex;align-items:center;
+  background:color-mix(in srgb, var(--rhi) 15%, transparent);
+  border:1px solid var(--rhi);border-radius:999px;
+  padding:1px 7px;font-size:10px;font-weight:700;letter-spacing:.02em;color:var(--rhi);
+  transition:filter .12s}
+.rhibadge:hover{filter:brightness(1.35)}
+.rhibadge.dim{background:color-mix(in srgb, var(--rhi) 5%, transparent);border-color:var(--line);color:var(--muted)}
+.rhibadge.dim:hover{border-color:var(--rhi);color:var(--rhi)}
 .gpubadge{flex:none;display:inline-flex;align-items:center;
   background:color-mix(in srgb, var(--accent) 15%, transparent);
   border:1px solid var(--accent);border-radius:999px;
@@ -685,6 +693,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
         </select>
         <input type="text" id="rhiLegacyVersion" hidden placeholder="Version, e.g. 5.9.2" style="width:140px">
         <select id="rhiCustomFile" hidden style="flex:1"></select>
+        <button class="btn small" id="rhiCustomCheckBtn" hidden title="Redeploy any Custom-channel file that's changed since it was installed, to every game using it">Check for updates</button>
       </div>
       <p class="note" id="rhiChannelNote" style="margin-top:6px"></p>
       <div id="rhiBuildsBox"></div>
@@ -697,7 +706,9 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
       </div>
       <div class="bar" id="rhiBar"><i></i></div>
       <p class="note" id="rhiDetail"></p>
-      <p class="note">Always installs as <code>dxgi.dll</code>; refuses to overwrite a foreign one
+      <p class="note">Installs as <code>dxgi.dll</code> (DX11/12 games), or
+        <code>d3d9.dll</code>/<code>d3d8.dll</code>/<code>opengl32.dll</code> on DX9/DX8/OpenGL-only
+        games; refuses to overwrite a foreign DLL at that target
         (backs it up as <code>.original</code> instead). Drop your own build into
         <code class="mono">~/.local/share/proton-command-center/rhi/reshade-custom/</code> to use it
         via the Custom channel.</p>
@@ -726,6 +737,13 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
       </div>
       <div class="bar" id="rhiShaderBar"><i></i></div>
       <p class="note" id="rhiShaderDetail"></p>
+      <div class="row" style="margin-top:14px;align-items:center;gap:10px;flex-wrap:wrap">
+        <label class="btn small" for="rhiPresetFile" style="cursor:pointer">Load a preset .ini…</label>
+        <input type="file" id="rhiPresetFile" accept=".ini,.txt" hidden>
+        <span class="note">Reads its <code>Techniques=</code> line(s) and auto-selects/deploys whichever
+          packs above provide those shaders (downloading any not already cached).</span>
+      </div>
+      <p class="note" id="rhiPresetDetail"></p>
     </div>
     <div class="section">
       <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:0 0 10px">Addons</h3>
@@ -778,6 +796,13 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
         <select id="rhiOsFgOutput"></select>
         <button class="btn" id="rhiOsFgApplyBtn">Apply</button>
       </div>
+      <div class="row" id="rhiOsStreamlineRow" hidden style="margin-top:10px;align-items:center;gap:10px;flex-wrap:wrap">
+        <label class="note" for="rhiOsStreamlineVersion" style="margin:0">Streamline SDK</label>
+        <select id="rhiOsStreamlineVersion"></select>
+        <button class="btn green" id="rhiOsStreamlineDeployBtn">Deploy</button>
+        <button class="btn danger" id="rhiOsStreamlineRemoveBtn" hidden>Remove</button>
+        <span class="note" id="rhiOsStreamlineNote" style="width:100%"></span>
+      </div>
     </div>
     <div class="section">
       <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:0 0 10px">DXVK</h3>
@@ -797,6 +822,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
       <div class="row" style="margin-top:10px">
         <button class="btn green" id="rhiDxvkInstallBtn">Install DXVK</button>
         <button class="btn" id="rhiDxvkUpdateBtn" hidden>Update</button>
+        <button class="btn" id="rhiDxvkResetConfBtn" hidden title="Rewrite dxvk.conf back to PCC's default, discarding manual edits">Reset dxvk.conf</button>
         <button class="btn danger" id="rhiDxvkRemoveBtn" hidden>Remove</button>
       </div>
       <div class="bar" id="rhiDxvkBar"><i></i></div>
@@ -1366,7 +1392,7 @@ function renderGrid(filter=""){
       <div class="body">
         <img loading="lazy" src="https://cdn.cloudflare.steamstatic.com/steam/apps/${g.appid}/header.jpg"
              data-appid="${g.appid}" data-fallback="0" alt="">
-        <div class="meta"><div class="nameRow"><b>${esc(g.name)}</b>${g.has_ultraplus?`<button class="ultraplusbadge" title="Ultra+ mods are set up in this game — click to manage"><img src="${ULTRAPLUS_LOGO}" alt="">ULTRA+</button>`:g.ultraplus_supported?`<button class="ultraplusbadge dim" title="Ultra+ mods are available for this game — click to install"><img src="${ULTRAPLUS_LOGO}" alt="">ULTRA+ available</button>`:""}</div><small>${(statusById[g.appid]||{}).installing?("installing"+((statusById[g.appid]||{}).pct!=null?" · "+(statusById[g.appid]||{}).pct+"%":"…")):(g._uninstalled?"not installed":(g.size_bytes?fmtMB(g.size_bytes):"—"))}</small></div>
+        <div class="meta"><div class="nameRow"><b>${esc(g.name)}</b>${g.has_ultraplus?`<button class="ultraplusbadge" title="Ultra+ mods are set up in this game — click to manage"><img src="${ULTRAPLUS_LOGO}" alt="">ULTRA+</button>`:g.ultraplus_supported?`<button class="ultraplusbadge dim" title="Ultra+ mods are available for this game — click to install"><img src="${ULTRAPLUS_LOGO}" alt="">ULTRA+ available</button>`:""}${g.has_rhi?`<button class="rhibadge" title="ReShade/OptiScaler/DXVK/RE Framework is set up in this game — click to manage">RHI</button>`:g.rhi_supported?`<button class="rhibadge dim" title="ReShade/OptiScaler/DXVK are available for this game — click to install">RHI available</button>`:""}</div><small>${(statusById[g.appid]||{}).installing?("installing"+((statusById[g.appid]||{}).pct!=null?" · "+(statusById[g.appid]||{}).pct+"%":"…")):(g._uninstalled?"not installed":(g.size_bytes?fmtMB(g.size_bytes):"—"))}</small></div>
         ${g._uninstalled?`<button class="installbtn" data-install="${g.appid}">Install</button>`:`<button class="playbtn" data-play="${g.appid}" title="Play">▶</button>`}
       </div>
       <div class="cardbar"><i></i></div>
@@ -1408,6 +1434,13 @@ $("#grid").addEventListener("click",e=>{
     e.stopPropagation();
     const card=ub.closest(".card");
     if(card){openGame(card.dataset.appid);switchTab("mods")}
+    return;
+  }
+  const rb=e.target.closest(".rhibadge");
+  if(rb){
+    e.stopPropagation();
+    const card=rb.closest(".card");
+    if(card){openGame(card.dataset.appid);switchTab("rhi")}
     return;
   }
   const c=e.target.closest(".card");
@@ -1769,6 +1802,14 @@ async function openGame(appid){
   $("#dName").textContent=current.name;
   $("#dAppid").textContent="appid "+appid;
   $("#dRemove").hidden=!current.custom;
+  // Non-Steam shortcuts get a synthetic local appid Steam itself generates
+  // (a CRC of the exe path) - ProtonDB has no data under that id (it only
+  // tracks real Steam store titles), so checking would just produce a dead
+  // "No rating yet" link. Hide the check entirely rather than offer
+  // something that can never work.
+  $("#pdbCheckBtn").hidden=!!current.custom;
+  $("#pdbBadge").innerHTML=current.custom
+    ?'<span class="note">Not a Steam title — no ProtonDB rating available.</span>':"";
   $("#dHero").dataset.appid=appid;$("#dHero").dataset.fallback="0";$("#dHero").style.opacity="";
   $("#dHero").src=`https://cdn.cloudflare.steamstatic.com/steam/apps/${appid}/header.jpg`;
   switchTab("launch");
@@ -2060,10 +2101,17 @@ async function loadRhiRefFramework(appid){
     const d=await api(`/api/game/${appid}/rhi/refwork`);
     if(!d.is_re_engine){sec.hidden=true;return {installed:true,is_re_engine:false}}
     sec.hidden=false;
-    $("#rhiRefInstallBtn").hidden=d.installed;
+    $("#rhiRefInstallBtn").hidden=false;
+    $("#rhiRefInstallBtn").disabled=!!d.pd_upscaler;
+    $("#rhiRefInstallBtn").textContent=d.installed
+      ?(d.pd_upscaler?"PD-Upscaler build active":d.update_available?"⬆ Update RE Framework":"↺ Reinstall RE Framework")
+      :"Install RE Framework";
     $("#rhiRefRemoveBtn").hidden=!d.installed;
     $("#rhiRefStatus").innerHTML=d.installed
-      ? `<div class="item"><div class="top"><b>Installed</b><span class="chip g">v${esc(d.version||"?")}</span></div></div>`
+      ? (d.pd_upscaler
+          ? `<div class="item"><div class="top"><b>PD-Upscaler build</b><span class="chip m">OptiScaler-compatible</span></div>
+              <p class="note">Swapped in automatically for this game's OptiScaler install. Remove OptiScaler to restore the standard build.</p></div>`
+          : `<div class="item"><div class="top"><b>Installed</b><span class="chip g">v${esc(d.version||"?")}</span>${d.update_available?'<span class="chip a">update available</span>':""}</div></div>`)
       : '<p class="note">Not installed yet.</p>';
     return d;
   }catch(e){sec.hidden=true;return {installed:true,is_re_engine:false}}
@@ -2079,9 +2127,21 @@ function applyRhiChannelUI(){
   const ch=$("#rhiChannel").value;
   $("#rhiLegacyVersion").hidden=ch!=="legacy";
   $("#rhiCustomFile").hidden=ch!=="custom";
+  $("#rhiCustomCheckBtn").hidden=ch!=="custom";
   $("#rhiChannelNote").textContent=RHI_CHANNEL_NOTES[ch]||"";
 }
 $("#rhiChannel").addEventListener("change",applyRhiChannelUI);
+$("#rhiCustomCheckBtn").addEventListener("click",async()=>{
+  const btn=$("#rhiCustomCheckBtn");btn.disabled=true;btn.textContent="Checking…";
+  try{
+    const r=await post("/api/rhi/reshade/check_custom_updates",{});
+    toast(r.changed.length
+      ?`${r.changed.length} custom file(s) changed — redeployed to ${r.redeployed} game(s)`
+      :"No changes since last check");
+    if(current)loadRhiReshade(current.appid);
+  }catch(e){toast(e.message,true)}
+  btn.disabled=false;btn.textContent="Check for updates";
+});
 function useRhiBuild(path){
   $("#rhiExePath").value=path;
   toast("Set as the exe to target — Install/Update in each section below will use it");
@@ -2126,7 +2186,7 @@ async function loadRhiReshade(appid){
     if(d.installed){
       box.innerHTML=`
         <div class="item">
-          <div class="top"><b>dxgi.dll</b>
+          <div class="top"><b>${esc((d.path||"").split("/").pop()||"dxgi.dll")}</b>
             <span class="chip g">v${esc(d.version||"?")}</span>
             <span class="chip m">${esc(d.channel||"stable")}</span>
             ${d.detected_api_display?`<span class="chip a">${esc(d.detected_api_display)}</span>`:""}
@@ -2218,8 +2278,9 @@ async function loadRhiShaderPacks(appid){
           <label class="row rhiShaderRow" data-search="${esc((p.name+" "+p.description).toLowerCase())}"
             style="align-items:flex-start;gap:8px;margin-top:8px;cursor:pointer">
             <input type="checkbox" class="rhiShaderCheck" data-id="${esc(p.id)}" ${selected.has(p.id)?"checked":""} style="margin-top:3px">
-            <span><b>${esc(p.name)}</b>${p.cached?'<span class="chip m" style="margin-left:6px">cached</span>':""}
+            <span style="flex:1"><b>${esc(p.name)}</b>${p.cached?'<span class="chip m" style="margin-left:6px">cached</span>':""}${p.update_available?'<span class="chip a" style="margin-left:6px">update available</span>':""}
               <span class="note" style="display:block">${esc(p.description)}</span></span>
+            ${p.update_available?`<button type="button" class="btn small rhiShaderUpdateBtn" data-id="${esc(p.id)}">Update</button>`:""}
           </label>`).join("")}
       </details>`).join("");
   }catch(e){box.innerHTML=`<p class="note">${esc(e.message)}</p>`}
@@ -2229,6 +2290,21 @@ $("#rhiShaderSearch").addEventListener("input",e=>{
   document.querySelectorAll(".rhiShaderRow").forEach(row=>{
     row.style.display=(!q||row.dataset.search.includes(q))?"":"none";
   });
+});
+$("#rhiShaderCategories").addEventListener("click",async(e)=>{
+  const btn=e.target.closest(".rhiShaderUpdateBtn");
+  if(!btn)return;
+  e.preventDefault();e.stopPropagation();
+  const packId=btn.dataset.id;
+  btn.disabled=true;btn.textContent="Updating…";
+  try{
+    const {task}=await post("/api/rhi/shader_packs/update",{pack_id:packId});
+    trackTask(task,"#rhiShaderBar",(t)=>{
+      if(t.status==="done")toast(`${packId} updated`);
+      rhiShaderCatalog=null;   // force a fresh catalog fetch, this pack's cache is stale
+      if(current)loadRhiShaderPacks(current.appid);
+    },"#rhiShaderDetail");
+  }catch(e2){toast(e2.message,true);btn.disabled=false;btn.textContent="Update"}
 });
 $("#rhiShaderDeployBtn").addEventListener("click",async()=>{
   if(!current)return;
@@ -2251,6 +2327,30 @@ $("#rhiShaderRemoveBtn").addEventListener("click",async()=>{
     await post("/api/rhi/shaders/remove",{appid:current.appid});
     toast("Removed");loadRhiShaderPacks(current.appid);
   }catch(e){toast(e.message,true)}
+});
+$("#rhiPresetFile").addEventListener("change",async(e)=>{
+  if(!current)return;
+  const file=e.target.files&&e.target.files[0];
+  if(!file)return;
+  const detail=$("#rhiPresetDetail");
+  detail.textContent="Reading preset…";
+  try{
+    const presetText=await file.text();
+    const {task}=await post("/api/rhi/shaders/apply_preset",
+      {appid:current.appid,preset_text:presetText});
+    trackTask(task,"#rhiShaderBar",(t)=>{
+      if(t.result){
+        const r=t.result;
+        detail.textContent=r.matched.length
+          ?`Applied ${r.matched.join(", ")}${r.unresolved.length?` — couldn't find a pack for: ${r.unresolved.join(", ")}`:""}`
+          :`No known pack provides any shader this preset needs${r.unresolved.length?` (${r.unresolved.join(", ")})`:""}.`;
+        if(r.matched.length)toast(`Applied ${r.matched.length} pack(s) from preset`);
+      }
+      rhiShaderCatalog=null;
+      loadRhiShaderPacks(current.appid);
+    },"#rhiPresetDetail");
+  }catch(e2){detail.textContent=e2.message}
+  e.target.value="";   // allow re-selecting the same file later
 });
 
 /* ---------- RHI: addons ---------- */
@@ -2340,7 +2440,10 @@ async function loadRhiOptiscaler(appid){
       $("#rhiOsRemoveBtn").hidden=false;
       $("#rhiOsUpdateBtn").hidden=!d.update_available;
       $("#rhiOsFgRow").hidden=false;
+      $("#rhiOsStreamlineRow").hidden=false;
+      loadRhiStreamline(appid);
     }else{
+      $("#rhiOsStreamlineRow").hidden=true;
       $("#rhiOsGpuType").value=effectiveVendor()==="AMD"?"AMD":"NVIDIA";
       $("#rhiOsInstallBtn").textContent="Install OptiScaler";
       box.innerHTML=d.exe
@@ -2400,6 +2503,44 @@ $("#rhiOsFgApplyBtn").addEventListener("click",async()=>{
     toast("Frame gen settings applied");
   }catch(e){toast(e.message,true)}
 });
+async function loadRhiStreamline(appid){
+  try{
+    const d=await api(`/api/game/${appid}/rhi/streamline`);
+    const sel=$("#rhiOsStreamlineVersion");
+    const hasLibrary=!!(d.library&&d.library.length);
+    if(hasLibrary){
+      sel.innerHTML=d.library.map(e=>`<option value="${esc(e.version)}">${esc(e.version)}</option>`).join("");
+      sel.disabled=false;
+    }else{
+      sel.innerHTML='<option value="">— download one on the DLSS tab first —</option>';
+      sel.disabled=true;
+    }
+    $("#rhiOsStreamlineDeployBtn").disabled=!hasLibrary;
+    $("#rhiOsStreamlineDeployBtn").textContent=d.deployed?"Redeploy":"Deploy";
+    $("#rhiOsStreamlineRemoveBtn").hidden=!d.deployed;
+    $("#rhiOsStreamlineNote").textContent=d.deployed
+      ?`Deployed (${d.files.length} files) — needed when Frame gen input is set to dlssg (NVIDIA DLSS Frame Generation).`
+      :"Needed only when Frame gen input above is set to dlssg (NVIDIA DLSS Frame Generation).";
+  }catch(e){$("#rhiOsStreamlineNote").textContent=e.message}
+}
+$("#rhiOsStreamlineDeployBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  const btn=$("#rhiOsStreamlineDeployBtn");btn.disabled=true;
+  try{
+    const version=$("#rhiOsStreamlineVersion").value||undefined;
+    const r=await post("/api/rhi/streamline/deploy",{appid:current.appid,version});
+    toast(`Deployed Streamline SDK ${r.version} (${r.deployed} files)`);
+    loadRhiStreamline(current.appid);
+  }catch(e){toast(e.message,true)}
+  btn.disabled=false;
+});
+$("#rhiOsStreamlineRemoveBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  try{
+    await post("/api/rhi/streamline/remove",{appid:current.appid});
+    toast("Removed");loadRhiStreamline(current.appid);
+  }catch(e){toast(e.message,true)}
+});
 
 /* ---------- RHI: DXVK ---------- */
 const RHI_DXVK_LILIUM_D3D9_NAMES=["Safest","2nd Safest","Slightly Unsafe","Unsafer","Even Unsafer","Experimental"];
@@ -2417,11 +2558,17 @@ $("#rhiDxvkVariant").addEventListener("change",rhiDxvkUpdatePresetVisibility);
 async function loadRhiDxvk(appid){
   const box=$("#rhiDxvkStatus");
   box.innerHTML='<p class="note">Scanning game folder…</p>';
-  $("#rhiDxvkRemoveBtn").hidden=true;$("#rhiDxvkUpdateBtn").hidden=true;
+  $("#rhiDxvkRemoveBtn").hidden=true;$("#rhiDxvkUpdateBtn").hidden=true;$("#rhiDxvkResetConfBtn").hidden=true;
   try{
     const d=await api(`/api/game/${appid}/rhi/dxvk`);
     window._rhiDxvkState=d;
     rhiDxvkUpdatePresetVisibility();
+    $("#rhiDxvkInstallBtn").disabled=!!d.blacklisted;
+    if(d.blacklisted){
+      box.innerHTML='<p class="note">⚠ DXVK is blocked for this game — its anti-cheat '
+        +'software can flag or ban players for DXVK\'s presence, even unused.</p>';
+      return;
+    }
     if(d.installed){
       $("#rhiDxvkVariant").value=d.variant||"stable";
       rhiDxvkUpdatePresetVisibility();
@@ -2437,6 +2584,7 @@ async function loadRhiDxvk(appid){
       $("#rhiDxvkInstallBtn").textContent="Reinstall";
       $("#rhiDxvkRemoveBtn").hidden=false;
       $("#rhiDxvkUpdateBtn").hidden=!d.update_available;
+      $("#rhiDxvkResetConfBtn").hidden=false;
     }else{
       $("#rhiDxvkInstallBtn").textContent="Install DXVK";
       box.innerHTML=d.exe
@@ -2478,6 +2626,14 @@ $("#rhiDxvkRemoveBtn").addEventListener("click",async()=>{
   try{
     await post("/api/rhi/dxvk/remove",{appid:current.appid});
     toast("Removed");loadRhiDxvk(current.appid);
+  }catch(e){toast(e.message,true)}
+});
+$("#rhiDxvkResetConfBtn").addEventListener("click",async()=>{
+  if(!current)return;
+  if(!await pccConfirm(`Reset dxvk.conf for ${current.name} back to defaults? Any manual edits will be lost.`,{yes:"Reset"}))return;
+  try{
+    await post("/api/rhi/dxvk/reset_conf",{appid:current.appid});
+    toast("dxvk.conf reset to default");
   }catch(e){toast(e.message,true)}
 });
 
@@ -2600,6 +2756,7 @@ function renderPdbBadge(appid){
 }
 async function loadCachedPdb(appid){
   // repopulate the badge from the backend's stored rating (survives app reopen)
+  if(current&&current.custom)return;   // no real ProtonDB data for a non-Steam shortcut
   if(PDB_CACHE[appid]){renderPdbBadge(appid);return;}
   try{
     const d=await api(`/api/game/${appid}/protondb?cached=1`);

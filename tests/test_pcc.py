@@ -249,6 +249,31 @@ class PCCTests(unittest.TestCase):
         self.assertIn(r["appid"], merged)
         self.assertIn("12345", merged)   # the mock's real Steam game, untouched
 
+    def test_add_shortcut_computes_real_install_size(self):
+        game_dir = Path(self.tmp.name) / "MyGame"
+        game_dir.mkdir()
+        (game_dir / "MyGame.exe").write_bytes(b"x" * 1000)
+        (game_dir / "data.pak").write_bytes(b"y" * 2000)
+        pcc.add_shortcut(self.root, "My Game", str(game_dir / "MyGame.exe"))
+        shortcuts = pcc.list_shortcuts(self.root)
+        self.assertEqual(shortcuts[0]["size_bytes"], 3000)
+
+    def test_shortcut_size_bytes_is_cached(self):
+        game_dir = Path(self.tmp.name) / "MyGame2"
+        game_dir.mkdir()
+        (game_dir / "a.bin").write_bytes(b"x" * 500)
+        size1 = pcc._shortcut_size_bytes("99999", str(game_dir))
+        self.assertEqual(size1, 500)
+        (game_dir / "b.bin").write_bytes(b"y" * 500)   # grows after first check
+        size2 = pcc._shortcut_size_bytes("99999", str(game_dir))
+        self.assertEqual(size2, 500)   # still cached, doesn't re-walk yet
+        # force cache expiry
+        state = pcc.load_state()
+        state["shortcut_size_cache"]["99999"]["ts"] = 0
+        pcc.save_state(state)
+        size3 = pcc._shortcut_size_bytes("99999", str(game_dir))
+        self.assertEqual(size3, 1000)
+
     def test_add_shortcut_preserves_other_entries_on_remove(self):
         a = pcc.add_shortcut(self.root, "Game A", "/tmp/A/A.exe")
         b = pcc.add_shortcut(self.root, "Game B", "/tmp/B/B.exe")
@@ -937,6 +962,20 @@ class PCCTests(unittest.TestCase):
         self.assertEqual(
             pcc.detect_graphics_api({"d3d11.dll"}, {"d3d12.dll"}), "d3d11")
 
+    def test_detect_graphics_api_dxgi_short_circuits_before_delay_load(self):
+        # Regular-imports dxgi.dll alone (no >=DX11 explicit match) -> DX12
+        # is inferred immediately, WITHOUT even consulting delay-loads -
+        # matches RHI's GraphicsApiDetector.Detect() exactly (the dxgi-only
+        # inference happens right after the regular scan, before delay-load
+        # scanning). A game that regular-imports only dxgi.dll but
+        # delay-loads d3d11.dll is unambiguously DX12, not DX11.
+        self.assertEqual(
+            pcc.detect_graphics_api({"dxgi.dll"}, {"d3d11.dll"}), "d3d12")
+        # But if dxgi.dll ISN'T regular-imported, delay-load scanning still
+        # applies normally.
+        self.assertEqual(
+            pcc.detect_graphics_api({"opengl32.dll"}, {"d3d11.dll"}), "d3d11")
+
     def test_detect_unity_api_boot_config_and_fallback(self):
         d = Path(self.tmp.name) / "unity_game"
         d.mkdir()
@@ -1096,10 +1135,96 @@ class PCCTests(unittest.TestCase):
         self.assertEqual((d / "dxgi.dll").read_bytes(),
                          b"totally unrelated vendor DLL content")
 
+    def test_backup_foreign_dll_refreshes_stale_backup_instead_of_discarding(self):
+        # If a foreign DLL was already backed up once and then updated (e.g.
+        # a game patch replaced it) before install/backup runs again, the
+        # backup must be refreshed with the CURRENT foreign content, not
+        # silently discarded - the old behavior unlink()'d the new foreign
+        # file and left the stale backup in place.
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        target = d / "dxgi.dll"
+        (target.with_name("dxgi.dll.original")).write_bytes(b"stale old backup")
+        target.write_bytes(b"updated foreign content")
+        pcc._backup_foreign_dll(target)
+        self.assertFalse(target.exists())
+        self.assertEqual(target.with_name("dxgi.dll.original").read_bytes(),
+                         b"updated foreign content")
+
+    def test_backup_foreign_dll_does_not_back_up_dxvk_managed_name(self):
+        # A DXVK file sitting at a DXVK-managed filename (e.g. d3d9.dll for
+        # a DX9 game where ReShade also wants to install as d3d9.dll) isn't
+        # "foreign" - the two coexist there rather than one backing up the
+        # other.
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        target = d / "d3d9.dll"
+        target.write_bytes(b"totally not dxvk or reshade, just filler " + b"DXVK_" + b"x" * 100)
+        pcc._backup_foreign_dll(target)
+        self.assertTrue(target.is_file())
+        self.assertFalse(target.with_name("d3d9.dll.original").exists())
+
     def test_install_reshade_refuses_vulkan(self):
         d, exe = self._fake_game_exe(dlls=["vulkan-1.dll"])
         with self.assertRaises(RuntimeError):
             pcc.install_reshade("12345", str(d), exe_override=str(exe))
+
+    def test_resolve_auto_reshade_filename(self):
+        self.assertEqual(pcc.resolve_auto_reshade_filename({"d3d11"}), "dxgi.dll")
+        self.assertEqual(pcc.resolve_auto_reshade_filename({"d3d12"}), "dxgi.dll")
+        # DX11/12 take precedence even if the game also legacy-imports d3d9
+        self.assertEqual(pcc.resolve_auto_reshade_filename({"d3d11", "d3d9"}), "dxgi.dll")
+        self.assertEqual(pcc.resolve_auto_reshade_filename({"d3d9"}), "d3d9.dll")
+        self.assertEqual(pcc.resolve_auto_reshade_filename({"d3d8"}), "d3d8.dll")
+        # DX9 beats OpenGL even without any DX11/12 present
+        self.assertEqual(pcc.resolve_auto_reshade_filename({"d3d9", "opengl"}), "d3d9.dll")
+        # OpenGL only applies when it's the ONLY api detected
+        self.assertEqual(pcc.resolve_auto_reshade_filename({"opengl"}), "opengl32.dll")
+        self.assertEqual(pcc.resolve_auto_reshade_filename(set()), "dxgi.dll")
+
+    def test_detect_all_graphics_apis(self):
+        self.assertEqual(pcc._detect_all_graphics_apis({"d3d9.dll"}), {"d3d9"})
+        # dxgi-only regular import with no explicit DX -> infers d3d12 too
+        self.assertEqual(pcc._detect_all_graphics_apis({"dxgi.dll"}), {"d3d12"})
+        # explicit regular match suppresses the dxgi-only inference
+        self.assertEqual(pcc._detect_all_graphics_apis({"dxgi.dll", "d3d11.dll"}), {"d3d11"})
+        # delay-loads count unconditionally here (unlike detect_graphics_api)
+        self.assertEqual(
+            pcc._detect_all_graphics_apis({"d3d9.dll"}, {"d3d11.dll"}), {"d3d9", "d3d11"})
+
+    def test_install_reshade_dx9_installs_as_d3d9_dll(self):
+        d, exe = self._fake_game_exe(dlls=["d3d9.dll"])
+        engine_dir = pcc.RESHADE_STAGING_DIR / "9.9.9"
+        engine_dir.mkdir(parents=True)
+        (engine_dir / "ReShade64.dll").write_bytes(b"R" * 1_100_000)
+        (engine_dir / "ReShade32.dll").write_bytes(b"r" * 1_100_000)
+        real_latest, real_engine = pcc.reshade_latest, pcc.ensure_reshade_engine
+        pcc.reshade_latest = lambda: {"version": "9.9.9", "url": "http://x"}
+        pcc.ensure_reshade_engine = lambda version, url=None, task_id=None: engine_dir
+        try:
+            r = pcc.install_reshade("12345", str(d), exe_override=str(exe))
+        finally:
+            pcc.reshade_latest = real_latest
+            pcc.ensure_reshade_engine = real_engine
+        self.assertEqual(r["path"], str(d / "d3d9.dll"))
+        self.assertTrue((d / "d3d9.dll").is_file())
+        self.assertFalse((d / "dxgi.dll").exists())
+
+    def test_install_reshade_opengl_only_installs_as_opengl32_dll(self):
+        d, exe = self._fake_game_exe(dlls=["opengl32.dll"])
+        engine_dir = pcc.RESHADE_STAGING_DIR / "9.9.9"
+        engine_dir.mkdir(parents=True)
+        (engine_dir / "ReShade64.dll").write_bytes(b"R" * 1_100_000)
+        (engine_dir / "ReShade32.dll").write_bytes(b"r" * 1_100_000)
+        real_latest, real_engine = pcc.reshade_latest, pcc.ensure_reshade_engine
+        pcc.reshade_latest = lambda: {"version": "9.9.9", "url": "http://x"}
+        pcc.ensure_reshade_engine = lambda version, url=None, task_id=None: engine_dir
+        try:
+            r = pcc.install_reshade("12345", str(d), exe_override=str(exe))
+        finally:
+            pcc.reshade_latest = real_latest
+            pcc.ensure_reshade_engine = real_engine
+        self.assertEqual(r["path"], str(d / "opengl32.dll"))
 
     # ---- RHI: ReShade channels (No Addons / Legacy / Nightly / Custom) ----
     def test_reshade_no_addons_regex_excludes_addon_build(self):
@@ -1184,6 +1309,57 @@ class PCCTests(unittest.TestCase):
         self.assertEqual(r["version"], "MyCustomReShade64.dll")
         self.assertEqual((d / "dxgi.dll").read_bytes(), b"C" * 2000)
 
+    def test_check_custom_reshade_updates_redeploys_on_hash_change(self):
+        d, exe = self._fake_game_exe()
+        pcc.RESHADE_CUSTOM_DIR.mkdir(parents=True, exist_ok=True)
+        (pcc.RESHADE_CUSTOM_DIR / "Custom.dll").write_bytes(b"v1 content")
+        pcc.install_reshade("12345", str(d), exe_override=str(exe),
+                            channel="custom", custom_filename="Custom.dll")
+        target = Path(pcc.load_state()["rhi_reshade_installs"]["12345"]["path"])
+        self.assertEqual(target.read_bytes(), b"v1 content")
+
+        # first check just establishes the baseline hash - nothing changed yet
+        r0 = pcc.check_custom_reshade_updates()
+        self.assertEqual(r0["changed"], [])
+        self.assertEqual(r0["redeployed"], 0)
+
+        # user drops a new build over the same filename
+        (pcc.RESHADE_CUSTOM_DIR / "Custom.dll").write_bytes(b"v2 content, updated")
+        r1 = pcc.check_custom_reshade_updates()
+        self.assertEqual(r1["changed"], ["Custom.dll"])
+        self.assertEqual(r1["redeployed"], 1)
+        self.assertEqual(target.read_bytes(), b"v2 content, updated")
+
+        # unchanged on the next check
+        r2 = pcc.check_custom_reshade_updates()
+        self.assertEqual(r2["changed"], [])
+        self.assertEqual(r2["redeployed"], 0)
+
+    def test_check_custom_reshade_updates_ignores_non_custom_channel_games(self):
+        d, exe = self._fake_game_exe()
+        pcc.RESHADE_CUSTOM_DIR.mkdir(parents=True, exist_ok=True)
+        engine_dir = pcc.RESHADE_STAGING_DIR / "9.9.9"
+        engine_dir.mkdir(parents=True)
+        (engine_dir / "ReShade64.dll").write_bytes(b"R" * 1_100_000)
+        (engine_dir / "ReShade32.dll").write_bytes(b"r" * 1_100_000)
+        real_latest, real_engine = pcc.reshade_latest, pcc.ensure_reshade_engine
+        pcc.reshade_latest = lambda: {"version": "9.9.9", "url": "http://x"}
+        pcc.ensure_reshade_engine = lambda version, url=None, task_id=None: engine_dir
+        try:
+            pcc.install_reshade("12345", str(d), exe_override=str(exe))   # stable channel
+        finally:
+            pcc.reshade_latest = real_latest
+            pcc.ensure_reshade_engine = real_engine
+        # an unrelated file in the Custom folder changing must not touch
+        # this stable-channel install at all
+        (pcc.RESHADE_CUSTOM_DIR / "Unrelated.dll").write_bytes(b"v1")
+        pcc.check_custom_reshade_updates()
+        (pcc.RESHADE_CUSTOM_DIR / "Unrelated.dll").write_bytes(b"v2")
+        r = pcc.check_custom_reshade_updates()
+        self.assertEqual(r["changed"], ["Unrelated.dll"])
+        self.assertEqual(r["redeployed"], 0)
+        self.assertEqual((d / "dxgi.dll").read_bytes(), b"R" * 1_100_000)
+
     def test_install_reshade_custom_channel_no_files_raises(self):
         d, exe = self._fake_game_exe()
         with self.assertRaises(RuntimeError):
@@ -1237,12 +1413,47 @@ class PCCTests(unittest.TestCase):
         status = pcc.scan_re_framework("12345", str(d))
         self.assertTrue(status["is_re_engine"])
         self.assertTrue(status["installed"])
+        self.assertFalse(status["update_available"])
 
         rm = pcc.remove_re_framework("12345")
         self.assertTrue(rm["removed"])
         self.assertFalse(target.exists())
         with self.assertRaises(RuntimeError):
             pcc.remove_re_framework("12345")
+
+    def test_remove_re_framework_restores_standard_build_when_pd_upscaler_active(self):
+        d = self.root / "steamapps/common/REGame"
+        d.mkdir(parents=True)
+        (d / "dinput8.dll").write_bytes(b"pd-upscaler build")
+        (d / "dinput8.dll.rhi_standard_backup").write_bytes(b"standard build")
+        state = pcc.load_state()
+        state.setdefault("rhi_reframework_installs", {})["12345"] = {
+            "path": str(d / "dinput8.dll"), "version": "PD-Upscaler",
+        }
+        pcc.save_state(state)
+        rm = pcc.remove_re_framework("12345")
+        self.assertTrue(rm["removed"])
+        self.assertEqual((d / "dinput8.dll").read_bytes(), b"standard build")
+        self.assertFalse((d / "dinput8.dll.rhi_standard_backup").exists())
+
+    def test_scan_re_framework_reports_update_available(self):
+        d = self.root / "steamapps/common/REGame"
+        d.mkdir(parents=True)
+        (d / "re_chunk_000.pak").write_bytes(b"x")
+        state = pcc.load_state()
+        state.setdefault("rhi_reframework_installs", {})["12345"] = {
+            "path": str(d / "dinput8.dll"), "version": "nightly-1111-old",
+        }
+        (d / "dinput8.dll").write_bytes(b"old build")
+        pcc.save_state(state)
+        real_latest = pcc.re_framework_latest
+        pcc.re_framework_latest = lambda: {"version": "nightly-2222-new", "url": "http://x"}
+        try:
+            status = pcc.scan_re_framework("12345", str(d))
+        finally:
+            pcc.re_framework_latest = real_latest
+        self.assertTrue(status["installed"])
+        self.assertTrue(status["update_available"])
 
     # ---- RHI: shader packs ----
     def test_expand_pack_dependencies_pulls_in_requires(self):
@@ -1476,6 +1687,159 @@ class PCCTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             pcc.ensure_shader_pack("NotARealPack")
 
+    def test_ensure_shader_pack_force_redownloads_and_prunes_stale_files(self):
+        zip_v1 = self._fake_shader_zip("pack-main", {
+            "Shaders/Old.fx": b"old", "Shaders/Keep.fx": b"keep v1",
+        })
+        real_bytes = pcc._gh_bytes
+        pcc._gh_bytes = lambda url, task=None: zip_v1
+        try:
+            files1 = pcc.ensure_shader_pack("CrosireMaster")
+        finally:
+            pcc._gh_bytes = real_bytes
+        self.assertIn("Shaders/CrosireMaster/Old.fx", files1)
+        self.assertTrue((pcc.RHI_DATA_DIR / "shaders" / "Shaders/CrosireMaster/Old.fx").is_file())
+
+        # Old.fx renamed away upstream, Keep.fx's content changed
+        zip_v2 = self._fake_shader_zip("pack-main", {
+            "Shaders/Keep.fx": b"keep v2", "Shaders/New.fx": b"new",
+        })
+        pcc._gh_bytes = lambda url, task=None: zip_v2
+        try:
+            files2 = pcc.ensure_shader_pack("CrosireMaster", force=True)
+        finally:
+            pcc._gh_bytes = real_bytes
+        self.assertNotIn("Shaders/CrosireMaster/Old.fx", files2)
+        self.assertIn("Shaders/CrosireMaster/New.fx", files2)
+        # stale file actually deleted from staging, not just untracked
+        self.assertFalse((pcc.RHI_DATA_DIR / "shaders" / "Shaders/CrosireMaster/Old.fx").exists())
+        self.assertEqual((pcc.RHI_DATA_DIR / "shaders" / "Shaders/CrosireMaster/Keep.fx")
+                         .read_bytes(), b"keep v2")
+
+    def test_check_shader_pack_update_establishes_baseline_then_detects_change(self):
+        zip_bytes = self._fake_shader_zip("pack-main", {"Shaders/A.fx": b"a"})
+        real_bytes = pcc._gh_bytes
+        pcc._gh_bytes = lambda url, task=None: zip_bytes
+        try:
+            pcc.ensure_shader_pack("CrosireMaster")
+        finally:
+            pcc._gh_bytes = real_bytes
+
+        real_signal = pcc._shader_pack_latest_signal
+        pcc._shader_pack_latest_signal = lambda pack, release=None: "sha-v1"
+        try:
+            # First check ever: nothing to compare against yet -> establishes
+            # baseline, reports no update.
+            self.assertFalse(pcc.check_shader_pack_update("CrosireMaster", force=True))
+            # Same signal again -> still no update.
+            self.assertFalse(pcc.check_shader_pack_update("CrosireMaster", force=True))
+            pcc._shader_pack_latest_signal = lambda pack, release=None: "sha-v2"
+            self.assertTrue(pcc.check_shader_pack_update("CrosireMaster", force=True))
+            # Cached (not forced) - stays True without re-checking, even if
+            # the live signal reverted (simulates staying within the 6h window).
+            pcc._shader_pack_latest_signal = lambda pack, release=None: "sha-v1"
+            self.assertTrue(pcc.check_shader_pack_update("CrosireMaster", force=False))
+        finally:
+            pcc._shader_pack_latest_signal = real_signal
+
+    def test_check_shader_pack_update_false_for_uncached_pack(self):
+        self.assertFalse(pcc.check_shader_pack_update("CrosireMaster"))
+
+    def test_get_shader_pack_catalog_reports_update_available(self):
+        zip_bytes = self._fake_shader_zip("pack-main", {"Shaders/A.fx": b"a"})
+        real_bytes = pcc._gh_bytes
+        pcc._gh_bytes = lambda url, task=None: zip_bytes
+        try:
+            pcc.ensure_shader_pack("CrosireMaster")
+        finally:
+            pcc._gh_bytes = real_bytes
+        real_signal = pcc._shader_pack_latest_signal
+        pcc._shader_pack_latest_signal = lambda pack, release=None: "sha-v1"
+        try:
+            catalog = {p["id"]: p for p in pcc.get_shader_pack_catalog()}
+            self.assertTrue(catalog["CrosireMaster"]["cached"])
+            self.assertFalse(catalog["CrosireMaster"]["update_available"])  # baseline just set
+            pcc._shader_pack_latest_signal = lambda pack, release=None: "sha-v2"
+            state = pcc.load_state()
+            state["rhi_shader_pack_update_checks"]["CrosireMaster"]["ts"] = 0   # expire cache
+            pcc.save_state(state)
+            catalog2 = {p["id"]: p for p in pcc.get_shader_pack_catalog()}
+            self.assertTrue(catalog2["CrosireMaster"]["update_available"])
+            self.assertFalse(catalog2["SweetFX"]["update_available"])   # never downloaded
+        finally:
+            pcc._shader_pack_latest_signal = real_signal
+
+    def test_extract_fx_files(self):
+        self.assertEqual(pcc._extract_fx_files("TechniqueA@HDR.fx,TechniqueB@Bloom.fx"),
+                         {"HDR.fx", "Bloom.fx"})
+        self.assertEqual(pcc._extract_fx_files(""), set())
+        self.assertEqual(pcc._extract_fx_files("no-at-sign-here"), set())
+        # duplicate technique referencing the same file, plus stray whitespace
+        self.assertEqual(pcc._extract_fx_files(" TechA@HDR.fx , TechB@HDR.fx "), {"HDR.fx"})
+
+    def test_extract_fx_files_from_preset(self):
+        preset = (
+            "[TECHNIQUES]\n"
+            "Techniques=TechA@HDR.fx,TechB@Bloom.fx\n"
+            "TechniqueSorting=TechA@HDR.fx\n"   # not a Techniques= line, ignored
+            "[HDR.fx]\n"
+            "Enabled=1\n"
+        )
+        self.assertEqual(pcc._extract_fx_files_from_preset(preset), {"HDR.fx", "Bloom.fx"})
+
+    def _seed_shader_pack_cache(self, pack_id, files):
+        """Writes real files under RHI_DATA_DIR/shaders/ and records them in
+        state, matching what ensure_shader_pack would leave behind - lets
+        resolve/apply-preset tests avoid mocking network downloads for all
+        14+ catalog packs."""
+        for rel, content in files.items():
+            p = pcc.RHI_DATA_DIR / "shaders" / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(content)
+        state = pcc.load_state()
+        state.setdefault("rhi_shader_packs", {})[pack_id] = {
+            "files": list(files.keys()), "fetched_at": "2026-01-01T00:00:00Z", "signal": None}
+        pcc.save_state(state)
+
+    def test_resolve_preset_shader_packs_matches_and_reports_unresolved(self):
+        self._seed_shader_pack_cache("CrosireMaster", {"Shaders/CrosireMaster/HDR.fx": b"x"})
+        self._seed_shader_pack_cache("SweetFX", {"Shaders/SweetFX/Bloom.fx": b"x"})
+        real_ensure = pcc.ensure_shader_pack
+        pcc.ensure_shader_pack = (lambda pid, task_id=None, force=False:
+            pcc.load_state().get("rhi_shader_packs", {}).get(pid, {}).get("files", []))
+        try:
+            r = pcc.resolve_preset_shader_packs({"HDR.fx", "Bloom.fx", "Nonexistent.fx"})
+        finally:
+            pcc.ensure_shader_pack = real_ensure
+        self.assertEqual(r["matched"], ["CrosireMaster", "SweetFX"])
+        self.assertEqual(r["unresolved"], ["Nonexistent.fx"])
+
+    def test_apply_preset_shader_packs_full_flow(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        self._seed_shader_pack_cache("CrosireMaster", {"Shaders/CrosireMaster/HDR.fx": b"hdr content"})
+        real_ensure = pcc.ensure_shader_pack
+        pcc.ensure_shader_pack = (lambda pid, task_id=None, force=False:
+            pcc.load_state().get("rhi_shader_packs", {}).get(pid, {}).get("files", []))
+        preset = "Techniques=SomeTechnique@HDR.fx,OtherTechnique@Missing.fx\n"
+        try:
+            r = pcc.apply_preset_shader_packs("12345", str(d), preset)
+        finally:
+            pcc.ensure_shader_pack = real_ensure
+        self.assertEqual(r["matched"], ["CrosireMaster"])
+        self.assertEqual(r["unresolved"], ["Missing.fx"])
+        self.assertEqual(r["deployed"], 1)
+        self.assertIn("CrosireMaster", pcc.get_game_shader_selection("12345"))
+        deployed_file = d / "reshade-shaders/Shaders/CrosireMaster/HDR.fx"
+        self.assertEqual(deployed_file.read_bytes(), b"hdr content")
+
+    def test_apply_preset_shader_packs_no_techniques_is_noop(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        r = pcc.apply_preset_shader_packs("12345", str(d), "not a real preset at all")
+        self.assertEqual(r, {"matched": [], "unresolved": [], "deployed": 0})
+        self.assertEqual(pcc.get_game_shader_selection("12345"), [])
+
     def test_deploy_shader_packs_full_flow_and_remove(self):
         d = self.root / "steamapps/common/TestGame"
         d.mkdir(parents=True, exist_ok=True)
@@ -1550,14 +1914,14 @@ class PCCTests(unittest.TestCase):
     # ---- RHI: ReShade addons ----
     def test_parse_addons_ini_skips_disabled_sections(self):
         content = (
-            "[00]\n"
+            "[02]\n"
             "PackageName=Swap chain override by crosire\n"
             "PackageDescription=Force windowed/fullscreen\n"
             "DownloadUrl32=http://x/swapchain.addon32\n"
             "DownloadUrl64=http://x/swapchain.addon64\n"
             "RepositoryUrl=http://repo\n"
             "\n"
-            "# [00]\n"
+            "# [02]\n"
             "# PackageName=Framerate Limiter by crosire\n"
             "# PackageDescription=disabled entry, must be skipped\n"
             "\n"
@@ -1573,12 +1937,37 @@ class PCCTests(unittest.TestCase):
         self.assertNotIn("Framerate Limiter by crosire", names)
         self.assertEqual(len(parsed), 2)
 
+    def test_parse_addons_ini_skips_excluded_section_ids(self):
+        # "00"/"21"/"26" are excluded even when active (uncommented) - they're
+        # managed by RHI itself or N/A, per RHI's AddonsIniParser.ExcludedSections.
+        content = (
+            "[00]\n"
+            "PackageName=Swap chain override by crosire\n"
+            "DownloadUrl32=http://x/swapchain.addon32\n"
+            "DownloadUrl64=http://x/swapchain.addon64\n"
+            "\n"
+            "[21]\n"
+            "PackageName=Excluded Twentyone\n"
+            "DownloadUrl64=http://x/twentyone.addon64\n"
+            "\n"
+            "[26]\n"
+            "PackageName=Excluded Twentysix\n"
+            "DownloadUrl64=http://x/twentysix.addon64\n"
+            "\n"
+            "[03]\n"
+            "PackageName=A Real Addon\n"
+            "DownloadUrl64=http://x/real.addon64\n"
+        )
+        parsed = pcc._parse_addons_ini(content)
+        names = [a["PackageName"] for a in parsed]
+        self.assertEqual(names, ["A Real Addon"])
+
     def test_slugify_addon_name(self):
         self.assertEqual(pcc._slugify_addon_name("Swap chain override by crosire"),
                          "swap-chain-override-by-crosire")
 
     def test_reshade_addons_catalog_fetches_and_caches(self):
-        ini_text = ("[00]\nPackageName=Test Addon\n"
+        ini_text = ("[02]\nPackageName=Test Addon\n"
                    "PackageDescription=desc\n"
                    "DownloadUrl32=http://x/a.addon32\n"
                    "DownloadUrl64=http://x/a.addon64\n")
@@ -1593,9 +1982,13 @@ class PCCTests(unittest.TestCase):
             catalog = pcc.reshade_addons_catalog()
         finally:
             pcc.urllib.request.urlopen = real_urlopen
-        self.assertEqual(len(catalog), 1)
+        # + the always-present renodx-devkit/renodx-dlssfix hardcoded entries
+        self.assertEqual(len(catalog), 3)
         self.assertEqual(catalog[0]["id"], "test-addon")
         self.assertEqual(catalog[0]["download_url64"], "http://x/a.addon64")
+        ids = {a["id"] for a in catalog}
+        self.assertIn("renodx-devkit", ids)
+        self.assertIn("renodx-dlssfix", ids)
         # second call is served from the 6h cache, no network needed
         pcc.urllib.request.urlopen = lambda req, timeout=30: (_ for _ in ()).throw(
             RuntimeError("should not fetch again"))
@@ -2087,6 +2480,80 @@ class PCCTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             pcc.remove_optiscaler("12345")
 
+    def _fake_pd_upscaler_zip(self, artifact, dll_content):
+        import io, zipfile
+        inner_buf = io.BytesIO()
+        with zipfile.ZipFile(inner_buf, "w") as z:
+            z.writestr("dinput8.dll", dll_content)
+        outer_buf = io.BytesIO()
+        with zipfile.ZipFile(outer_buf, "w") as z:
+            z.writestr(f"{artifact}.zip", inner_buf.getvalue())
+        return outer_buf.getvalue()
+
+    def test_install_optiscaler_swaps_pd_upscaler_re_framework(self):
+        d, exe = self._fake_game_exe()
+        (d / "re_chunk_000.pak").write_bytes(b"x")   # RE Engine marker
+        (d / "dinput8.dll").write_bytes(b"standard REFramework build")
+        state = pcc.load_state()
+        state.setdefault("rhi_reframework_installs", {})["12345"] = {
+            "path": str(d / "dinput8.dll"), "version": "nightly-1111",
+        }
+        pcc.save_state(state)
+        self._fake_optiscaler_staging()
+        real_manifest, real_bytes = pcc.rhi_manifest, pcc._gh_bytes
+        pcc.rhi_manifest = lambda: {"pdUpscalerGames": {"Test Game": "RE2"}}
+        pcc._gh_bytes = lambda url, task=None: self._fake_pd_upscaler_zip("RE2", b"pd-upscaler build")
+        try:
+            r = pcc.install_optiscaler("12345", str(d), exe_override=str(exe),
+                                       gpu_type="NVIDIA", game_name="Test Game")
+        finally:
+            pcc.rhi_manifest, pcc._gh_bytes = real_manifest, real_bytes
+        self.assertTrue(r["pd_upscaler_installed"])
+        self.assertEqual((d / "dinput8.dll").read_bytes(), b"pd-upscaler build")
+        backup = d / "dinput8.dll.rhi_standard_backup"
+        self.assertEqual(backup.read_bytes(), b"standard REFramework build")
+        ref_rec = pcc.load_state()["rhi_reframework_installs"]["12345"]
+        self.assertEqual(ref_rec["version"], "PD-Upscaler")
+
+        # removing OptiScaler restores the standard build
+        real_latest = pcc.re_framework_latest
+        pcc.re_framework_latest = lambda: {"version": "nightly-2222", "url": "http://x"}
+        try:
+            pcc.remove_optiscaler("12345")
+        finally:
+            pcc.re_framework_latest = real_latest
+        self.assertEqual((d / "dinput8.dll").read_bytes(), b"standard REFramework build")
+        self.assertFalse(backup.exists())
+        ref_rec2 = pcc.load_state()["rhi_reframework_installs"]["12345"]
+        self.assertEqual(ref_rec2["version"], "nightly-2222")
+
+    def test_install_optiscaler_skips_pd_upscaler_when_no_standard_reframework(self):
+        d, exe = self._fake_game_exe()
+        self._fake_optiscaler_staging()
+        real_manifest = pcc.rhi_manifest
+        pcc.rhi_manifest = lambda: {"pdUpscalerGames": {"Test Game": "RE2"}}
+        try:
+            r = pcc.install_optiscaler("12345", str(d), exe_override=str(exe),
+                                       gpu_type="NVIDIA", game_name="Test Game")
+        finally:
+            pcc.rhi_manifest = real_manifest
+        self.assertFalse(r["pd_upscaler_installed"])
+        self.assertNotIn("12345", pcc.load_state().get("rhi_reframework_installs", {}))
+
+    def test_install_optiscaler_skips_pd_upscaler_for_unlisted_game(self):
+        d, exe = self._fake_game_exe()
+        (d / "dinput8.dll").write_bytes(b"standard build")
+        self._fake_optiscaler_staging()
+        real_manifest = pcc.rhi_manifest
+        pcc.rhi_manifest = lambda: {"pdUpscalerGames": {"Resident Evil 2": "RE2"}}
+        try:
+            r = pcc.install_optiscaler("12345", str(d), exe_override=str(exe),
+                                       gpu_type="NVIDIA", game_name="Some Other Game")
+        finally:
+            pcc.rhi_manifest = real_manifest
+        self.assertFalse(r["pd_upscaler_installed"])
+        self.assertEqual((d / "dinput8.dll").read_bytes(), b"standard build")
+
     def test_install_optiscaler_backs_up_game_original_dxgi(self):
         d, exe = self._fake_game_exe()
         (d / "dxgi.dll").write_bytes(b"totally unrelated game-owned dxgi")
@@ -2431,13 +2898,46 @@ class PCCTests(unittest.TestCase):
         pcc.remove_dxvk("12345")
         self.assertEqual((d / "dxgi.dll").read_bytes(), b"totally unrelated game-owned dxgi")
 
-    def test_install_dxvk_renames_conflicting_reshade(self):
+    def test_install_dxvk_refuses_to_orphan_reshade_without_optiscaler(self):
+        # Without OptiScaler present, nothing in the game folder would ever
+        # chainload a renamed ReShade64.dll - DXVK must refuse rather than
+        # silently break a working ReShade install.
         d, exe = self._fake_game_exe()
         (d / "dxgi.dll").write_bytes(b"R" * 100)
         state = pcc.load_state()
         state.setdefault("rhi_reshade_installs", {})["12345"] = {
             "path": str(d / "dxgi.dll"), "channel": "stable", "version": "6.8.0",
             "bitness": 64, "exe": str(exe),
+        }
+        pcc.save_state(state)
+        self._fake_dxvk_staging()
+        with self.assertRaises(RuntimeError):
+            pcc.install_dxvk("12345", str(d), "stable", exe_override=str(exe))
+        # ReShade untouched, DXVK never deployed
+        self.assertTrue((d / "dxgi.dll").is_file())
+        self.assertEqual((d / "dxgi.dll").read_bytes(), b"R" * 100)
+        self.assertFalse((d / "ReShade64.dll").exists())
+        self.assertNotIn("12345", pcc.load_state().get("rhi_dxvk_installs", {}))
+
+    def test_install_dxvk_renames_conflicting_reshade_when_optiscaler_present(self):
+        d, exe = self._fake_game_exe()
+        (d / "dxgi.dll").write_bytes(b"R" * 100)
+        state = pcc.load_state()
+        state.setdefault("rhi_reshade_installs", {})["12345"] = {
+            "path": str(d / "dxgi.dll"), "channel": "stable", "version": "6.8.0",
+            "bitness": 64, "exe": str(exe),
+        }
+        pcc.save_state(state)
+        # Simulate OptiScaler already having chainloaded/renamed ReShade
+        # itself and taken over dxgi.dll (the normal ReShade->OptiScaler
+        # install order) - here we instead pretend it's tracked but the
+        # ReShade record still points at dxgi.dll, to isolate DXVK's own
+        # rename-permission check from OptiScaler's.
+        (d / "dxgi.dll").write_bytes(b"R" * 100)   # OptiScaler's own dxgi.dll stand-in
+        state = pcc.load_state()
+        state.setdefault("rhi_optiscaler_installs", {})["12345"] = {
+            "install_path": str(d), "installed_as": "dxgi.dll", "variant": "stable",
+            "gpu_type": "NVIDIA", "version": "v1.0.0", "exe": str(exe),
         }
         pcc.save_state(state)
         self._fake_dxvk_staging()
@@ -2453,6 +2953,47 @@ class PCCTests(unittest.TestCase):
         self.assertTrue((d / "dxgi.dll").is_file())
         self.assertEqual((d / "dxgi.dll").read_bytes(), b"R" * 100)
         self.assertFalse((d / "ReShade64.dll").exists())
+
+    def _seed_rhi_manifest(self, **fields):
+        state = pcc.load_state()
+        state["rhi_manifest"] = {"ts": pcc.time.time(), "data": fields}
+        pcc.save_state(state)
+
+    def test_is_dxvk_blacklisted(self):
+        self._seed_rhi_manifest(dxvkBlacklist=["Fortnite", "Apex Legends"])
+        self.assertTrue(pcc.is_dxvk_blacklisted("Fortnite"))
+        self.assertTrue(pcc.is_dxvk_blacklisted("fortnite"))   # case-insensitive
+        self.assertFalse(pcc.is_dxvk_blacklisted("Some Other Game"))
+        self.assertFalse(pcc.is_dxvk_blacklisted(None))
+
+    def test_is_dxvk_blacklisted_no_manifest_data_is_not_blacklisted(self):
+        self.assertFalse(pcc.is_dxvk_blacklisted("Fortnite"))
+
+    def test_install_dxvk_refuses_blacklisted_game(self):
+        d, exe = self._fake_game_exe()
+        self._fake_dxvk_staging()
+        self._seed_rhi_manifest(dxvkBlacklist=["Fortnite"])
+        with self.assertRaises(RuntimeError):
+            pcc.install_dxvk("12345", str(d), "stable", exe_override=str(exe),
+                             game_name="Fortnite")
+        self.assertNotIn("12345", pcc.load_state().get("rhi_dxvk_installs", {}))
+        self.assertFalse((d / "dxgi.dll").exists())
+
+    def test_install_dxvk_allows_non_blacklisted_game(self):
+        d, exe = self._fake_game_exe()
+        self._fake_dxvk_staging()
+        self._seed_rhi_manifest(dxvkBlacklist=["Fortnite"])
+        pcc.install_dxvk("12345", str(d), "stable", exe_override=str(exe),
+                         game_name="Some Other Game")
+        self.assertIn("12345", pcc.load_state()["rhi_dxvk_installs"])
+
+    def test_scan_game_dxvk_reports_blacklisted_flag(self):
+        d, exe = self._fake_game_exe()
+        self._seed_rhi_manifest(dxvkBlacklist=["Fortnite"])
+        status = pcc.scan_game_dxvk("12345", str(d), exe_path=str(exe), game_name="Fortnite")
+        self.assertTrue(status["blacklisted"])
+        status2 = pcc.scan_game_dxvk("12345", str(d), exe_path=str(exe), game_name="Other Game")
+        self.assertFalse(status2["blacklisted"])
 
     def test_install_dxvk_ignores_reshade_in_a_different_directory(self):
         d = self.root / "steamapps/common/TestGame"
@@ -2484,6 +3025,27 @@ class PCCTests(unittest.TestCase):
         conf = (d / "dxvk.conf").read_text()
         self.assertEqual(conf, pcc.DXVK_LILIUM_D3D11_PRESETS[2][1])
         self.assertIn("scRGB", conf)
+
+    def test_reset_dxvk_conf_restores_default_template(self):
+        d, exe = self._fake_game_exe()
+        self._fake_dxvk_staging()
+        pcc.install_dxvk("12345", str(d), "stable", exe_override=str(exe))
+        (d / "dxvk.conf").write_text("dxvk.enableGraphicsPipelineLibrary = False\n# user edit")
+        r = pcc.reset_dxvk_conf("12345")
+        self.assertTrue(r["reset"])
+        self.assertEqual((d / "dxvk.conf").read_text(), pcc.DXVK_DEFAULT_CONF)
+
+    def test_reset_dxvk_conf_restores_lilium_preset(self):
+        d, exe = self._fake_game_exe()
+        self._fake_dxvk_staging(variant="lilium", version="v3.0.2-HDR-mod-v0.3.4")
+        pcc.install_dxvk("12345", str(d), "lilium", exe_override=str(exe), lilium_preset=2)
+        (d / "dxvk.conf").write_text("garbage")
+        pcc.reset_dxvk_conf("12345")
+        self.assertEqual((d / "dxvk.conf").read_text(), pcc.DXVK_LILIUM_D3D11_PRESETS[2][1])
+
+    def test_reset_dxvk_conf_no_install_raises(self):
+        with self.assertRaises(RuntimeError):
+            pcc.reset_dxvk_conf("99999")
 
     def test_dxvk_routes_conflicting_dll_to_optiscaler_plugins(self):
         d, exe = self._fake_game_exe()
@@ -2531,6 +3093,26 @@ class PCCTests(unittest.TestCase):
         dxvk_rec = pcc.load_state()["rhi_dxvk_installs"]["12345"]
         self.assertIn("dxgi.dll", dxvk_rec["installed_dlls"])
         self.assertEqual(dxvk_rec["plugin_dlls"], [])
+
+    def test_optiscaler_does_not_relocate_stale_dxvk_record(self):
+        # If the state record claims a DLL is DXVK's but the actual file on
+        # disk isn't (a stale record, or the user manually swapped it), it
+        # must NOT get relocated into OptiScaler/plugins/ as if it were.
+        d, exe = self._fake_game_exe()
+        (d / "dxgi.dll").write_bytes(b"some totally unrelated vendor binary content")
+        state = pcc.load_state()
+        state.setdefault("rhi_dxvk_installs", {})["12345"] = {
+            "install_path": str(d), "variant": "stable", "api": "d3d11", "bitness": 64,
+            "installed_dlls": ["dxgi.dll"], "plugin_dlls": [], "backed_up_files": [],
+            "exe": str(exe),
+        }
+        pcc.save_state(state)
+        self._fake_optiscaler_staging()
+        pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="NVIDIA")
+        self.assertFalse((d / "OptiScaler" / "plugins" / "dxgi.dll").exists())
+        dxvk_rec = pcc.load_state()["rhi_dxvk_installs"]["12345"]
+        self.assertIn("dxgi.dll", dxvk_rec["installed_dlls"])
+        self.assertEqual(dxvk_rec.get("plugin_dlls", []), [])
 
     # ---- compile state ----
     def test_sgdb_fetch_and_cache(self):
@@ -3044,6 +3626,68 @@ class PCCTests(unittest.TestCase):
             pcc._rhi_dlss_manifest, pcc._gh_bytes = real_manifest, real_bytes
         self.assertEqual(pcc.TASKS["t4"]["status"], "done")
         self.assertIn("already cached", pcc.TASKS["t4"]["detail"])
+
+    def _seed_streamline_version(self, version, files):
+        vdir = pcc.STREAMLINE_DATA_DIR / version
+        vdir.mkdir(parents=True, exist_ok=True)
+        for name, content in files.items():
+            (vdir / name).write_bytes(content)
+
+    def test_deploy_streamline_to_game_no_cache_raises(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        with self.assertRaises(RuntimeError):
+            pcc.deploy_streamline_to_game(str(d))
+
+    def test_deploy_streamline_to_game_copies_dlls_and_scan_reports_it(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        self._seed_streamline_version("2.13.0.0", {
+            "sl.interposer.dll": b"interposer", "sl.dlss_g.dll": b"fg plugin",
+            "readme.txt": b"not a dll, must be skipped",
+        })
+        r = pcc.deploy_streamline_to_game(str(d))
+        self.assertEqual(r["deployed"], 2)
+        self.assertEqual(r["version"], "2.13.0.0")
+        dest = d / "OptiScaler" / "Streamline"
+        self.assertEqual((dest / "sl.interposer.dll").read_bytes(), b"interposer")
+        self.assertEqual((dest / "sl.dlss_g.dll").read_bytes(), b"fg plugin")
+        self.assertFalse((dest / "readme.txt").exists())
+
+        status = pcc.scan_streamline_for_game(str(d))
+        self.assertTrue(status["deployed"])
+        self.assertCountEqual(status["files"], ["sl.interposer.dll", "sl.dlss_g.dll"])
+
+        rm = pcc.remove_streamline_from_game(str(d))
+        self.assertTrue(rm["removed"])
+        self.assertFalse(dest.exists())
+        status2 = pcc.scan_streamline_for_game(str(d))
+        self.assertFalse(status2["deployed"])
+
+    def test_deploy_streamline_to_game_picks_requested_version(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        self._seed_streamline_version("2.13.0.0", {"sl.interposer.dll": b"new"})
+        self._seed_streamline_version("2.10.0.0", {"sl.interposer.dll": b"old"})
+        r = pcc.deploy_streamline_to_game(str(d), version="2.10.0.0")
+        self.assertEqual(r["version"], "2.10.0.0")
+        self.assertEqual((d / "OptiScaler" / "Streamline" / "sl.interposer.dll").read_bytes(), b"old")
+
+    def test_remove_streamline_from_game_noop_when_not_deployed(self):
+        d = self.root / "steamapps/common/TestGame"
+        d.mkdir(parents=True, exist_ok=True)
+        rm = pcc.remove_streamline_from_game(str(d))
+        self.assertFalse(rm["removed"])
+
+    def test_remove_optiscaler_takes_streamline_folder_with_it(self):
+        d, exe = self._fake_game_exe()
+        self._fake_optiscaler_staging()
+        pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="NVIDIA")
+        self._seed_streamline_version("2.13.0.0", {"sl.interposer.dll": b"x"})
+        pcc.deploy_streamline_to_game(str(d))
+        self.assertTrue((d / "OptiScaler" / "Streamline" / "sl.interposer.dll").is_file())
+        pcc.remove_optiscaler("12345")
+        self.assertFalse((d / "OptiScaler").exists())
 
     def test_pe_version_skips_false_signature(self):
         """Regression: a coincidental 0xFEEF04BD before the real version block
