@@ -600,6 +600,19 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
         Manual import below stays available as a fallback.</p>
       <div class="bar" id="dlBar"><i></i></div>
     </div>
+    <div class="section">
+      <h3>Streamline SDK</h3>
+      <p class="note">The full sl.*.dll/nvngx_*.dll bundle some games ship directly, separate from the
+        single DLLs above. Cached locally — no automatic per-game deploy, since there's no single
+        convention for where a game expects the whole set placed.</p>
+      <div id="streamlineStatus" class="note">—</div>
+      <div id="streamlineLib"></div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn" id="streamlineCheckBtn">Check for updates</button>
+        <button class="btn green" id="streamlineDlBtn">Download latest Streamline SDK</button>
+      </div>
+      <div class="bar" id="streamlineBar"><i></i></div>
+    </div>
   </div>
 
   <!-- MODS -->
@@ -1778,6 +1791,8 @@ async function loadDLSS(appid){
     statusById[appid]={...statusById[appid],dlss:d.dlls.length>0};
     renderGrid($("#search").value);
     if(!d.dlls.length){$("#dlssList").innerHTML='<p class="note">No DLSS DLLs found in this game.</p>';return}
+    const hasNr=d.dlls.some(dll=>dll.kind==="nr");
+    const hasOther=d.dlls.some(dll=>dll.kind!=="nr");
     $("#dlssList").innerHTML=d.dlls.map((dll,i)=>{
       const newest=libDlls.filter(x=>x.kind===dll.kind).sort((a,b)=>vNewer(a.version,b.version)?-1:1)[0];
       const upd=newest&&vNewer(newest.version,dll.version);
@@ -1795,11 +1810,28 @@ async function loadDLSS(appid){
           <button class="btn green" data-doswap="${i}">Swap</button>
           ${dll.backed_up?`<button class="btn" data-restore="${i}">Restore original</button>`:""}
         </div>
-      </div>`}).join("");
+      </div>`}).join("")
+      +(!hasNr&&hasOther?`
+      <div class="item">
+        <div class="top"><b>DLSS Neural Rendering</b><span class="chip m">not deployed</span></div>
+        <p class="note">Not present in this game. If you deploy it, it'll be copied next to
+          the DLSS DLLs found above (RTX 50-series GPUs only).</p>
+        <div class="row" style="margin-top:10px">
+          <button class="btn green" id="deployNrBtn">Deploy Neural Rendering DLL here</button>
+        </div>
+      </div>`:"");
     window._gameDlls=d.dlls;
     fillSwapSelects();
     $("#dlssList").onclick=async e=>{
       const s=e.target.dataset.doswap,r=e.target.dataset.restore,u=e.target.dataset.update;
+      if(e.target.id==="deployNrBtn"){
+        const btn=e.target;btn.disabled=true;
+        try{
+          const res=await post(`/api/game/${appid}/dlss/deploy_nr`,{});
+          toast(`Deployed Neural Rendering v${res.version}`);loadDLSS(appid);
+        }catch(err){toast(err.message,true);btn.disabled=false}
+        return;
+      }
       if(u!==undefined){
         try{
           const res=await post("/api/dlss/swap",{game_dll:window._gameDlls[u].path,library_dll:e.target.dataset.lib});
@@ -2481,6 +2513,47 @@ $("#importBtn").addEventListener("click",async()=>{
     const r=await post("/api/dlss/import",{path:$("#importPath").value});
     toast(`Imported ${r.kind.toUpperCase()} v${r.version}`);$("#importPath").value="";loadLibrary();
   }catch(e){toast(e.message,true)}
+});
+
+function renderStreamlineLib(cached){
+  $("#streamlineLib").innerHTML=cached.length?cached.map(x=>`
+    <div class="item"><div class="top"><b class="mono">Streamline SDK</b>
+      <span class="chip g">${esc(x.version)}</span></div>
+      <div class="note mono">${esc(x.path)} — ${x.files.length} files</div></div>`).join("")
+    :'<p class="note">Nothing cached yet.</p>';
+}
+async function loadStreamlineLibrary(){
+  try{
+    const d=await api("/api/streamline/latest");
+    renderStreamlineLib(d.cached||[]);
+    return d;
+  }catch(e){return null}
+}
+loadStreamlineLibrary();
+$("#streamlineCheckBtn").addEventListener("click",async()=>{
+  const btn=$("#streamlineCheckBtn");btn.disabled=true;
+  try{
+    const d=await loadStreamlineLibrary();
+    if(!d||!d.latest){$("#streamlineStatus").textContent="Couldn't reach RHI's manifest.";return}
+    const have=(d.cached||[]).some(x=>x.version===d.latest.version);
+    $("#streamlineStatus").textContent=have
+      ? `Up to date — Streamline SDK ${d.latest.version} is cached.`
+      : `Streamline SDK ${d.latest.version} is available (not yet downloaded).`;
+  }catch(e){toast(e.message,true)}
+  finally{btn.disabled=false}
+});
+$("#streamlineDlBtn").addEventListener("click",async()=>{
+  const btn=$("#streamlineDlBtn");
+  try{
+    const {task}=await post("/api/streamline/download",{});
+    btn.disabled=true;
+    trackTask(task,"#streamlineBar",(t)=>{
+      btn.disabled=false;
+      toast(t.detail||"Done");
+      loadStreamlineLibrary();
+    });
+    setTimeout(()=>btn.disabled=false,300000);
+  }catch(e){toast(e.message,true);btn.disabled=false}
 });
 
 function trackTask(id,barSel,onDone,detailSel){

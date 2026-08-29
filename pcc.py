@@ -38,9 +38,10 @@ _DEDUPE_ON_IMPORT = True  # dedupe runs lazily via dll_library()
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
 DLSS_KINDS = {
-    "nvngx_dlss.dll":  {"kind": "sr",  "label": "DLSS Super Resolution"},
-    "nvngx_dlssg.dll": {"kind": "fg",  "label": "DLSS Frame Generation"},
-    "nvngx_dlssd.dll": {"kind": "rr",  "label": "DLSS Ray Reconstruction"},
+    "nvngx_dlss.dll":   {"kind": "sr",  "label": "DLSS Super Resolution"},
+    "nvngx_dlssg.dll":  {"kind": "fg",  "label": "DLSS Frame Generation"},
+    "nvngx_dlssd.dll":  {"kind": "rr",  "label": "DLSS Ray Reconstruction"},
+    "nvngx_dlssnr.dll": {"kind": "nr",  "label": "DLSS Neural Rendering"},
 }
 KIND_TO_NAME = {v["kind"]: k for k, v in DLSS_KINDS.items()}
 
@@ -802,7 +803,17 @@ def _scan_dlss_tree(base: Path):
     return found
 
 
-def scan_game_dlss(install_path):
+def scan_game_dlss(install_path, other_roots=()):
+    """other_roots: every OTHER game's own install_path known to PCC. The
+    climb below refuses to step into a directory that's home to one of
+    them - without that check it silently wanders into a Steam library's
+    shared common/ folder (or a custom multi-game root) after just one
+    climb and reports a completely unrelated game's DLLs as this game's
+    own. Found the hard way: scanning "Alien: Isolation" (which has no
+    DLSS of its own) climbed straight into steamapps/common and reported
+    The Witcher 3's nvngx_dlss.dll, and a misconfigured non-Steam shortcut
+    climbed into a shared /mnt/data/Games root and reported DLLs from
+    three unrelated games."""
     base = Path(install_path)
     found = _scan_dlss_tree(base)
     if found:
@@ -814,9 +825,12 @@ def scan_game_dlss(install_path):
     # Binaries/Win64 folder the exe sits in) can live several levels above
     # that. Climb looking for them, stopping at the first hit so this can't
     # wander into an unrelated sibling game's folder higher up the tree.
+    other_roots = [Path(p) for p in other_roots]
     for _ in range(4):
         parent = base.parent
         if parent == base or len(parent.parts) <= 2:
+            break
+        if any(parent == r or parent in r.parents for r in other_roots):
             break
         base = parent
         found = _scan_dlss_tree(base)
@@ -2294,27 +2308,37 @@ def download_dlss(task_id, kind) -> None:
                       "detail": f"Looking for {label} DLL"}
     errors = []
 
-    # PRIMARY: DLSS Swapper's manifest - refreshed constantly, carries the
-    # newest SR/FG/RR versions (this is the fix for "not fetching the latest").
+    # PRIMARY: DLSS Swapper's manifest, checked alongside RHI's own manifest -
+    # both are refreshed constantly and each has been the first to carry a
+    # brand-new SR/FG/RR build at different times, so take whichever reports
+    # the higher version (this is the fix for "not fetching the latest").
+    got = None
     try:
         TASKS[task_id]["detail"] = "Checking DLSS Swapper manifest"
         got = _manifest_latest(kind, task_id)
-        if got:
-            version, data = got
-            tmp_final = DATA_DIR / dll_name
-            try:
-                tmp_final.write_bytes(data)
-                if data[:2] == b"MZ" and pe_version(tmp_final):
-                    info = import_dll(tmp_final)
-                    fr = friendly_dlss(info["version"])
-                    TASKS[task_id] = {"status": "done", "progress": 100,
-                                      "detail": f"Added {fr['gen']} {label} "
-                                                f"{fr['short']}"}
-                    return
-            finally:
-                tmp_final.unlink(missing_ok=True)
     except Exception as e:
         errors.append(f"manifest: {e}")
+    try:
+        TASKS[task_id]["detail"] = "Checking RHI manifest"
+        rhi_got = _rhi_manifest_latest(kind, task_id)
+        if rhi_got and (not got or version_tuple(rhi_got[0]) > version_tuple(got[0])):
+            got = rhi_got
+    except Exception as e:
+        errors.append(f"rhi manifest: {e}")
+    if got:
+        version, data = got
+        tmp_final = DATA_DIR / dll_name
+        try:
+            tmp_final.write_bytes(data)
+            if data[:2] == b"MZ" and pe_version(tmp_final):
+                info = import_dll(tmp_final)
+                fr = friendly_dlss(info["version"])
+                TASKS[task_id] = {"status": "done", "progress": 100,
+                                  "detail": f"Added {fr['gen']} {label} "
+                                            f"{fr['short']}"}
+                return
+        finally:
+            tmp_final.unlink(missing_ok=True)
     for repo, fname in DLL_SOURCES.get(kind, []):
         try:
             TASKS[task_id]["detail"] = f"Searching {repo}"
@@ -3698,13 +3722,18 @@ RESHADE_ADDONS_CACHE_FILE = RHI_DATA_DIR / "addons_cache.ini"
 RENODX_DLSS5_RELEASES_API = "https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100"
 RENODX_DLSS5_TAG_PREFIX = "renodx-dlss5-"
 RENODX_DLSS5_ADDON_FILE = "renodx-dlss5.addon64"
-# RHI's own small curated DLSS manifest (distinct from the much larger
-# beeradmoore/dlss-swapper-manifest-builder one Part 2's OptiScaler DLSS
-# swap uses) - confirmed live to be the only source with a "dlssnr" entry
-# (NVIDIA's DLSS Neural Rendering component, required by RenoDX DLSS5,
-# 50-series GPUs only): version 310.8.0 at research time, a zip asset on
-# RankFTW/rhi-repo.
+# RHI's own curated DLSS manifest (distinct from the beeradmoore/
+# dlss-swapper-manifest-builder one Part 2's OptiScaler DLSS swap uses). It
+# also carries "dlss"/"dlssg"/"dlssd"/"streamline" sections overlapping
+# beeradmoore's, and has repeatedly gone live with a new DLSS build (e.g.
+# 310.8.0) before both the DLSS Swapper manifest and NVIDIA's own public
+# GitHub repos catch up - see rhi_manifest_dlss_sr/fg/rr() below, checked
+# alongside _manifest_latest() in download_dlss(). It's the only source
+# with a "dlssnr" entry at all (NVIDIA's DLSS Neural Rendering component,
+# required by RenoDX DLSS5, 50-series GPUs only): version 310.8.0 at
+# research time, a zip asset on RankFTW/rhi-repo.
 RHI_DLSS_MANIFEST_URL = "https://raw.githubusercontent.com/RankFTW/RHI/main/dlss_manifest.json"
+RHI_DLSS_MANIFEST_SECTION = {"sr": "dlss", "fg": "dlssg", "rr": "dlssd"}
 DLSSNR_DLL_NAME = "nvngx_dlssnr.dll"
 DLSSNR_CACHE_DIR = RHI_DATA_DIR / "dlssnr"
 
@@ -3762,6 +3791,113 @@ def _rhi_dlss_manifest() -> dict:
     return data
 
 
+def _rhi_manifest_latest(kind, task_id):
+    """Same shape as _manifest_latest() but reading RHI's own dlss_manifest.json
+    instead of DLSS Swapper's. Checked alongside it in download_dlss() -
+    whichever manifest reports the higher version wins, so a lag on either
+    side (this has happened on both) never blocks picking up a new build."""
+    import zipfile, io
+    section = RHI_DLSS_MANIFEST_SECTION.get(kind)
+    if not section:
+        return None
+    try:
+        entries = _rhi_dlss_manifest().get(section) or []
+    except Exception:
+        return None
+    if not entries:
+        return None
+    best = max(entries, key=lambda e: version_tuple(e.get("version", "0")))
+    url = best.get("url")
+    if not url:
+        return None
+    TASKS[task_id]["detail"] = f"RHI manifest has {best.get('version')}, downloading"
+    data = _gh_bytes(url, task_id)
+    fname = KIND_TO_NAME.get(kind)
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            members = [m for m in z.namelist() if m.lower().endswith(fname)]
+            if members:
+                return best.get("version"), z.read(members[0])
+    except zipfile.BadZipFile:
+        pass
+    return None
+
+
+# Streamline SDK: the full sl.*.dll/nvngx_*.dll bundle (interposer + plugins),
+# distinct from the single "dlss"/"dlssg"/"dlssd" DLLs download_dlss() swaps
+# per-game. There's no single convention for where a game expects the whole
+# set placed, so this only wires up the download point - a local version
+# cache the user can point a game at manually, same spirit as manual import.
+STREAMLINE_DATA_DIR = RHI_DATA_DIR / "streamline"
+
+
+def streamline_sdk_latest() -> dict | None:
+    """Latest Streamline SDK release from RHI's own manifest's "streamline"
+    section. 6h cached via _rhi_dlss_manifest()."""
+    entries = _rhi_dlss_manifest().get("streamline") or []
+    if not entries:
+        return None
+    best = max(entries, key=lambda e: version_tuple(e.get("version", "0")))
+    if not best.get("url"):
+        return None
+    return {"version": best.get("version"), "url": best["url"]}
+
+
+def streamline_sdk_library() -> list:
+    """Locally cached Streamline SDK bundles, newest first."""
+    if not STREAMLINE_DATA_DIR.is_dir():
+        return []
+    out = []
+    for vdir in STREAMLINE_DATA_DIR.iterdir():
+        if not vdir.is_dir():
+            continue
+        files = sorted(f.name for f in vdir.iterdir() if f.is_file())
+        if files:
+            out.append({"version": vdir.name, "path": str(vdir), "files": files})
+    out.sort(key=lambda e: version_tuple(e["version"]), reverse=True)
+    return out
+
+
+def download_streamline_sdk(task_id) -> None:
+    """Downloads+extracts the latest Streamline SDK bundle into
+    STREAMLINE_DATA_DIR/<version>/, flattening the zip's internal folder.
+    A no-op if that version is already cached."""
+    import zipfile, io
+    TASKS[task_id] = {"status": "running", "progress": 0, "detail": "Checking RHI manifest"}
+    try:
+        latest = streamline_sdk_latest()
+        if not latest:
+            TASKS[task_id] = {"status": "error", "progress": 0,
+                              "detail": "No Streamline SDK entry in RHI's manifest"}
+            return
+        version = latest["version"]
+        version_dir = STREAMLINE_DATA_DIR / version
+        if version_dir.is_dir() and any(version_dir.iterdir()):
+            TASKS[task_id] = {"status": "done", "progress": 100,
+                              "detail": f"Streamline SDK {version} already cached",
+                              "result": {"version": version, "path": str(version_dir)}}
+            return
+        TASKS[task_id]["detail"] = f"Downloading Streamline SDK {version}"
+        data = _gh_bytes(latest["url"], task_id)
+        TASKS[task_id]["detail"] = "Extracting"
+        version_dir.mkdir(parents=True, exist_ok=True)
+        count = 0
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for member in zf.namelist():
+                if member.endswith("/"):
+                    continue
+                name = Path(member).name
+                if not name:
+                    continue
+                (version_dir / name).write_bytes(zf.read(member))
+                count += 1
+        TASKS[task_id] = {"status": "done", "progress": 100,
+                          "detail": f"Streamline SDK {version} cached ({count} files)",
+                          "result": {"version": version, "path": str(version_dir)}}
+    except Exception as e:
+        TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
+
+
 def ensure_dlssnr_cached() -> Path | None:
     """Downloads+caches the latest nvngx_dlssnr.dll from RHI's own curated
     manifest - the required companion for the RenoDX DLSS5 addon."""
@@ -3794,6 +3930,51 @@ def _deploy_dlssnr_if_absent(install_path) -> None:
     src = ensure_dlssnr_cached()
     if src:
         shutil.copy2(src, dest)
+
+
+def find_dlssnr_target_dir(install_path, other_roots=()) -> Path | None:
+    """Where nvngx_dlssnr.dll belongs for a game that doesn't have one yet:
+    whatever directory its other DLSS engine DLLs already live in, since
+    Streamline loads its nvngx_*.dll plugins from a single shared folder -
+    the same reasoning as the RenoDX DLSS5 addon's own DeployNrDllIfAbsentAsync,
+    generalised beyond that one addon's own install dir. Games scatter these
+    across nested engine-plugin folders (see scan_game_dlss's climb-up
+    comment), so this reuses that same scan rather than guessing a path.
+    other_roots is forwarded to scan_game_dlss() unchanged - required here
+    even more than there, since this function's whole job is picking a
+    write target, not just a display path. Prefers Super Resolution's
+    folder (present whenever DLSS is used at all), falling back to Frame
+    Generation's then Ray Reconstruction's. None if no other DLSS DLL was
+    found anywhere - without one there's no basis to guess where NR should
+    go."""
+    found = scan_game_dlss(install_path, other_roots=other_roots)
+    for kind in ("sr", "fg", "rr"):
+        hit = next((f for f in found if f["kind"] == kind), None)
+        if hit:
+            return Path(hit["path"]).parent
+    return None
+
+
+def deploy_dlssnr_to_game(install_path, other_roots=()) -> dict:
+    """Copies the cached nvngx_dlssnr.dll into whichever directory this
+    game's other DLSS DLLs already live in (find_dlssnr_target_dir). Backs
+    up any existing NR file first, matching swap_dll()'s backup convention,
+    so restore_dll() works on it afterwards like any other DLSS DLL."""
+    target_dir = find_dlssnr_target_dir(install_path, other_roots=other_roots)
+    if not target_dir:
+        raise RuntimeError("No DLSS Super Resolution/Frame Generation/Ray "
+                           "Reconstruction DLL found in this game - can't tell "
+                           "where the Neural Rendering DLL should go.")
+    src = ensure_dlssnr_cached()
+    if not src:
+        raise RuntimeError("Couldn't fetch nvngx_dlssnr.dll from RHI's manifest.")
+    dest = target_dir / DLSSNR_DLL_NAME
+    if dest.is_file():
+        bak = _backup_path(dest)
+        if not bak.exists():
+            shutil.copy2(dest, bak)
+    shutil.copy2(src, dest)
+    return {"deployed": True, "path": str(dest), "version": pe_version(dest)}
 
 
 def _slugify_addon_name(name) -> str:
@@ -6918,7 +7099,9 @@ class Handler(BaseHTTPRequestHandler):
             elif m := re.match(r"^/api/game/(\d+)/dlss$", self.path):
                 games = {g["appid"]: g for g in all_games(root)}
                 g = games.get(m.group(1))
-                dlls = scan_game_dlss(g["install_path"]) if g else []
+                other_roots = [g2["install_path"] for aid2, g2 in games.items()
+                               if aid2 != m.group(1) and g2.get("install_path")]
+                dlls = scan_game_dlss(g["install_path"], other_roots=other_roots) if g else []
                 state = load_state()
                 state.setdefault("dlss_seen", {})[m.group(1)] = bool(dlls)
                 save_state(state)
@@ -7051,6 +7234,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(fetch_owned_games(root, force=force))
             elif self.path == "/api/dlss/library":
                 self._json({"dlls": dll_library()})
+            elif self.path == "/api/streamline/latest":
+                self._json({"latest": streamline_sdk_latest(),
+                            "cached": streamline_sdk_library()})
             elif m := re.match(r"^/api/art_debug/(\d+)(?:\?(.*))?$", self.path):
                 qs = urllib.parse.parse_qs(m.group(2) or "")
                 gname = (qs.get("name") or [None])[0]
@@ -7384,6 +7570,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(restore_dll(body["game_dll"]))
             elif self.path == "/api/dlss/import":
                 self._json(import_dll(body["path"]))
+            elif m := re.match(r"^/api/game/(\d+)/dlss/deploy_nr$", self.path):
+                games = {g["appid"]: g for g in all_games(root)}
+                g = games.get(m.group(1))
+                if not g:
+                    self._json({"error": "game not found"}, 404); return
+                other_roots = [g2["install_path"] for aid2, g2 in games.items()
+                               if aid2 != m.group(1) and g2.get("install_path")]
+                self._json(deploy_dlssnr_to_game(g["install_path"], other_roots=other_roots))
             elif self.path == "/api/dlss/download":
                 kind = body.get("kind", "sr")
                 if kind not in DLL_SOURCES:
@@ -7395,6 +7589,11 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/dlss/download_sr":
                 tid = str(uuid.uuid4())
                 threading.Thread(target=download_latest_sr, args=(tid,), daemon=True).start()
+                self._json({"task": tid})
+            elif self.path == "/api/streamline/download":
+                tid = str(uuid.uuid4())
+                threading.Thread(target=download_streamline_sdk, args=(tid,),
+                                 daemon=True).start()
                 self._json({"task": tid})
             else:
                 self._json({"error": "not found"}, 404)
