@@ -26,7 +26,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.28.0"
+VERSION = "1.29.0"
 PORT = int(os.environ.get("PCC_PORT", "8686"))
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path.home() / ".local/share/proton-command-center"
@@ -4779,6 +4779,13 @@ OPTISCALER_INIS_DIR = OPTISCALER_DATA_DIR / "inis"          # user-editable, see
 OPTIPATCHER_STAGING_DIR = OPTISCALER_DATA_DIR / "optipatcher"
 OPTISCALER_DLSS_DIR = OPTISCALER_DATA_DIR / "dlss"           # SR/RR/FG dll cache
 OPTISCALER_INI_TEMPLATES_DIR = Path(__file__).resolve().parent / "optiscaler_inis"
+# Custom channel - same idea as RESHADE_CUSTOM_DIR: the user drops an
+# already-extracted build of their own (a fork, a DLSS-NR build, anything
+# with a real release's layout - OptiScaler.dll alongside its companion
+# files) into its own named subfolder here, and it shows up as a pickable
+# build on the Custom variant. No download, no staging copy - installed
+# straight from this folder, same approach ReShade's Custom channel uses.
+OPTISCALER_CUSTOM_DIR = RHI_DATA_DIR / "optiscaler-custom"
 
 OPTISCALER_RELEASES_API = "https://api.github.com/repos/optiscaler/OptiScaler/releases/latest"
 OPTISCALER_NIGHTLY_RELEASES_API = "https://api.github.com/repos/optiscaler/OptiScaler-nightly/releases"
@@ -4845,6 +4852,42 @@ def optiscaler_staging_ready(nightly=False) -> bool:
     return (d / "OptiScaler.dll").is_file() and (d / "version.txt").is_file()
 
 
+def list_custom_optiscaler_builds() -> list:
+    """Subfolders under OPTISCALER_CUSTOM_DIR that look like a real
+    OptiScaler build (OptiScaler.dll directly inside), for the per-game
+    'which one' picker - port of list_custom_reshade_files() for a
+    multi-file build instead of a single DLL."""
+    if not OPTISCALER_CUSTOM_DIR.is_dir():
+        return []
+    return sorted(p.name for p in OPTISCALER_CUSTOM_DIR.iterdir()
+                 if p.is_dir() and (p / "OptiScaler.dll").is_file())
+
+
+def resolve_optiscaler_staging(variant, custom_build=None, task_id=None) -> tuple:
+    """Resolves (staging_dir, version_label) for the requested OptiScaler
+    variant. Stable/Nightly download+extract the latest GitHub release as
+    before; Custom points straight at a user-dropped build folder in
+    OPTISCALER_CUSTOM_DIR - no download, no staging copy, version_label is
+    just the folder name (mirrors get_staged_reshade_path's Custom case,
+    where the filename itself is the version label)."""
+    if variant == "custom":
+        if not custom_build:
+            builds = list_custom_optiscaler_builds()
+            if not builds:
+                raise RuntimeError(
+                    f"No builds in the Custom OptiScaler folder ({OPTISCALER_CUSTOM_DIR}) - "
+                    f"drop an extracted build there first, in its own subfolder "
+                    f"(one containing OptiScaler.dll directly).")
+            custom_build = builds[0]
+        d = OPTISCALER_CUSTOM_DIR / custom_build
+        if not (d / "OptiScaler.dll").is_file():
+            raise RuntimeError(f"Custom OptiScaler build not found: {custom_build}")
+        return d, custom_build
+    nightly = variant == "nightly"
+    staging_dir = ensure_optiscaler_staging(nightly=nightly, task_id=task_id)
+    return staging_dir, optiscaler_staging_version(nightly=nightly)
+
+
 def optiscaler_latest(nightly=False) -> dict:
     """Latest OptiScaler release metadata (tag + .7z asset URL), 6h cached.
     Stable has a real 'latest' alias; Nightly's repo doesn't, so the first
@@ -4881,6 +4924,48 @@ def check_optiscaler_update(nightly=False) -> bool:
     except Exception:
         return False
     return optiscaler_staging_ready(nightly) and optiscaler_staging_version(nightly) != info["version"]
+
+
+def _hash_dir(path) -> str:
+    """Combined content hash of every file under a directory tree (path +
+    content, so a rename is also seen as a change), for detecting when the
+    user has dropped a new build over an existing Custom OptiScaler folder."""
+    h = hashlib.sha256()
+    for p in sorted(Path(path).rglob("*")):
+        if p.is_file():
+            h.update(str(p.relative_to(path)).encode())
+            h.update(_sha256_file(p).encode())
+    return h.hexdigest()
+
+
+def check_custom_optiscaler_updates() -> dict:
+    """Detects when a Custom OptiScaler build folder has changed since it
+    was last hashed (the user dropped a newer build in over the same
+    folder name) and redeploys it to every game installed from that exact
+    folder - port of check_custom_reshade_updates() for a whole build
+    directory instead of a single DLL. Reuses update_optiscaler() itself
+    for the actual redeploy, since it already knows how to re-stage +
+    re-deploy any tracked install by appid."""
+    if not OPTISCALER_CUSTOM_DIR.is_dir():
+        return {"changed": [], "redeployed": 0}
+    current = {d.name: _hash_dir(d) for d in OPTISCALER_CUSTOM_DIR.iterdir()
+              if d.is_dir() and (d / "OptiScaler.dll").is_file()}
+    state = load_state()
+    first_run = "rhi_custom_optiscaler_hashes" not in state
+    stored = state.get("rhi_custom_optiscaler_hashes", {})
+    changed = set() if first_run else {name for name, h in current.items() if stored.get(name) != h}
+    redeployed = 0
+    if changed:
+        for appid, rec in state.get("rhi_optiscaler_installs", {}).items():
+            if rec.get("variant") == "custom" and rec.get("custom_build") in changed:
+                try:
+                    update_optiscaler(appid)
+                    redeployed += 1
+                except Exception:
+                    pass
+    state["rhi_custom_optiscaler_hashes"] = current
+    save_state(state)
+    return {"changed": sorted(changed), "redeployed": redeployed}
 
 
 def ensure_optiscaler_staging(nightly=False, task_id=None) -> Path:
@@ -5286,17 +5371,22 @@ def scan_game_optiscaler(appid, install_path, exe_path=None) -> dict:
     result = {"exe": str(exe) if exe else None, "detected_api": detected["api"],
              "detected_api_display": display["label"], "detected_api_inferred": display["inferred"],
              "detected_bitness": detected["bitness"], "installed": False,
-             "update_available": False}
+             "update_available": False, "custom_builds": list_custom_optiscaler_builds()}
     if rec:
         p = Path(rec["install_path"]) / rec["installed_as"]
-        nightly = rec.get("variant") == "nightly"
+        variant = rec.get("variant", "stable")
         result.update({"installed": p.is_file(), "path": str(p),
-                       "installed_as": rec["installed_as"], "variant": rec.get("variant"),
+                       "installed_as": rec["installed_as"], "variant": variant,
+                       "custom_build": rec.get("custom_build"),
                        "gpu_type": rec.get("gpu_type"), "dlss_inputs": rec.get("dlss_inputs"),
                        "version": rec.get("version")})
-        if p.is_file():
+        # Update checks only make sense for the GitHub-sourced channels -
+        # Custom is user-managed by design (its own "Check for updates"
+        # button hash-diffs the folder instead, matching Legacy/Custom
+        # ReShade's same reasoning in scan_game_reshade()).
+        if p.is_file() and variant in ("stable", "nightly"):
             try:
-                result["update_available"] = check_optiscaler_update(nightly=nightly)
+                result["update_available"] = check_optiscaler_update(nightly=(variant == "nightly"))
             except Exception:
                 pass
     return result
@@ -5304,7 +5394,7 @@ def scan_game_optiscaler(appid, install_path, exe_path=None) -> dict:
 
 def install_optiscaler(appid, install_path, exe_override=None, gpu_type=None,
                        dlss_inputs=True, variant="stable", hotkey=None,
-                       task_id=None, game_name=None) -> dict:
+                       custom_build=None, task_id=None, game_name=None) -> dict:
     """Installs OptiScaler for one game: resolves the effective DLL name
     from the detected graphics API (dxgi.dll, or winmm.dll for Vulkan),
     renames an already-installed ReShade out of the way first if its
@@ -5313,7 +5403,10 @@ def install_optiscaler(appid, install_path, exe_override=None, gpu_type=None,
     of RE Engine games with a dedicated OptiScaler-compatible REFramework
     build (manifest.json's pdUpscalerGames), also swaps that in over an
     already-installed standard REFramework - non-fatal on failure, since
-    OptiScaler itself is already successfully installed by that point."""
+    OptiScaler itself is already successfully installed by that point.
+    variant="custom" installs a user-dropped build from custom_build (see
+    OPTISCALER_CUSTOM_DIR / resolve_optiscaler_staging) instead of
+    downloading a GitHub release."""
     nightly = variant == "nightly"
     exe = Path(exe_override).expanduser() if exe_override else _find_game_exe(install_path)
     if not exe or not exe.is_file():
@@ -5324,8 +5417,7 @@ def install_optiscaler(appid, install_path, exe_override=None, gpu_type=None,
     if gpu_type == "unknown":
         gpu_type = "NVIDIA"
 
-    staging_dir = ensure_optiscaler_staging(nightly=nightly, task_id=task_id)
-    version = optiscaler_staging_version(nightly=nightly)
+    staging_dir, version = resolve_optiscaler_staging(variant, custom_build=custom_build, task_id=task_id)
     effective_dll_name = _resolve_optiscaler_dll_name(detected["api"])
     target_dir = exe.parent
 
@@ -5415,12 +5507,20 @@ def install_optiscaler(appid, install_path, exe_override=None, gpu_type=None,
         if name.lower() != "optiscaler.dll":
             deployed_files.append(name)
 
-    # INI seed + deploy + enforce
-    seed_optiscaler_user_inis()
-    user_ini = get_optiscaler_user_ini_path(gpu_type, dlss_inputs, nightly)
+    # INI seed + deploy + enforce. Custom has no curated PCC template (those
+    # only exist for Stable/Nightly's own known INI formats) - it seeds from
+    # the build's own bundled OptiScaler.ini instead, same as a plain
+    # from-scratch OptiScaler install would.
     game_ini = target_dir / "OptiScaler.ini"
-    if not game_ini.is_file() and user_ini.is_file():
-        shutil.copy2(user_ini, game_ini)
+    if variant == "custom":
+        staged_ini = staging_dir / "OptiScaler.ini"
+        if not game_ini.is_file() and staged_ini.is_file():
+            shutil.copy2(staged_ini, game_ini)
+    else:
+        seed_optiscaler_user_inis()
+        user_ini = get_optiscaler_user_ini_path(gpu_type, dlss_inputs, nightly)
+        if not game_ini.is_file() and user_ini.is_file():
+            shutil.copy2(user_ini, game_ini)
     if game_ini.is_file():
         _enforce_ini_flag(game_ini, "LoadReshade", "true")
         _enforce_ini_flag(game_ini, "LoadAsiPlugins", "true")
@@ -5443,7 +5543,8 @@ def install_optiscaler(appid, install_path, exe_override=None, gpu_type=None,
     installs = state.setdefault("rhi_optiscaler_installs", {})
     installs[str(appid)] = {
         "install_path": str(target_dir), "installed_as": effective_dll_name,
-        "variant": variant, "gpu_type": gpu_type, "dlss_inputs": dlss_inputs,
+        "variant": variant, "custom_build": custom_build if variant == "custom" else None,
+        "gpu_type": gpu_type, "dlss_inputs": dlss_inputs,
         "version": version, "exe": str(exe),
         "deployed_files": deployed_files, "deployed_subdirs": deployed_subdirs,
         "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -5491,11 +5592,12 @@ def install_optiscaler(appid, install_path, exe_override=None, gpu_type=None,
 
 
 def _install_optiscaler_task(task_id, appid, install_path, exe, gpu_type,
-                             dlss_inputs, variant, hotkey, game_name=None) -> None:
+                             dlss_inputs, variant, hotkey, game_name=None,
+                             custom_build=None) -> None:
     try:
         install_optiscaler(appid, install_path, exe_override=exe, gpu_type=gpu_type,
                            dlss_inputs=dlss_inputs, variant=variant, hotkey=hotkey,
-                           task_id=task_id, game_name=game_name)
+                           custom_build=custom_build, task_id=task_id, game_name=game_name)
     except Exception as e:
         TASKS[task_id] = {"status": "error", "progress": 0, "detail": str(e)}
 
@@ -5643,12 +5745,12 @@ def update_optiscaler(appid, task_id=None) -> dict:
     rec = state.get("rhi_optiscaler_installs", {}).get(str(appid))
     if not rec:
         raise RuntimeError("No OptiScaler install tracked for this game.")
-    nightly = rec.get("variant") == "nightly"
+    variant = rec.get("variant", "stable")
     target_dir = Path(rec["install_path"])
     installed_dll = rec["installed_as"]
 
-    staging_dir = ensure_optiscaler_staging(nightly=nightly, task_id=task_id)
-    version = optiscaler_staging_version(nightly=nightly)
+    staging_dir, version = resolve_optiscaler_staging(
+        variant, custom_build=rec.get("custom_build"), task_id=task_id)
 
     if task_id and task_id in TASKS:
         TASKS[task_id]["detail"] = "Updating OptiScaler files"
@@ -8262,7 +8364,7 @@ class Handler(BaseHTTPRequestHandler):
                                  args=(tid, appid, g["install_path"], body.get("exe"),
                                        body.get("gpu_type"), body.get("dlss_inputs", True),
                                        body.get("variant", "stable"), body.get("hotkey"),
-                                       g["name"]),
+                                       g["name"], body.get("custom_build")),
                                  daemon=True).start()
                 self._json({"task": tid})
             elif self.path == "/api/rhi/optiscaler/remove":
@@ -8274,6 +8376,8 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=_update_optiscaler_task,
                                  args=(tid, appid), daemon=True).start()
                 self._json({"task": tid})
+            elif self.path == "/api/rhi/optiscaler/check_custom_updates":
+                self._json(check_custom_optiscaler_updates())
             elif self.path == "/api/rhi/optiscaler/hotkey":
                 hotkey = body.get("hotkey", "")
                 set_optiscaler_hotkey(hotkey)

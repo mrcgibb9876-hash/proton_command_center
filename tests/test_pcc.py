@@ -128,6 +128,7 @@ class PCCTests(unittest.TestCase):
         pcc.OPTISCALER_INIS_DIR = pcc.OPTISCALER_DATA_DIR / "inis"
         pcc.OPTIPATCHER_STAGING_DIR = pcc.OPTISCALER_DATA_DIR / "optipatcher"
         pcc.OPTISCALER_DLSS_DIR = pcc.OPTISCALER_DATA_DIR / "dlss"
+        pcc.OPTISCALER_CUSTOM_DIR = pcc.RHI_DATA_DIR / "optiscaler-custom"
         pcc.DXVK_DATA_DIR = pcc.RHI_DATA_DIR / "dxvk"
         pcc.DXVK_DEV_DIR = pcc.DXVK_DATA_DIR / "development"
         pcc.DXVK_STABLE_DIR = pcc.DXVK_DATA_DIR / "stable"
@@ -2782,6 +2783,84 @@ class PCCTests(unittest.TestCase):
         finally:
             pcc.ensure_optipatcher_staged = real_optipatcher
         self.assertTrue((d / "plugins" / "OptiPatcher.asi").is_file())
+
+    # ---- RHI: OptiScaler Custom variant ----
+    def _fake_custom_optiscaler_build(self, name="DLSSNR-v0.1.0", extra_companion=True):
+        """Drops a fake user-provided build into OPTISCALER_CUSTOM_DIR, same
+        shape as a real extracted release (OptiScaler.dll + .ini directly
+        inside, no version.txt - Custom builds are user-managed, the folder
+        name itself is the version label)."""
+        b = pcc.OPTISCALER_CUSTOM_DIR / name
+        b.mkdir(parents=True, exist_ok=True)
+        (b / "OptiScaler.dll").write_bytes(b"OptiScaler fake custom build" + b"\x00" * 500)
+        (b / "OptiScaler.ini").write_text("[Upscalers]\nSpoofing=auto\n")
+        if extra_companion:
+            (b / "nvngx.dll_dlssnr.dll").write_bytes(b"fake dlssnr companion")
+        return b
+
+    def test_list_custom_optiscaler_builds_only_lists_real_builds(self):
+        self._fake_custom_optiscaler_build("DLSSNR-v0.1.0")
+        (pcc.OPTISCALER_CUSTOM_DIR / "not-a-build").mkdir(parents=True)
+        self.assertEqual(pcc.list_custom_optiscaler_builds(), ["DLSSNR-v0.1.0"])
+
+    def test_install_optiscaler_custom_variant_deploys_own_files_and_ini(self):
+        d, exe = self._fake_game_exe()
+        self._fake_custom_optiscaler_build("DLSSNR-v0.1.0")
+        r = pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="NVIDIA",
+                                   variant="custom", custom_build="DLSSNR-v0.1.0")
+        self.assertTrue(r["installed"])
+        self.assertEqual(r["version"], "DLSSNR-v0.1.0")
+        self.assertTrue((d / "dxgi.dll").is_file())
+        self.assertIn(b"OptiScaler", (d / "dxgi.dll").read_bytes())
+        # The build's own companion DLL (not one of PCC's hardcoded names)
+        # deploys like any other loose file in the source folder.
+        self.assertTrue((d / "nvngx.dll_dlssnr.dll").is_file())
+        ini_text = (d / "OptiScaler.ini").read_text()
+        self.assertIn("[Upscalers]", ini_text)          # seeded from the build's own ini
+        self.assertIn("LoadReshade=true", ini_text)      # still enforced same as any variant
+
+        status = pcc.scan_game_optiscaler("12345", str(d), exe_path=str(exe))
+        self.assertEqual(status["variant"], "custom")
+        self.assertEqual(status["custom_build"], "DLSSNR-v0.1.0")
+        self.assertFalse(status["update_available"])     # no network check for Custom
+
+        rm = pcc.remove_optiscaler("12345")
+        self.assertTrue(rm["removed"])
+        self.assertFalse((d / "dxgi.dll").exists())
+        self.assertFalse((d / "nvngx.dll_dlssnr.dll").exists())
+
+    def test_install_optiscaler_custom_variant_defaults_to_first_available_build(self):
+        d, exe = self._fake_game_exe()
+        self._fake_custom_optiscaler_build("OnlyBuild")
+        r = pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="NVIDIA",
+                                   variant="custom")
+        self.assertEqual(r["version"], "OnlyBuild")
+
+    def test_install_optiscaler_custom_variant_without_any_build_raises(self):
+        d, exe = self._fake_game_exe()
+        with self.assertRaises(RuntimeError):
+            pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="NVIDIA",
+                                   variant="custom")
+
+    def test_check_custom_optiscaler_updates_first_run_only_establishes_baseline(self):
+        self._fake_custom_optiscaler_build("DLSSNR-v0.1.0")
+        r = pcc.check_custom_optiscaler_updates()
+        self.assertEqual(r, {"changed": [], "redeployed": 0})
+
+    def test_check_custom_optiscaler_updates_redeploys_changed_build(self):
+        d, exe = self._fake_game_exe()
+        self._fake_custom_optiscaler_build("DLSSNR-v0.1.0")
+        pcc.install_optiscaler("12345", str(d), exe_override=str(exe), gpu_type="NVIDIA",
+                               variant="custom", custom_build="DLSSNR-v0.1.0")
+        pcc.check_custom_optiscaler_updates()   # establish baseline
+        # User drops a newer build over the same folder name.
+        (pcc.OPTISCALER_CUSTOM_DIR / "DLSSNR-v0.1.0" / "OptiScaler.dll").write_bytes(
+            b"OptiScaler fake custom build v2" + b"\x00" * 500)
+        r = pcc.check_custom_optiscaler_updates()
+        self.assertEqual(r["changed"], ["DLSSNR-v0.1.0"])
+        self.assertEqual(r["redeployed"], 1)
+        self.assertEqual((d / "dxgi.dll").read_bytes(),
+                         (pcc.OPTISCALER_CUSTOM_DIR / "DLSSNR-v0.1.0" / "OptiScaler.dll").read_bytes())
 
     def test_ensure_dlss_dll_cached_downloads_from_manifest(self):
         import zipfile, io

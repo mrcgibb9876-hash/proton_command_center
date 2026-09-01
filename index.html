@@ -763,14 +763,20 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
     <div class="section">
       <h3 style="font-size:12.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:0 0 10px">OptiScaler</h3>
       <p class="note" style="margin:0 0 10px">Redirects DLSS/FSR/XeSS calls to any upscaler + frame gen, on any GPU.
-        Installs alongside ReShade when both are wanted (auto-renamed to coexist).</p>
+        Installs alongside ReShade when both are wanted (auto-renamed to coexist). Drop your own build
+        (a fork, a DLSS Neural Rendering build, anything with a real release's layout) into its own named
+        folder under <code class="mono">~/.local/share/proton-command-center/rhi/optiscaler-custom/</code>
+        to use it via the Custom variant.</p>
       <div id="rhiOsStatus"><p class="note">Checking…</p></div>
       <div class="row" style="margin-top:10px;align-items:center;gap:10px;flex-wrap:wrap">
         <label class="note" for="rhiOsVariant" style="margin:0">Variant</label>
         <select id="rhiOsVariant">
           <option value="stable">Stable</option>
           <option value="nightly">Nightly</option>
+          <option value="custom">Custom</option>
         </select>
+        <select id="rhiOsCustomBuild" hidden style="flex:1"></select>
+        <button class="btn small" id="rhiOsCustomCheckBtn" hidden title="Redeploy any Custom build that's changed since it was installed, to every game using it">Check for updates</button>
         <label class="note" for="rhiOsGpuType" style="margin:0">GPU</label>
         <select id="rhiOsGpuType">
           <option value="NVIDIA">NVIDIA</option>
@@ -854,7 +860,7 @@ textarea{width:100%;min-height:84px;background:#0c1014;border:1px solid var(--li
 
 <script>
 "use strict";
-const FRONTEND_VERSION="1.28.0";
+const FRONTEND_VERSION="1.29.0";
 const $=s=>document.querySelector(s);
 const api=async(p,opts)=>{const r=await fetch(p,opts);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);return j};
 const post=(p,body)=>api(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
@@ -2421,6 +2427,23 @@ const RHI_OS_FG_OUTPUTS=["auto","nofg","fsrfg","xefg","nukems"];
   $("#rhiOsFgInput").innerHTML=RHI_OS_FG_INPUTS.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join("");
   $("#rhiOsFgOutput").innerHTML=RHI_OS_FG_OUTPUTS.map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join("");
 })();
+function applyRhiOsVariantUI(){
+  const isCustom=$("#rhiOsVariant").value==="custom";
+  $("#rhiOsCustomBuild").hidden=!isCustom;
+  $("#rhiOsCustomCheckBtn").hidden=!isCustom;
+}
+$("#rhiOsVariant").addEventListener("change",applyRhiOsVariantUI);
+$("#rhiOsCustomCheckBtn").addEventListener("click",async()=>{
+  const btn=$("#rhiOsCustomCheckBtn");btn.disabled=true;btn.textContent="Checking…";
+  try{
+    const r=await post("/api/rhi/optiscaler/check_custom_updates",{});
+    toast(r.changed.length
+      ?`${r.changed.length} custom build(s) changed — redeployed to ${r.redeployed} game(s)`
+      :"No changes since last check");
+    if(current)loadRhiOptiscaler(current.appid);
+  }catch(e){toast(e.message,true)}
+  btn.disabled=false;btn.textContent="Check for updates";
+});
 async function loadRhiOptiscaler(appid){
   const box=$("#rhiOsStatus");
   box.innerHTML='<p class="note">Scanning game folder…</p>';
@@ -2428,15 +2451,20 @@ async function loadRhiOptiscaler(appid){
   try{
     const d=await api(`/api/game/${appid}/rhi/optiscaler`);
     window._rhiOsState=d;
+    $("#rhiOsCustomBuild").innerHTML=(d.custom_builds||[]).length
+      ?d.custom_builds.map(b=>`<option value="${esc(b)}">${esc(b)}</option>`).join("")
+      :'<option value="">— drop a build into the Custom folder first —</option>';
     if(d.installed){
       $("#rhiOsVariant").value=d.variant||"stable";
+      if(d.variant==="custom"&&d.custom_build)$("#rhiOsCustomBuild").value=d.custom_build;
+      applyRhiOsVariantUI();
       $("#rhiOsGpuType").value=d.gpu_type||"NVIDIA";
       $("#rhiOsDlssInputs").checked=d.dlss_inputs!==false;
       box.innerHTML=`
         <div class="item">
           <div class="top"><b>${esc(d.installed_as)}</b>
             <span class="chip g">${esc(d.version||"?")}</span>
-            <span class="chip m">${esc(d.variant||"stable")}</span>
+            <span class="chip m">${esc(d.variant||"stable")}${d.variant==="custom"&&d.custom_build?` — ${esc(d.custom_build)}`:""}</span>
             ${d.detected_api_display?`<span class="chip a">${esc(d.detected_api_display)}</span>`:""}
             ${d.update_available?'<span class="chip a">update available</span>':""}</div>
           <div class="path mono">${esc(d.path)}</div>
@@ -2452,6 +2480,7 @@ async function loadRhiOptiscaler(appid){
       loadRhiStreamline(appid);
     }else{
       $("#rhiOsStreamlineRow").hidden=true;
+      applyRhiOsVariantUI();
       $("#rhiOsGpuType").value=effectiveVendor()==="AMD"?"AMD":"NVIDIA";
       $("#rhiOsInstallBtn").textContent="Install OptiScaler";
       box.innerHTML=d.exe
@@ -2464,9 +2493,15 @@ $("#rhiOsInstallBtn").addEventListener("click",async()=>{
   if(!current)return;
   const btn=$("#rhiOsInstallBtn");btn.disabled=true;
   try{
-    const body={appid:current.appid,variant:$("#rhiOsVariant").value,
+    const variant=$("#rhiOsVariant").value;
+    const body={appid:current.appid,variant,
       gpu_type:$("#rhiOsGpuType").value,dlss_inputs:$("#rhiOsDlssInputs").checked,
       hotkey:$("#rhiOsHotkey").value};
+    if(variant==="custom"){
+      const b=$("#rhiOsCustomBuild").value;
+      if(!b){toast("Drop a build into the Custom OptiScaler folder first",true);btn.disabled=false;return}
+      body.custom_build=b;
+    }
     if($("#rhiExePath").value.trim())body.exe=$("#rhiExePath").value.trim();
     const {task}=await post("/api/rhi/optiscaler/install",body);
     trackTask(task,"#rhiOsBar",(t)=>{

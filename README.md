@@ -120,7 +120,12 @@ app or Wine-hosted process:
 - **Shader packs & addons** - ReShade's real community catalogs, deployed to
   its own default search paths.
 - **OptiScaler** - redirects DLSS/FSR/XeSS calls to any upscaler + frame
-  gen, on any GPU. Coexists with ReShade automatically.
+  gen, on any GPU. Coexists with ReShade automatically. Stable and Nightly
+  fetch straight from OptiScaler's own GitHub releases; a **Custom** variant
+  installs any build you drop in yourself (a fork, a DLSS Neural Rendering
+  build, anything shaped like a real release) - same idea as ReShade's
+  Custom channel, with its own "Check for updates" that redeploys to every
+  game using it when you drop in a newer build over the same folder.
 - **DXVK** - Development, Stable, or Lilium HDR variant, per game. Coexists
   with ReShade and OptiScaler automatically (conflicting DLLs route through
   `OptiScaler/plugins/`, or ReShade gets renamed aside).
